@@ -84,9 +84,13 @@
             var $tbody = $('#ekti-mapping-tbody').empty();
 
             // Build EventKoi options.
-            var ekOptions = '<option value="">— Not mapped —</option>';
+            var ekOptions = '<option value="">\u2014 Not mapped \u2014</option>';
             $.each(d.ek_events, function (i, ev) {
-                ekOptions += '<option value="' + ev.ID + '">' + escapeHtml(ev.post_title) + ' (' + ev.ID + ')</option>';
+                var statusLabel = '';
+                if (ev.post_status && ev.post_status !== 'publish') {
+                    statusLabel = ' [' + ev.post_status + ']';
+                }
+                ekOptions += '<option value="' + ev.ID + '">' + escapeHtml(ev.post_title) + statusLabel + ' (' + ev.ID + ')</option>';
             });
 
             $.each(d.rows, function (i, row) {

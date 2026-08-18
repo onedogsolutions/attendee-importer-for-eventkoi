@@ -145,12 +145,15 @@ final class EventKoi_Tickets_Importer {
     }
 
     /**
-     * Get all published EventKoi events.
+     * Get all EventKoi events (published, expired, draft — excluding trash).
      */
     private function get_eventkoi_events() {
         global $wpdb;
         return $wpdb->get_results(
-            "SELECT ID, post_title FROM {$wpdb->posts} WHERE post_type = 'eventkoi_event' AND post_status = 'publish' ORDER BY post_title ASC",
+            "SELECT ID, post_title, post_status FROM {$wpdb->posts}
+             WHERE post_type = 'eventkoi_event'
+               AND post_status NOT IN ('trash', 'auto-draft')
+             ORDER BY post_status = 'publish' DESC, post_title ASC",
             ARRAY_A
         );
     }
@@ -198,22 +201,65 @@ final class EventKoi_Tickets_Importer {
     /**
      * Build a reverse lookup: TEC event ID → EventKoi event ID using _tec_import_source_id.
      * This is the authoritative mapping left by EventKoi's native event importer.
+     *
+     * Handles duplicate imports (same TEC event imported multiple times) by preferring:
+     *   1. Published events over expired/draft.
+     *   2. Lower post ID (first import) when statuses are equal.
+     *
+     * Also includes expired/draft EventKoi events so attendees of past classes
+     * can still be migrated if the user chooses to map them.
      */
     private function get_tec_import_source_mapping() {
         global $wpdb;
+
+        // Fetch ALL EventKoi events with _tec_import_source_id (any status).
         $rows = $wpdb->get_results(
-            "SELECT pm.meta_value AS tec_event_id, p.ID AS eventkoi_id
+            "SELECT pm.meta_value AS tec_event_id, p.ID AS eventkoi_id, p.post_status, p.post_date
              FROM {$wpdb->postmeta} pm
              JOIN {$wpdb->posts} p ON pm.post_id = p.ID
              WHERE pm.meta_key = '_tec_import_source_id'
                AND p.post_type = 'eventkoi_event'
-               AND p.post_status = 'publish'",
+             ORDER BY p.ID ASC",
             ARRAY_A
         );
-        $source_map = [];
+
+        // Status priority: publish > eventkoi_expired > draft > anything else.
+        $status_priority = [
+            'publish'          => 0,
+            'eventkoi_expired' => 1,
+            'draft'            => 2,
+        ];
+
+        $source_map   = [];
+        $candidates   = []; // tec_id => array of candidates
+        $duplicates   = 0;
+
         foreach ( $rows as $row ) {
-            $source_map[ $row['tec_event_id'] ] = (int) $row['eventkoi_id'];
+            $tec_id = $row['tec_event_id'];
+            $candidates[ $tec_id ][] = $row;
         }
+
+        foreach ( $candidates as $tec_id => $cands ) {
+            if ( count( $cands ) > 1 ) {
+                $duplicates++;
+                // Sort: prefer publish, then lowest ID.
+                usort( $cands, function ( $a, $b ) use ( $status_priority ) {
+                    $pa = isset( $status_priority[ $a['post_status'] ] ) ? $status_priority[ $a['post_status'] ] : 99;
+                    $pb = isset( $status_priority[ $b['post_status'] ] ) ? $status_priority[ $b['post_status'] ] : 99;
+                    if ( $pa !== $pb ) {
+                        return $pa - $pb;
+                    }
+                    return intval( $a['eventkoi_id'] ) - intval( $b['eventkoi_id'] );
+                } );
+            }
+            $winner = $cands[0];
+            $source_map[ $tec_id ] = (int) $winner['eventkoi_id'];
+        }
+
+        if ( $duplicates > 0 ) {
+            $this->log( "Source mapping: {$duplicates} duplicate TEC imports detected; resolved by preferring published events." );
+        }
+
         return $source_map;
     }
 
