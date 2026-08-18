@@ -63,9 +63,18 @@
             $('#stat-mapped').text(d.mapped_event_count);
             $('#stat-unmapped').text(d.unmapped_event_count);
             $('#stat-mapped-attendees').text(d.mapped_attendees);
+            $('#stat-wc-orders').text(d.wc_order_count);
             $('#stat-already-imported').text(d.already_imported);
             totalAttendees = d.mapped_attendees;
-            appendConsole('Stats loaded. ' + d.mapped_attendees + ' attendees ready to import.', 'info');
+
+            // Show/hide WooCommerce warning.
+            if (!d.wc_available) {
+                $('#ekti-wc-warning').show();
+            } else {
+                $('#ekti-wc-warning').hide();
+            }
+
+            appendConsole('Stats loaded. ' + d.mapped_attendees + ' attendees and ' + d.wc_order_count + ' WC orders ready to import.', 'info');
         });
     }
 
@@ -212,9 +221,9 @@
             for (var i = 0; i < results.length; i++) {
                 var r = results[i];
                 if (r.action === 'created') {
-                    appendConsole('✓ Created attendee #' + r.attendee_id + ': ' + (r.name || ''));
+                    appendConsole('✓ Created attendee #' + r.attendee_id + ': ' + (r.name || '') + ' [' + (r.composite_key || '') + ']');
                 } else if (r.action === 'dry_run_create') {
-                    appendConsole('[DRY] Would create: ' + (r.name || '') + ' <' + (r.email || '') + '> → EventKoi #' + r.ek_event_id + ' @ $' + (r.price || '0'));
+                    appendConsole('[DRY] Would create: ' + (r.name || '') + ' <' + (r.email || '') + '> → EventKoi #' + r.ek_event_id + ' @ $' + (r.price || '0') + ' | key: ' + (r.composite_key || '') + ' | WC#' + (r.wc_order_id || 'none'));
                 } else if (r.action === 'skipped') {
                     appendConsole('⊘ Skipped #' + r.attendee_id + ': ' + r.reason, 'warn');
                 } else if (r.action === 'error') {
@@ -227,7 +236,8 @@
             updateProgress(pct);
             setStatus('#ekti-migration-status',
                 'Processed: <strong>' + state.processed + '</strong> | ' +
-                'Created: <strong>' + state.attendees_created + '</strong> | ' +
+                'Attendees: <strong>' + state.attendees_created + '</strong> | ' +
+                'Orders: <strong>' + (state.orders_created || 0) + '</strong> | ' +
                 'Skipped: <strong>' + state.skipped + '</strong> | ' +
                 'Errors: <strong>' + state.errors + '</strong>',
                 state.errors > 0 ? 'warning' : 'info'
@@ -236,7 +246,7 @@
             if (d.done || state.completed) {
                 appendConsole('=== Migration ' + (dryRun ? 'Dry Run ' : '') + 'Complete ===', 'info');
                 appendConsole('Total processed: ' + state.processed, 'info');
-                appendConsole('Created: ' + state.attendees_created + ' | Skipped: ' + state.skipped + ' | Errors: ' + state.errors, 'info');
+                appendConsole('Attendees: ' + state.attendees_created + ' | Orders: ' + (state.orders_created || 0) + ' | Charges: ' + (state.charges_created || 0) + ' | Skipped: ' + state.skipped + ' | Errors: ' + state.errors, 'info');
                 updateProgress(100);
                 isRunning = false;
                 $('#ekti-start-migration, #ekti-resume-migration').prop('disabled', false);
@@ -256,7 +266,7 @@
     }
 
     function rollback() {
-        if (!confirm('This will DELETE all imported ticket orders and ticket types created by this importer. Continue?')) {
+        if (!confirm('This will DELETE all imported ticket orders, parent orders, charges, notes, and WC order meta created by this importer. Continue?')) {
             return;
         }
         appendConsole('=== Running Rollback ===', 'warn');
@@ -266,7 +276,12 @@
                 return;
             }
             var d = resp.data;
-            appendConsole('Rollback complete. Deleted ' + d.deleted_orders + ' ticket orders and ' + d.deleted_tickets + ' ticket types.', 'warn');
+            appendConsole('Rollback complete:', 'warn');
+            appendConsole('  Ticket orders: ' + d.deleted_orders, 'warn');
+            appendConsole('  Parent orders: ' + d.deleted_parent_orders, 'warn');
+            appendConsole('  Charges: ' + d.deleted_charges, 'warn');
+            appendConsole('  Notes: ' + d.deleted_notes, 'warn');
+            appendConsole('  Ticket types: ' + d.deleted_tickets, 'warn');
             setStatus('#ekti-migration-status', 'Rollback complete.', 'warning');
             updateProgress(0);
             loadStats();

@@ -8,11 +8,13 @@ top-level document.
 
 - **Branch:** `main`
 - **Plugin version:** 1.0.0
-- **Last updated:** 2026-08-18
-- **Overall status:** ✅ Phase 1 complete (4/4) — bootstrap, database layer,
+- **Last updated:** 2026-08-20
+- **Overall status:** ✅ Phase 2 complete (5/5) — bootstrap, database layer,
   event mapping + auto-match, migration engine with rollback, admin UI with
-  jQuery. Duplicate TEC import handling added. Plugin is feature-complete for
-  the initial release.
+  jQuery, **WooCommerce order linking** (parent orders, charges, order notes,
+  WC meta, composite keys, check-in codes). Duplicate TEC import handling
+  added. Plugin is feature-complete for the initial release. WooCommerce
+  dependency is now fully guarded.
 
 ## Shared project facts (true for every step)
 
@@ -48,16 +50,26 @@ top-level document.
 | 2 | Database layer (TEC attendees, EventKoi events/tickets, mapping) | ✅ Done | b2a2594 |
 | 3 | Migration engine (batch processing, dry run, rollback) | ✅ Done | b2a2594 |
 | 4 | Event auto-match + duplicate TEC import handling | ✅ Done | 2bdb3c7, f63942a |
+| 5 | WooCommerce order linking (parent orders, charges, composite keys, WC meta) | ✅ Done | (pending) |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
 
-**1.0.0 is feature-complete on `main`.** Remaining before wider release:
+**Phase 2 (WooCommerce order linking) is feature-complete on `main`.**
+Remaining before wider release:
 
-- **Live QA** on a WordPress install with real TEC + EventKoi data — confirm
-  the full pipeline (stats → auto-match → mapping review → dry run → live
-  import → rollback) works end-to-end.
+- **Live QA** on a WordPress install with real TEC + EventKoi + WooCommerce
+  data — confirm the full pipeline (stats → auto-match → mapping review →
+  dry run → live import → EventKoi Orders/Attendees/QR check-in → WC order
+  meta visible → rollback including WC meta) works end-to-end.
+- **Idempotency QA** — run the importer twice on the same dataset; the
+  second run should report all attendees as "Already imported" and create
+  zero new parent orders, charges, or WC meta writes.
+- **Status sync QA** — after import, change a WC order status (e.g. to
+  `refunded`) and verify EventKoi's `on_order_status_changed` and
+  `on_order_refunded` handlers pick up the change via the `_eventkoi_synced`
+  flag.
 - **readme.txt** (WordPress.org-style) if distributing.
 - **`.pot` translation template** if internationalization is needed.
 - **Uninstall cleanup** (`uninstall.php`) — currently the plugin leaves
@@ -106,18 +118,17 @@ All data access lives in the singleton class as private methods:
 ### Step 3 — Migration engine (batch processing, dry run, rollback) ✅
 - **State machine:** `get_migration_state()` / `update_migration_state()` /
   `reset_migration_state()` — `ekti_migration_state` option tracks offset,
-  processed count, tickets/attendees created, skipped, errors, completion
-  flag, dry-run flag, and start time.
-- **Batch processor:** `process_batch($dry_run)` reads `EKTI_BATCH_SIZE` (30)
-  attendees from the current offset, checks event mapping, gets or creates
-  an EventKoi ticket type per TEC event + product combo (via
-  `get_or_create_ticket()`), checks for already-imported attendees (via
-  `tec_import_` prefixed order IDs), and inserts into
-  `wp_eventkoi_ticket_orders` with full field mapping (customer name/email,
-  quantity 1, unit price, payment status `paid`, WC order reference as
-  `payment_intent_id`, check-in status/token, WC order date as `created_at`).
-  Updates `quantity_sold` on the ticket type. Marks source attendees with
-  `_eventkoi_imported_from_tec` post meta.
+  processed count, tickets/attendees/orders/charges created, skipped,
+  errors, completion flag, dry-run flag, and start time.
+- **Batch processor:** `process_batch($dry_run)` — see Step 5 for the
+  Phase 2 3-phase rework. In summary: reads `EKTI_BATCH_SIZE` (30)
+  attendees from the current offset, groups by WC order, creates one parent
+  `wp_eventkoi_orders` row + one `wp_eventkoi_charges` row per WC order,
+  then one `wp_eventkoi_ticket_orders` row per attendee with the composite
+  `order_id = 'wc_' . $wc_order_id . ':' . $ticket_id . ':' . $checkin_code`
+  and `payment_status = 'complete'`. Checks both composite and legacy
+  `tec_import_` keys for duplicates. Updates `quantity_sold` via recount.
+  Marks source attendees with `_eventkoi_imported_from_tec` post meta.
 - **Ticket creation:** `get_or_create_ticket()` — checks for a previously
   created ticket (via `_ekti_tec_product_{tec_event_id}_{product_id}` option),
   falls back to matching existing EventKoi tickets by event + name, and if
@@ -125,11 +136,14 @@ All data access lives in the singleton class as private methods:
   `quantity_sold` pre-set to the existing attendee count for that TEC
   event/product combo.
 - **Dry run:** same code path but skips DB writes; results array contains
-  `dry_run_create` actions with the would-be data.
-- **Rollback:** `rollback_import()` — deletes all `tec_import_*` rows from
-  `wp_eventkoi_ticket_orders`, deletes ticket types tracked via
-  `_ekti_tec_product_*` options, cleans `_eventkoi_imported_from_tec` meta,
-  resets migration state.
+  `dry_run_create` actions with the would-be composite key, WC order ID,
+  and check-in code.
+- **Rollback:** `rollback_import()` — deletes importer-created rows from
+  five tables (`wp_eventkoi_order_notes`, `wp_eventkoi_charges`,
+  `wp_eventkoi_orders`, `wp_eventkoi_ticket_orders`, `wp_eventkoi_tickets`),
+  cleans `_eventkoi_imported_from_tec` source meta, cleans `_eventkoi_*`
+  meta on WC `shop_order` posts, resets migration state. See Step 5 for
+  full table/pattern details.
 - **AJAX handlers:** `ajax_run_batch`, `ajax_rollback`, `ajax_get_stats`,
   `ajax_get_log`, `ajax_clear_log` — all nonce + `manage_options` gated.
 
@@ -154,24 +168,106 @@ All data access lives in the singleton class as private methods:
 
 ---
 
+### Step 5 — WooCommerce order linking (Phase 2) ✅
+Brings the importer's output into structural parity with EventKoi's native
+`WooCommerce_Checkout::on_payment_complete()` + `Ticket_Order_Sync::sync_order_to_local()`
+flow so imported attendees appear correctly in EventKoi's Orders list,
+Attendees tab, sales history, QR check-in, and status sync.
+
+- **New helper methods** on the singleton class:
+  - `wc_is_available()` — `function_exists('wc_get_order') && class_exists('WooCommerce')`
+    guard. Resolves the long-standing WC-dependency blocker.
+  - `get_wc_order($order_id)` — safe wrapper that returns `null` when WC is
+    inactive or the order does not exist.
+  - `get_wc_order_date($order_id)` — rewritten on top of `get_wc_order()`;
+    no longer fatals when WC is absent.
+  - `generate_checkin_code()` — 12-char codes using EventKoi's human-friendly
+    alphabet `ABCDEFGHJKLMNPQRSTUVWXYZ23456789` (no ambiguous chars `0`, `O`,
+    `1`, `I`). Cryptographically random via `random_bytes()`.
+  - `create_parent_order(...)` — upserts a row into `wp_eventkoi_orders` with
+    `checkout_id = 'wc_' . $wc_order_id`, lowercase currency, INT unix
+    timestamps, `gateway = 'woocommerce'`, `payment_status = 'complete'`, and
+    billing info pulled from the WC order (falling back to the first
+    attendee). Also inserts an `order_completed` row into
+    `wp_eventkoi_order_notes`. Idempotent via `checkout_id` UNIQUE KEY.
+  - `create_charge_row(...)` — upserts into `wp_eventkoi_charges` with
+    `charge_id = 'wc_charge_' . $wc_order_id`, `status = 'succeeded'`,
+    `gateway = 'woocommerce'`. Idempotent via `charge_id` UNIQUE KEY.
+  - `set_wc_order_meta(...)` — writes `_eventkoi_event_id`,
+    `_eventkoi_instance_ts`, `_eventkoi_event_title`,
+    `_eventkoi_ticket_items`, `_eventkoi_master_checkin_code`, and
+    `_eventkoi_synced = 'yes'` on the WC order. Skips when `_eventkoi_synced`
+    is already `'yes'` (idempotent). Enables EventKoi's admin to link back to
+    the WC order, suppress duplicate emails, and react to status changes and
+    refunds.
+- **`process_batch()` reworked into 3 phases:**
+  - *Phase 1 — resolve & group*: validates mapping, gets/creates ticket
+    types, and groups attendees by `wc_order_id` while accumulating per-order
+    totals and ticket items.
+  - *Phase 2 — parent order + charge per WC order*: calls
+    `create_parent_order()`, `create_charge_row()`, and `set_wc_order_meta()`
+    once per unique WC order.
+  - *Phase 3 — ticket_orders rows per attendee*: builds the composite
+    `order_id = 'wc_' . $wc_order_id . ':' . $ticket_id . ':' . $checkin_code`,
+    sets `payment_status = 'complete'` (was `'paid'` — `'paid'` is invisible
+    to EventKoi's `sync_quantity_sold()` IN-clause), sets
+    `charge_id = 'wc_charge_' . $wc_order_id`, `payment_intent_id = null`,
+    and `checkin_token` to the generated 12-char code. Free/comp attendees
+    without a WC order fall back to the legacy `tec_import_{id}` key.
+  - Duplicate detection now checks **both** the new composite key **and** the
+    legacy `tec_import_{id}` key so v1.0.0 imports are not re-imported.
+  - `quantity_sold` is now recounted via
+    `SELECT COALESCE(SUM(quantity), 0) ... WHERE payment_status IN ('complete','completed','succeeded','partially_refunded')`
+    — matching EventKoi's own `sync_quantity_sold()` semantics — instead of
+    the v1.0.0 `quantity_sold + 1` increment.
+- **Migration state tracking** gained `orders_created` and `charges_created`
+  counters (in both `get_migration_state()` defaults and
+  `reset_migration_state()`). Surfaced in the progress status line and the
+  completion summary in `admin.js`.
+- **`ajax_get_stats()`** now returns `wc_order_count` (COUNT DISTINCT WC
+  orders for mapped events) and `wc_available` (boolean). The admin page
+  renders a new "WC Orders to Link" stat tile and shows a dismissible
+  warning notice when WooCommerce is not active.
+- **Rollback** now cleans up all five tables and WC order meta:
+  `wp_eventkoi_order_notes` (for importer parent orders),
+  `wp_eventkoi_charges` (`gateway='woocommerce'` + `wc_charge_%`),
+  `wp_eventkoi_orders` (`gateway='woocommerce'` + `wc_%` checkout_id),
+  `wp_eventkoi_ticket_orders` (`wc_%` OR `tec_import_%`), importer-created
+  ticket types, `_eventkoi_imported_from_tec` source meta, AND the
+  `_eventkoi_*` meta on WC `shop_order` posts.
+- **admin.js** updates: new stat tile population (`#stat-wc-orders`), WC
+  warning show/hide, composite keys shown in console for both `created` and
+  `dry_run_create` results, progress status line includes Orders count,
+  completion summary includes Orders + Charges, rollback confirmation and
+  per-table deletion counts updated.
+- **admin.css** — no changes required; the `.ekti-stats-grid` uses
+  `grid-template-columns: repeat(auto-fill, minmax(180px, 1fr))` which
+  absorbs the new tile automatically.
+
+---
+
 ## Admin UI ✅
 
 Server-rendered PHP page (`render_admin_page()`) with four panels:
 1. **Overview** — stats grid (TEC events, attendees, EventKoi events, mapped/
-   unmapped events, attendees to import, already imported) loaded via AJAX.
+   unmapped events, attendees to import, WC orders to link, already imported)
+   loaded via AJAX. Dismissible warning notice when WooCommerce is inactive.
 2. **Event Mapping** — Auto-Match button, Load/Save Mapping buttons, a
    `wp-list-table` with TEC event ID/title/attendee count and an EventKoi
    event `<select>` per row. Status badges show match source.
 3. **Run Migration** — Dry Run checkbox, Start Import / Resume / Rollback
    buttons, progress bar, live console output with color-coded log entries
-   (green=success, red=error, yellow=warn, blue=info).
+   (green=success, red=error, yellow=warn, blue=info). Console shows
+   composite keys and WC order IDs per attendee.
 4. **Import Log File** — Load/Clear buttons, `<pre>` viewer.
 
-`admin.js` (318 lines, jQuery IIFE): AJAX helper, console appender, stats
-loader, mapping loader/saver, auto-match runner, recursive batch runner with
-progress tracking, rollback with confirmation.
+`admin.js` (jQuery IIFE): AJAX helper, console appender, stats loader
+(including WC order count + WC availability check), mapping loader/saver,
+auto-match runner, recursive batch runner with progress tracking showing
+attendees/orders/skipped/errors, completion summary with charges, rollback
+with per-table deletion counts.
 
-`admin.css` (187 lines): panel cards, stats grid, progress bar, dark console
+`admin.css`: panel cards, auto-filling stats grid, progress bar, dark console
 with syntax coloring, mapping table overflow scroll, CSS spinner.
 
 ---
@@ -181,6 +277,24 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
 - 2026-08-18: Initial STATE.md created retroactively to document the completed
   1.0.0 build. All four steps were implemented across commits `c303f8a` →
   `f63942a`.
+
+- 2026-08-20: **Phase 2 — WooCommerce order linking.** Deep inspection of
+  EventKoi Lite's source (`class-woocommerce-checkout.php`,
+  `class-ticket-order-sync.php`, and the three table schema classes) showed
+  that the v1.0.0 importer was producing orphaned `wp_eventkoi_ticket_orders`
+  rows: wrong `order_id` format (`tec_import_{id}` instead of the composite
+  `wc_{wc_order_id}:{ticket_id}:{checkin_code}`), wrong `payment_status`
+  (`'paid'` instead of `'complete'` — invisible to `sync_quantity_sold()`'s
+  IN-clause), missing parent rows in `wp_eventkoi_orders`, missing rows in
+  `wp_eventkoi_charges`, missing `order_completed` notes, and missing
+  `_eventkoi_*` meta on the WC order itself. The result was that imported
+  attendees were invisible to EventKoi's admin Orders list, Attendees tab,
+  QR check-in, and status/refund sync. Phase 2 rewrites `process_batch()`
+  as a 3-phase pipeline (resolve+group → parent order+charge per WC order →
+  ticket_orders row per attendee with composite key), adds seven helper
+  methods, extends rollback to five tables plus WC meta, and guards every
+  `wc_get_order()` call behind `function_exists()` checks — closing the
+  WooCommerce-dependency blocker called out in Open questions since 1.0.0.
 
 - Commit `2bdb3c7` (auto-match enhancement): added `_tec_import_source_id` as
   the primary auto-match strategy. Before this, only title-based matching was
@@ -221,14 +335,17 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
   and post meta (`_eventkoi_imported_from_tec`) that should be cleaned up on
   plugin deletion. Low priority since these are inert when the plugin is
   inactive.
-- **WooCommerce dependency:** `get_wc_order_date()` calls `wc_get_order()`
-  without checking if WooCommerce is active. If WC is deactivated, this will
-  fatal. Should be guarded with `function_exists('wc_get_order')`.
 - **No i18n:** all strings are hard-coded in English. A `.pot` file and
   `load_plugin_textdomain()` call would be needed for translation.
 - **Log file in uploads:** the log file lives at
   `wp-content/uploads/eventkoi-import.log` which is web-accessible. Consider
   adding an `.htaccess` deny or moving to a non-public path.
+- ~~**WooCommerce dependency**~~: resolved in Phase 2. All `wc_get_order()`
+  call sites are now wrapped in `wc_is_available()` / `get_wc_order()` which
+  use `function_exists('wc_get_order') && class_exists('WooCommerce')`. The
+  importer degrades gracefully when WC is absent: the admin page shows a
+  warning notice, parent orders and charges are skipped, and ticket_orders
+  rows fall back to the legacy `tec_import_{id}` key.
 
 ---
 
