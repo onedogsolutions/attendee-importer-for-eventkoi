@@ -95,9 +95,15 @@
                     'value="' + selected + '"',
                     'value="' + selected + '" selected'
                 );
+                var badge = '';
+                if (row.match_source === 'source') {
+                    badge = ' <span style="color:#16a34a;font-size:11px;" title="Matched via EventKoi import log">&#x2713; import log</span>';
+                } else if (row.match_source === 'manual') {
+                    badge = ' <span style="color:#d97706;font-size:11px;" title="Matched via title similarity or manual">~ title/fuzzy</span>';
+                }
                 var tr = '<tr data-tec-id="' + row.tec_id + '">' +
                     '<td>' + row.tec_id + '</td>' +
-                    '<td>' + escapeHtml(row.tec_title) + '</td>' +
+                    '<td>' + escapeHtml(row.tec_title) + badge + '</td>' +
                     '<td>' + row.attendee_count + '</td>' +
                     '<td><select class="ekti-ek-select" data-tec-id="' + row.tec_id + '">' + selectHtml + '</select></td>' +
                     '</tr>';
@@ -141,10 +147,13 @@
             }
             var d = resp.data;
             setStatus('#ekti-mapping-status',
-                'Auto-match complete: <strong>' + d.matched + '</strong> matched, <strong>' + d.unmatched + '</strong> unmatched.',
+                'Auto-match complete: <strong>' + d.matched + '</strong> matched (' +
+                d.source_matched + ' via import log, ' +
+                d.title_matched + ' exact title, ' +
+                d.fuzzy_matched + ' fuzzy), <strong>' + d.unmatched + '</strong> unmatched.',
                 d.unmatched > 0 ? 'warning' : 'success'
             );
-            appendConsole('Auto-match: ' + d.matched + ' matched, ' + d.unmatched + ' unmatched.', d.unmatched > 0 ? 'warn' : 'info');
+            appendConsole('Auto-match: ' + d.matched + ' matched (' + d.source_matched + ' source, ' + d.title_matched + ' title, ' + d.fuzzy_matched + ' fuzzy), ' + d.unmatched + ' unmatched.', d.unmatched > 0 ? 'warn' : 'info');
             loadMapping();
             loadStats();
         });

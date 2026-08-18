@@ -196,12 +196,41 @@ final class EventKoi_Tickets_Importer {
     }
 
     /**
-     * Attempt auto-matching TEC events to EventKoi events by title similarity.
+     * Build a reverse lookup: TEC event ID → EventKoi event ID using _tec_import_source_id.
+     * This is the authoritative mapping left by EventKoi's native event importer.
+     */
+    private function get_tec_import_source_mapping() {
+        global $wpdb;
+        $rows = $wpdb->get_results(
+            "SELECT pm.meta_value AS tec_event_id, p.ID AS eventkoi_id
+             FROM {$wpdb->postmeta} pm
+             JOIN {$wpdb->posts} p ON pm.post_id = p.ID
+             WHERE pm.meta_key = '_tec_import_source_id'
+               AND p.post_type = 'eventkoi_event'
+               AND p.post_status = 'publish'",
+            ARRAY_A
+        );
+        $source_map = [];
+        foreach ( $rows as $row ) {
+            $source_map[ $row['tec_event_id'] ] = (int) $row['eventkoi_id'];
+        }
+        return $source_map;
+    }
+
+    /**
+     * Attempt auto-matching TEC events to EventKoi events.
+     * Strategy:
+     *   1. Primary: _tec_import_source_id (authoritative from EventKoi's importer).
+     *   2. Secondary: Exact title match.
+     *   3. Fallback: Fuzzy title match (≥85% similarity).
      */
     private function auto_match_events() {
         $tec_event_ids = $this->get_tec_event_ids_with_attendees();
         $ek_events     = $this->get_eventkoi_events();
         $mapping       = $this->get_saved_mapping();
+        $source_map    = $this->get_tec_import_source_mapping();
+
+        $this->log( 'Auto-match: ' . count( $source_map ) . ' EventKoi events have _tec_import_source_id.' );
 
         $ek_titles = [];
         foreach ( $ek_events as $ek ) {
@@ -209,63 +238,76 @@ final class EventKoi_Tickets_Importer {
             $ek_titles[ $key ] = $ek['ID'];
         }
 
-        $matched   = 0;
-        $unmatched = 0;
+        $matched          = 0;
+        $unmatched        = 0;
+        $source_matched   = 0;
+        $title_matched    = 0;
+        $fuzzy_matched    = 0;
 
         foreach ( $tec_event_ids as $tec_id ) {
+            // Strategy 1: Authoritative _tec_import_source_id mapping.
+            if ( isset( $source_map[ $tec_id ] ) ) {
+                $mapping[ $tec_id ] = $source_map[ $tec_id ];
+                $matched++;
+                $source_matched++;
+                continue;
+            }
+
+            // Strategy 2 & 3: Title-based matching (for events not in EventKoi's import).
             $tec_post = get_post( $tec_id );
-            if ( ! $tec_post ) {
-                // TEC event deleted — try to match by product name from attendees.
-                $product_name = $this->get_product_name_for_tec_event( $tec_id );
-                if ( $product_name ) {
-                    $key = sanitize_title( $product_name );
-                    if ( isset( $ek_titles[ $key ] ) ) {
-                        $mapping[ $tec_id ] = $ek_titles[ $key ];
-                        $matched++;
-                        continue;
-                    }
-                }
-                // Fuzzy match.
-                $fuzzy = $this->fuzzy_match_title( $product_name ?: '', array_column( $ek_events, 'post_title' ) );
-                if ( $fuzzy ) {
-                    $key = sanitize_title( $fuzzy );
-                    if ( isset( $ek_titles[ $key ] ) ) {
-                        $mapping[ $tec_id ] = $ek_titles[ $key ];
-                        $matched++;
-                        continue;
-                    }
-                }
+            $title    = '';
+
+            if ( $tec_post ) {
+                $title = $tec_post->post_title;
+            } else {
+                // TEC event deleted — use product name from attendees.
+                $title = $this->get_product_name_for_tec_event( $tec_id ) ?: '';
+            }
+
+            if ( empty( $title ) ) {
                 $unmatched++;
                 continue;
             }
 
-            $tec_title = $tec_post->post_title;
-            $key       = sanitize_title( $tec_title );
-
+            // Strategy 2: Exact title match.
+            $key = sanitize_title( $title );
             if ( isset( $ek_titles[ $key ] ) ) {
                 $mapping[ $tec_id ] = $ek_titles[ $key ];
                 $matched++;
-            } else {
-                $fuzzy = $this->fuzzy_match_title( $tec_title, array_column( $ek_events, 'post_title' ) );
-                if ( $fuzzy ) {
-                    $key = sanitize_title( $fuzzy );
-                    if ( isset( $ek_titles[ $key ] ) ) {
-                        $mapping[ $tec_id ] = $ek_titles[ $key ];
-                        $matched++;
-                        continue;
-                    }
-                }
-                $unmatched++;
+                $title_matched++;
+                continue;
             }
+
+            // Strategy 3: Fuzzy title match (≥85%).
+            $fuzzy = $this->fuzzy_match_title( $title, array_column( $ek_events, 'post_title' ) );
+            if ( $fuzzy ) {
+                $fuzzy_key = sanitize_title( $fuzzy );
+                if ( isset( $ek_titles[ $fuzzy_key ] ) ) {
+                    $mapping[ $tec_id ] = $ek_titles[ $fuzzy_key ];
+                    $matched++;
+                    $fuzzy_matched++;
+                    continue;
+                }
+            }
+
+            $unmatched++;
         }
 
         $this->save_mapping( $mapping );
 
+        $this->log( sprintf(
+            'Auto-match: %d total matched (%d via _tec_import_source_id, %d exact title, %d fuzzy). %d unmatched.',
+            $matched, $source_matched, $title_matched, $fuzzy_matched, $unmatched
+        ) );
+
         return [
-            'total_tec_events' => count( $tec_event_ids ),
-            'matched'          => $matched,
-            'unmatched'        => $unmatched,
-            'mapping'          => $mapping,
+            'total_tec_events'  => count( $tec_event_ids ),
+            'matched'           => $matched,
+            'source_matched'    => $source_matched,
+            'title_matched'     => $title_matched,
+            'fuzzy_matched'     => $fuzzy_matched,
+            'unmatched'         => $unmatched,
+            'mapping'           => $mapping,
         ];
     }
 
@@ -733,6 +775,7 @@ final class EventKoi_Tickets_Importer {
         $tec_event_ids = $this->get_tec_event_ids_with_attendees();
         $ek_events     = $this->get_eventkoi_events();
         $mapping       = $this->get_saved_mapping();
+        $source_map    = $this->get_tec_import_source_mapping();
         global $wpdb;
 
         $rows = [];
@@ -744,11 +787,21 @@ final class EventKoi_Tickets_Importer {
                 $tec_id
             ) );
 
+            $match_source = 'none';
+            if ( isset( $mapping[ $tec_id ] ) ) {
+                if ( isset( $source_map[ $tec_id ] ) && (int) $source_map[ $tec_id ] === (int) $mapping[ $tec_id ] ) {
+                    $match_source = 'source';
+                } else {
+                    $match_source = 'manual';
+                }
+            }
+
             $rows[] = [
                 'tec_id'         => $tec_id,
                 'tec_title'      => $tec_title,
                 'attendee_count' => $attendee_count,
                 'ek_event_id'    => isset( $mapping[ $tec_id ] ) ? $mapping[ $tec_id ] : null,
+                'match_source'   => $match_source,
             ];
         }
 
