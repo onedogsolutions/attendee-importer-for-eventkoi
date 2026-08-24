@@ -3,7 +3,7 @@
  * Plugin Name: EventKoi Tickets Importer
  * Plugin URI:  https://onedog.solutions
  * Description: Migrates tickets and attendees from The Events Calendar (Event Tickets / Event Tickets Plus) to EventKoi.
- * Version:     1.2.0
+ * Version:     1.3.0
  * Author:      One Dog Solutions
  * Author URI:  https://onedog.solutions
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'EKTI_VERSION', '1.2.0' );
+define( 'EKTI_VERSION', '1.3.0' );
 define( 'EKTI_LOG_DIR', WP_CONTENT_DIR . '/uploads' );
 define( 'EKTI_LOG_FILE', EKTI_LOG_DIR . '/eventkoi-import.log' );
 define( 'EKTI_BATCH_SIZE', 30 );
@@ -50,6 +50,10 @@ final class EventKoi_Tickets_Importer {
         add_action( 'wp_ajax_ekti_scan_ticket_details', [ $this, 'ajax_scan_ticket_details' ] );
         add_action( 'wp_ajax_ekti_run_ticket_details_sync', [ $this, 'ajax_run_ticket_details_sync' ] );
         add_action( 'wp_ajax_ekti_undo_sync', [ $this, 'ajax_undo_sync' ] );
+        add_action( 'wp_ajax_ekti_scan_calendar_sync', [ $this, 'ajax_scan_calendar_sync' ] );
+        add_action( 'wp_ajax_ekti_save_location_mapping', [ $this, 'ajax_save_location_mapping' ] );
+        add_action( 'wp_ajax_ekti_run_calendar_sync', [ $this, 'ajax_run_calendar_sync' ] );
+        add_action( 'wp_ajax_ekti_undo_calendar_sync', [ $this, 'ajax_undo_calendar_sync' ] );
         add_action( 'wp_ajax_ekti_get_log', [ $this, 'ajax_get_log' ] );
         add_action( 'wp_ajax_ekti_clear_log', [ $this, 'ajax_clear_log' ] );
     }
@@ -1812,6 +1816,9 @@ final class EventKoi_Tickets_Importer {
                 case 'untrash_post':
                     wp_untrash_post( $op['id'] );
                     break;
+                case 'create_term':
+                    wp_delete_term( $op['term_id'], 'event_cal' );
+                    break;
             }
             $counts[ $op['type'] ] = ( $counts[ $op['type'] ] ?? 0 ) + 1;
         }
@@ -2446,6 +2453,482 @@ final class EventKoi_Tickets_Importer {
     }
 
     /* ------------------------------------------------------------------
+     * STEP 8 — CALENDAR SYNC (LOCATIONS)
+     *
+     * Maps The Events Calendar locations (tribe_venue posts referenced
+     * via the _EventVenueID event meta, falling back to the location
+     * name already imported into EventKoi's `location` post meta) onto
+     * EventKoi calendars (event_cal taxonomy terms), then union-appends
+     * the mapped calendar onto each mapped EventKoi event. Append-only
+     * (existing calendars are never removed) and idempotent.
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Normalize a location/calendar name into a comparison key.
+     *
+     * Decodes entities ("San Antonio &#8211; Central"), unifies en/em
+     * dashes with hyphens, lowercases, and collapses everything else
+     * into single hyphens so keys are sanitize_key()-compatible.
+     */
+    private function normalize_location_name( $name ) {
+        $name = html_entity_decode( (string) $name, ENT_QUOTES );
+        $name = str_replace( [ "\u{2013}", "\u{2014}" ], '-', $name );
+        $name = function_exists( 'mb_strtolower' ) ? mb_strtolower( $name ) : strtolower( $name );
+        $name = preg_replace( '/[^a-z0-9]+/', '-', $name );
+        return trim( $name, '-' );
+    }
+
+    /**
+     * Collect distinct locations across the saved event mapping.
+     *
+     * Primary source: TEC venue post title via _EventVenueID meta.
+     * Fallback: the location name left on the EventKoi event by
+     * EventKoi's native importer (`location` meta array, `name` key).
+     * Returns key => [ name, venue_id, events (tec_id => ek_id) ].
+     */
+    private function get_tec_locations() {
+        $mapping   = $this->get_saved_mapping();
+        $locations = [];
+
+        foreach ( $mapping as $tec_id => $ek_id ) {
+            $tec_id = (int) $tec_id;
+            $ek_id  = (int) $ek_id;
+            if ( ! $ek_id || ! get_post( $ek_id ) ) {
+                continue;
+            }
+
+            $name     = '';
+            $venue_id = 0;
+            $vid      = (int) get_post_meta( $tec_id, '_EventVenueID', true );
+            if ( $vid ) {
+                $venue = get_post( $vid );
+                if ( $venue && '' !== trim( $venue->post_title ) ) {
+                    $name     = html_entity_decode( $venue->post_title, ENT_QUOTES );
+                    $venue_id = $vid;
+                }
+            }
+            if ( '' === trim( $name ) ) {
+                $loc = get_post_meta( $ek_id, 'location', true );
+                if ( is_array( $loc ) && ! empty( $loc['name'] ) ) {
+                    $name = $loc['name'];
+                }
+            }
+            if ( '' === trim( $name ) ) {
+                continue;
+            }
+
+            $key = $this->normalize_location_name( $name );
+            if ( '' === $key ) {
+                continue;
+            }
+            if ( ! isset( $locations[ $key ] ) ) {
+                $locations[ $key ] = [ 'name' => $name, 'venue_id' => $venue_id, 'events' => [] ];
+            }
+            if ( $venue_id && ! $locations[ $key ]['venue_id'] ) {
+                $locations[ $key ]['venue_id'] = $venue_id;
+            }
+            $locations[ $key ]['events'][ $tec_id ] = $ek_id;
+        }
+
+        ksort( $locations );
+        return $locations;
+    }
+
+    /**
+     * All EventKoi calendars (event_cal terms), sorted by name.
+     */
+    private function get_eventkoi_calendars() {
+        $terms = get_terms( [ 'taxonomy' => 'event_cal', 'hide_empty' => false ] );
+        if ( is_wp_error( $terms ) ) {
+            return [];
+        }
+        $cals = [];
+        foreach ( $terms as $t ) {
+            $cals[] = [
+                'term_id' => (int) $t->term_id,
+                'name'    => $t->name,
+                'slug'    => $t->slug,
+                'count'   => (int) $t->count,
+            ];
+        }
+        usort( $cals, function ( $a, $b ) {
+            return strcasecmp( $a['name'], $b['name'] );
+        } );
+        return $cals;
+    }
+
+    /**
+     * Auto-match locations to calendars by name content.
+     *
+     * Priority: exact normalized-name match, then containment (prefer
+     * the longest shared name), then similar_text() >= 85% (same
+     * threshold as event fuzzy matching).
+     */
+    private function auto_map_locations( $locations, $calendars ) {
+        $by_norm = [];
+        foreach ( $calendars as $cal ) {
+            $nk = $this->normalize_location_name( $cal['name'] );
+            if ( '' !== $nk && ! isset( $by_norm[ $nk ] ) ) {
+                $by_norm[ $nk ] = $cal;
+            }
+        }
+
+        $suggestions = [];
+        foreach ( $locations as $key => $loc ) {
+            $best = [ 'term_id' => null, 'term_name' => null, 'match_source' => 'none' ];
+
+            if ( isset( $by_norm[ $key ] ) ) {
+                $best = [
+                    'term_id'      => $by_norm[ $key ]['term_id'],
+                    'term_name'    => $by_norm[ $key ]['name'],
+                    'match_source' => 'exact',
+                ];
+            } else {
+                // Containment: prefer the longest calendar name shared with the location.
+                $contain = null;
+                foreach ( $calendars as $cal ) {
+                    $norm = $this->normalize_location_name( $cal['name'] );
+                    if ( '' === $norm ) {
+                        continue;
+                    }
+                    if ( false !== strpos( $key, $norm ) || false !== strpos( $norm, $key ) ) {
+                        if ( null === $contain
+                            || strlen( $norm ) > strlen( $this->normalize_location_name( $contain['name'] ) ) ) {
+                            $contain = $cal;
+                        }
+                    }
+                }
+                if ( $contain ) {
+                    $best = [
+                        'term_id'      => $contain['term_id'],
+                        'term_name'    => $contain['name'],
+                        'match_source' => 'fuzzy',
+                    ];
+                } else {
+                    // Fuzzy similarity.
+                    $fuzzy_best = null;
+                    $fuzzy_pct  = 0;
+                    foreach ( $calendars as $cal ) {
+                        similar_text( $key, $this->normalize_location_name( $cal['name'] ), $pct );
+                        if ( $pct > $fuzzy_pct ) {
+                            $fuzzy_pct  = $pct;
+                            $fuzzy_best = $cal;
+                        }
+                    }
+                    if ( $fuzzy_best && $fuzzy_pct >= 85.0 ) {
+                        $best = [
+                            'term_id'      => $fuzzy_best['term_id'],
+                            'term_name'    => $fuzzy_best['name'],
+                            'match_source' => 'fuzzy',
+                        ];
+                    }
+                }
+            }
+
+            $suggestions[ $key ] = $best;
+        }
+        return $suggestions;
+    }
+
+    /**
+     * Location mapping persistence (option: location key => target).
+     * Target is an int term_id, or "new:<name>" for create-on-run.
+     */
+    private function get_saved_location_mapping() {
+        $mapping = get_option( 'ekti_location_mapping', [] );
+        return is_array( $mapping ) ? $mapping : [];
+    }
+
+    private function save_location_mapping( $mapping ) {
+        update_option( 'ekti_location_mapping', $mapping, false );
+    }
+
+    /**
+     * Sanitize a raw location mapping payload from the admin UI.
+     */
+    private function sanitize_location_mapping( $mapping ) {
+        $clean = [];
+        if ( ! is_array( $mapping ) ) {
+            return $clean;
+        }
+        foreach ( $mapping as $key => $value ) {
+            $key = sanitize_key( $key );
+            if ( '' === $key || '' === $value || null === $value ) {
+                continue;
+            }
+            if ( is_string( $value ) && 0 === strpos( $value, 'new:' ) ) {
+                $name = sanitize_text_field( substr( $value, 4 ) );
+                if ( '' !== $name ) {
+                    $clean[ $key ] = 'new:' . $name;
+                }
+            } else {
+                $tid = (int) $value;
+                if ( $tid > 0 ) {
+                    $clean[ $key ] = $tid;
+                }
+            }
+        }
+        return $clean;
+    }
+
+    /**
+     * First existing event_cal term carrying EventKoi's display term
+     * meta — used as the template when creating new calendars.
+     */
+    private function get_calendar_template_id() {
+        global $wpdb;
+        return (int) $wpdb->get_var(
+            "SELECT tm.term_id FROM {$wpdb->termmeta} tm
+             JOIN {$wpdb->term_taxonomy} tt ON tm.term_id = tt.term_id
+             WHERE tt.taxonomy = 'event_cal' AND tm.meta_key = 'display'
+             ORDER BY tm.term_id ASC LIMIT 1"
+        );
+    }
+
+    /**
+     * Create an EventKoi calendar, reusing an existing term when the
+     * normalized name already exists. Audits a create_term op (undone
+     * by deleting the term).
+     */
+    private function create_eventkoi_calendar( $name, &$ops ) {
+        $name = sanitize_text_field( $name );
+        if ( '' === $name ) {
+            return new WP_Error( 'ekti_empty_calendar_name', 'Calendar name is empty.' );
+        }
+
+        $norm = $this->normalize_location_name( $name );
+        foreach ( $this->get_eventkoi_calendars() as $cal ) {
+            if ( $this->normalize_location_name( $cal['name'] ) === $norm ) {
+                return $cal['term_id'];
+            }
+        }
+
+        $created = wp_insert_term( $name, 'event_cal' );
+        if ( is_wp_error( $created ) ) {
+            return $created;
+        }
+        $term_id = (int) $created['term_id'];
+
+        // Copy EventKoi's display settings from a template calendar.
+        $template_id = $this->get_calendar_template_id();
+        if ( $template_id ) {
+            $meta = get_term_meta( $template_id );
+            foreach ( $meta as $meta_key => $values ) {
+                if ( is_array( $values ) && isset( $values[0] ) ) {
+                    add_term_meta( $term_id, $meta_key, $values[0] );
+                }
+            }
+        }
+
+        $ops[] = [ 'type' => 'create_term', 'term_id' => $term_id, 'name' => $name ];
+        $this->log( "Calendar sync: created EventKoi calendar \"{$name}\" (#{$term_id})." );
+        return $term_id;
+    }
+
+    /**
+     * Read-only scan: locations, calendars, auto-map suggestions, and
+     * per-location pending assignment counts (serves as the preview).
+     */
+    private function scan_calendar_sync() {
+        $locations   = $this->get_tec_locations();
+        $calendars   = $this->get_eventkoi_calendars();
+        $suggestions = $this->auto_map_locations( $locations, $calendars );
+        $saved       = $this->get_saved_location_mapping();
+
+        $rows   = [];
+        $counts = [
+            'locations'          => count( $locations ),
+            'mapped_events'      => 0,
+            'pending'            => 0,
+            'new_calendars'      => 0,
+            'unmapped_locations' => 0,
+        ];
+
+        foreach ( $locations as $key => $loc ) {
+            $sugg = isset( $suggestions[ $key ] )
+                ? $suggestions[ $key ]
+                : [ 'term_id' => null, 'term_name' => null, 'match_source' => 'none' ];
+
+            // Saved mapping wins over the auto-map suggestion.
+            $selected = isset( $saved[ $key ] ) ? $saved[ $key ] : $sugg['term_id'];
+
+            $is_new  = is_string( $selected ) && 0 === strpos( $selected, 'new:' );
+            $term_id = $is_new ? 0 : (int) $selected;
+
+            $pending = 0;
+            $seen    = [];
+            foreach ( $loc['events'] as $ek_id ) {
+                $counts['mapped_events']++;
+                if ( isset( $seen[ $ek_id ] ) ) {
+                    continue;
+                }
+                $seen[ $ek_id ] = true;
+                if ( $is_new ) {
+                    $pending++;
+                    continue;
+                }
+                if ( $term_id <= 0 ) {
+                    continue;
+                }
+                $current = wp_get_object_terms( $ek_id, 'event_cal', [ 'fields' => 'ids' ] );
+                if ( is_wp_error( $current ) || ! in_array( $term_id, array_map( 'intval', $current ), true ) ) {
+                    $pending++;
+                }
+            }
+
+            if ( $is_new ) {
+                $counts['new_calendars']++;
+            } elseif ( $term_id <= 0 ) {
+                $counts['unmapped_locations']++;
+            }
+            $counts['pending'] += $pending;
+
+            $rows[] = [
+                'key'                 => $key,
+                'name'                => $loc['name'],
+                'venue_id'            => $loc['venue_id'],
+                'source'              => $loc['venue_id'] ? 'venue' : 'eventkoi',
+                'event_count'         => count( $loc['events'] ),
+                'match_source'        => $sugg['match_source'],
+                'suggested_term_id'   => $sugg['term_id'],
+                'suggested_term_name' => $sugg['term_name'],
+                'selected'            => ( '' === $selected || null === $selected ) ? '' : (string) $selected,
+                'pending'             => $pending,
+            ];
+        }
+
+        return [
+            'locations' => $rows,
+            'calendars' => $calendars,
+            'counts'    => $counts,
+        ];
+    }
+
+    /**
+     * Apply the location mapping: create any "new:" calendars, then
+     * union-append each target calendar onto the mapped EventKoi
+     * events. Chunked, idempotent, audited to ekti_cal_sync_audit.
+     */
+    private function run_calendar_sync( $mapping, $chunk = 100 ) {
+        $ops = [];
+
+        // Resolve create-new targets up front so the whole run is
+        // audited even if later chunks fail.
+        foreach ( $mapping as $key => $target ) {
+            if ( is_string( $target ) && 0 === strpos( $target, 'new:' ) ) {
+                $term_id = $this->create_eventkoi_calendar( substr( $target, 4 ), $ops );
+                if ( is_wp_error( $term_id ) ) {
+                    if ( $ops ) {
+                        $this->audit_push_cal_sync( $ops );
+                    }
+                    return [ 'error' => $term_id->get_error_message() ];
+                }
+                $mapping[ $key ] = $term_id;
+            }
+        }
+        if ( $ops ) {
+            $this->audit_push_cal_sync( $ops );
+        }
+        // Persist the resolved targets so reruns and undo agree.
+        $this->save_location_mapping( $mapping );
+
+        $locations = $this->get_tec_locations();
+        $pending   = [];
+        $seen      = [];
+        foreach ( $mapping as $key => $term_id ) {
+            $term_id = (int) $term_id;
+            if ( $term_id <= 0 || ! isset( $locations[ $key ] ) ) {
+                continue;
+            }
+            foreach ( $locations[ $key ]['events'] as $tec_id => $ek_id ) {
+                if ( isset( $seen[ $ek_id . ':' . $term_id ] ) ) {
+                    continue;
+                }
+                $seen[ $ek_id . ':' . $term_id ] = true;
+                $current = wp_get_object_terms( $ek_id, 'event_cal', [ 'fields' => 'ids' ] );
+                if ( is_wp_error( $current ) ) {
+                    continue;
+                }
+                $current = array_map( 'intval', $current );
+                if ( in_array( $term_id, $current, true ) ) {
+                    continue;
+                }
+                $pending[] = [
+                    'tec_id'  => $tec_id,
+                    'ek_id'   => $ek_id,
+                    'term_id' => $term_id,
+                    'current' => $current,
+                ];
+            }
+        }
+
+        $batch   = array_slice( $pending, 0, $chunk );
+        $results = [];
+        $applied = 0;
+        $errors  = 0;
+        $batch_ops = [];
+
+        foreach ( $batch as $p ) {
+            $set = wp_set_object_terms( $p['ek_id'], [ $p['term_id'] ], 'event_cal', true );
+            if ( is_wp_error( $set ) ) {
+                $errors++;
+                $results[] = [ 'action' => 'error', 'ek_id' => $p['ek_id'], 'reason' => $set->get_error_message() ];
+                continue;
+            }
+            $batch_ops[] = [ 'type' => 'set_terms', 'post' => $p['ek_id'], 'old_term_ids' => $p['current'] ];
+            $applied++;
+            $results[] = [ 'action' => 'assigned', 'ek_id' => $p['ek_id'], 'tec_id' => $p['tec_id'], 'term_id' => $p['term_id'] ];
+        }
+
+        if ( $batch_ops ) {
+            $this->audit_push_cal_sync( $batch_ops );
+        }
+        if ( $applied || $errors ) {
+            $this->log( sprintf(
+                'Calendar sync chunk: %d assigned, %d errors (%d still pending).',
+                $applied, $errors, count( $pending ) - count( $batch )
+            ) );
+        }
+
+        return [
+            'processed' => count( $batch ),
+            'applied'   => $applied,
+            'errors'    => $errors,
+            'done'      => count( $pending ) <= count( $batch ),
+            'results'   => $results,
+        ];
+    }
+
+    /**
+     * Append audit ops to the calendar sync ledger (separate from the
+     * cleanup and ticket-sync ledgers so undos never cross-contaminate).
+     */
+    private function audit_push_cal_sync( $ops ) {
+        if ( empty( $ops ) ) {
+            return;
+        }
+        $audit = get_option( 'ekti_cal_sync_audit', [] );
+        if ( ! is_array( $audit ) ) {
+            $audit = [];
+        }
+        update_option( 'ekti_cal_sync_audit', array_merge( $audit, $ops ), false );
+    }
+
+    /**
+     * Undo the last calendar sync by replaying the ledger in reverse.
+     */
+    private function undo_calendar_sync() {
+        $audit = get_option( 'ekti_cal_sync_audit', [] );
+        if ( empty( $audit ) ) {
+            return [ 'error' => 'Nothing to undo.' ];
+        }
+        $counts = $this->replay_audit_ops( $audit );
+        delete_option( 'ekti_cal_sync_audit' );
+        $this->log( 'Calendar sync undo complete. ' . wp_json_encode( $counts ) );
+        return [ 'undone' => $counts ];
+    }
+
+    /* ------------------------------------------------------------------
      * AJAX HANDLERS
      * ------------------------------------------------------------------ */
 
@@ -2657,6 +3140,48 @@ final class EventKoi_Tickets_Importer {
         wp_send_json_success( $result );
     }
 
+    public function ajax_scan_calendar_sync() {
+        $this->check_ajax();
+        wp_send_json_success( $this->scan_calendar_sync() );
+    }
+
+    public function ajax_save_location_mapping() {
+        $this->check_ajax();
+        $mapping = isset( $_POST['mapping'] ) ? json_decode( stripslashes( $_POST['mapping'] ), true ) : [];
+        $clean   = $this->sanitize_location_mapping( $mapping );
+        $this->save_location_mapping( $clean );
+        $this->log( 'Location mapping saved. ' . count( $clean ) . ' locations.' );
+        wp_send_json_success( [ 'saved' => count( $clean ) ] );
+    }
+
+    public function ajax_run_calendar_sync() {
+        $this->check_ajax();
+        // A mapping payload in the request wins; otherwise use the saved one.
+        if ( isset( $_POST['mapping'] ) ) {
+            $clean = $this->sanitize_location_mapping( json_decode( stripslashes( $_POST['mapping'] ), true ) );
+            $this->save_location_mapping( $clean );
+        } else {
+            $clean = $this->get_saved_location_mapping();
+        }
+        if ( empty( $clean ) ) {
+            wp_send_json_error( 'No location mapping saved. Scan locations and save a mapping first.' );
+        }
+        $result = $this->run_calendar_sync( $clean );
+        if ( isset( $result['error'] ) ) {
+            wp_send_json_error( $result['error'] );
+        }
+        wp_send_json_success( $result );
+    }
+
+    public function ajax_undo_calendar_sync() {
+        $this->check_ajax();
+        $result = $this->undo_calendar_sync();
+        if ( isset( $result['error'] ) ) {
+            wp_send_json_error( $result['error'] );
+        }
+        wp_send_json_success( $result );
+    }
+
     public function ajax_get_log() {
         $this->check_ajax();
         $lines = 50;
@@ -2797,6 +3322,34 @@ final class EventKoi_Tickets_Importer {
                             <tr><th>Event ID</th><th>Title</th><th>Reason</th></tr>
                         </thead>
                         <tbody id="ekti-sync-review-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Calendar Sync Panel -->
+            <div class="ekti-panel" id="ekti-calsync-panel">
+                <h2>Calendar Sync (Locations)</h2>
+                <p>Map The Events Calendar locations to EventKoi calendars. The selected calendar is added to each mapped EventKoi event — existing calendars are never removed. All changes are audited and undoable.</p>
+                <div class="ekti-actions">
+                    <button class="button button-primary" id="ekti-calsync-scan">Scan Locations</button>
+                    <button class="button" id="ekti-calsync-save" disabled>Save Mapping</button>
+                    <button class="button" id="ekti-calsync-run" disabled>Run Calendar Sync</button>
+                    <button class="button button-secondary" id="ekti-calsync-undo" style="color:#a00;">Undo Last Calendar Sync</button>
+                </div>
+                <div id="ekti-calsync-status" class="ekti-status"></div>
+                <div id="ekti-calsync-progress-wrap" style="display:none;">
+                    <div class="ekti-progress-bar">
+                        <div class="ekti-progress-fill" id="ekti-calsync-progress-fill" style="width:0%"></div>
+                    </div>
+                    <div class="ekti-progress-text" id="ekti-calsync-progress-text">0%</div>
+                </div>
+                <div id="ekti-calsync-table-wrap" style="display:none;">
+                    <h3>Location &rarr; Calendar Mapping</h3>
+                    <table class="wp-list-table widefat fixed striped">
+                        <thead>
+                            <tr><th>TEC Location</th><th>Source</th><th>Mapped Events</th><th>Auto-Match</th><th>EventKoi Calendar</th><th>Pending</th></tr>
+                        </thead>
+                        <tbody id="ekti-calsync-tbody"></tbody>
                     </table>
                 </div>
             </div>

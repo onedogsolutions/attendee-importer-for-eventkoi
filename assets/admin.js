@@ -645,6 +645,210 @@
     }
 
     /* ------------------------------------------------------------------ */
+    /*  CALENDAR SYNC (LOCATIONS)                                         */
+    /* ------------------------------------------------------------------ */
+
+    var calSyncRunning = false;
+    var calSyncTotals  = { pending: 0, new_calendars: 0 };
+
+    function collectCalMapping() {
+        var mapping = {};
+        $('.ekti-cal-select').each(function () {
+            var key = $(this).data('loc-key');
+            var val = $(this).val();
+            if (val === 'new') {
+                var name = $.trim($('.ekti-cal-new-name[data-loc-key="' + key + '"]').val());
+                if (name !== '') {
+                    mapping[key] = 'new:' + name;
+                }
+            } else if (val !== '') {
+                mapping[key] = val;
+            }
+        });
+        return mapping;
+    }
+
+    function scanCalendarSync() {
+        appendConsole('Scanning locations...', 'info');
+        setStatus('#ekti-calsync-status', '<span class="ekti-spinner"></span> Scanning...', 'info');
+        ajax('ekti_scan_calendar_sync', {}, function (resp) {
+            if (!resp.success) {
+                appendConsole('Scan error: ' + resp.data, 'error');
+                setStatus('#ekti-calsync-status', 'Scan failed.', 'error');
+                return;
+            }
+            var d = resp.data;
+            var c = d.counts;
+
+            // Calendar dropdown options (shared across rows).
+            var calOptions = '<option value="">\u2014 None \u2014</option>';
+            $.each(d.calendars, function (i, cal) {
+                calOptions += '<option value="' + cal.term_id + '">' + escapeHtml(cal.name) + ' (' + cal.count + ')</option>';
+            });
+            calOptions += '<option value="new">\u2795 Create new calendar\u2026</option>';
+
+            var $tb = $('#ekti-calsync-tbody').empty();
+            $.each(d.locations, function (i, loc) {
+                var source = loc.source === 'venue'
+                    ? 'TEC venue #' + loc.venue_id
+                    : 'EventKoi location meta';
+
+                var badge;
+                if (loc.match_source === 'exact') {
+                    badge = '<span style="color:#16a34a;font-size:11px;" title="Exact name match">&#x2713; exact</span>';
+                } else if (loc.match_source === 'fuzzy') {
+                    badge = '<span style="color:#d97706;font-size:11px;" title="Similar name match">~ fuzzy: ' + escapeHtml(loc.suggested_term_name || '') + '</span>';
+                } else {
+                    badge = '<span style="color:#646970;font-size:11px;">no match</span>';
+                }
+
+                // Preselect the saved mapping or the auto-match suggestion.
+                var selected = loc.selected;
+                var isNew = selected.indexOf('new:') === 0;
+                var selectHtml = calOptions;
+                if (isNew) {
+                    selectHtml = selectHtml.replace('value="new"', 'value="new" selected');
+                } else if (selected !== '') {
+                    selectHtml = selectHtml.replace(
+                        'value="' + selected + '"',
+                        'value="' + selected + '" selected'
+                    );
+                }
+                var newInput = '<input type="text" class="ekti-cal-new-name" data-loc-key="' + loc.key + '" placeholder="New calendar name" value="' + escapeHtml(isNew ? selected.substring(4) : loc.name) + '" style="' + (isNew ? '' : 'display:none;') + 'margin-left:6px;" />';
+
+                $tb.append('<tr>' +
+                    '<td><strong>' + escapeHtml(loc.name) + '</strong></td>' +
+                    '<td>' + source + '</td>' +
+                    '<td>' + loc.event_count + '</td>' +
+                    '<td>' + badge + '</td>' +
+                    '<td><select class="ekti-cal-select" data-loc-key="' + loc.key + '">' + selectHtml + '</select>' + newInput + '</td>' +
+                    '<td>' + loc.pending + '</td>' +
+                    '</tr>');
+            });
+
+            $('#ekti-calsync-table-wrap').toggle(d.locations.length > 0);
+            calSyncTotals = { pending: c.pending, new_calendars: c.new_calendars };
+            $('#ekti-calsync-save').prop('disabled', calSyncRunning || d.locations.length === 0);
+            $('#ekti-calsync-run').prop('disabled', calSyncRunning || c.pending === 0);
+
+            setStatus('#ekti-calsync-status',
+                'Scan complete: <strong>' + c.locations + '</strong> locations across ' +
+                '<strong>' + c.mapped_events + '</strong> mapped events; ' +
+                '<strong>' + c.pending + '</strong> calendar assignments pending' +
+                (c.new_calendars > 0 ? ' (<strong>' + c.new_calendars + '</strong> new calendars to create)' : '') +
+                (c.unmapped_locations > 0 ? '; <strong>' + c.unmapped_locations + '</strong> locations unmapped' : '') + '.',
+                c.pending > 0 ? 'info' : 'success'
+            );
+            appendConsole('Calendar scan: ' + c.locations + ' locations, ' + c.pending + ' assignments pending' + (c.new_calendars > 0 ? ', ' + c.new_calendars + ' calendars to create' : '') + '.', 'info');
+        });
+    }
+
+    function saveCalMapping() {
+        var mapping = collectCalMapping();
+        appendConsole('Saving location mapping (' + Object.keys(mapping).length + ' locations)...', 'info');
+        ajax('ekti_save_location_mapping', { mapping: JSON.stringify(mapping) }, function (resp) {
+            if (!resp.success) {
+                appendConsole('Error saving location mapping: ' + resp.data, 'error');
+                return;
+            }
+            appendConsole('Location mapping saved. ' + resp.data.saved + ' locations.', 'info');
+            setStatus('#ekti-calsync-status', 'Location mapping saved.', 'success');
+        });
+    }
+
+    function updateCalSyncProgress(processed, total) {
+        var pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 100;
+        $('#ekti-calsync-progress-fill').css('width', pct + '%');
+        $('#ekti-calsync-progress-text').text(pct + '% (' + processed + '/' + total + ')');
+    }
+
+    function loopCalSync(mapping, total) {
+        var processed = 0;
+        var applied   = 0;
+        var errors    = 0;
+        $('#ekti-calsync-progress-wrap').show();
+        updateCalSyncProgress(0, total);
+
+        function step() {
+            ajax('ekti_run_calendar_sync', { mapping: JSON.stringify(mapping) }, function (resp) {
+                if (!resp.success) {
+                    appendConsole('Calendar sync error: ' + resp.data, 'error');
+                    calSyncRunning = false;
+                    $('#ekti-calsync-run').prop('disabled', false);
+                    return;
+                }
+                var d = resp.data;
+                $.each(d.results || [], function (i, r) {
+                    if (r.action === 'assigned') {
+                        appendConsole('\u2713 EventKoi #' + r.ek_id + ' (TEC ' + r.tec_id + ') \u2192 calendar #' + r.term_id);
+                    } else if (r.action === 'error') {
+                        appendConsole('\u2717 Error EK #' + r.ek_id + ': ' + r.reason, 'error');
+                    }
+                });
+                processed += d.applied;
+                applied += d.applied;
+                errors += (d.errors || 0);
+                updateCalSyncProgress(processed, total);
+
+                if (d.done) {
+                    appendConsole('=== Calendar Sync complete: ' + applied + ' assignments' + (errors > 0 ? ', ' + errors + ' errors' : '') + ' ===', 'info');
+                    setStatus('#ekti-calsync-status',
+                        'Sync complete: <strong>' + applied + '</strong> calendar assignments applied' +
+                        (errors > 0 ? ', <strong>' + errors + '</strong> errors' : '') + '.',
+                        errors > 0 ? 'warning' : 'success'
+                    );
+                    calSyncRunning = false;
+                    updateCalSyncProgress(total, total);
+                    scanCalendarSync();
+                } else if (d.applied === 0) {
+                    // No progress on this chunk — stop to avoid an infinite loop.
+                    appendConsole('Calendar sync stopped: no progress made with ' + (total - processed) + ' items still pending.', 'error');
+                    calSyncRunning = false;
+                    $('#ekti-calsync-run').prop('disabled', false);
+                } else {
+                    setTimeout(step, 200);
+                }
+            });
+        }
+        step();
+    }
+
+    function runCalSync() {
+        if (calSyncRunning) return;
+        var mapping = collectCalMapping();
+        if (Object.keys(mapping).length === 0) {
+            setStatus('#ekti-calsync-status', 'No locations mapped. Choose an EventKoi calendar for at least one location.', 'warning');
+            return;
+        }
+        if (!confirm('Apply ' + calSyncTotals.pending + ' calendar assignments' + (calSyncTotals.new_calendars > 0 ? ' (creating ' + calSyncTotals.new_calendars + ' new calendar(s))' : '') + '? Existing calendars are never removed. Changes are audited and can be undone.')) {
+            return;
+        }
+        calSyncRunning = true;
+        $('#ekti-calsync-run').prop('disabled', true);
+        appendConsole('=== Starting Calendar Sync ===', 'info');
+        loopCalSync(mapping, calSyncTotals.pending);
+    }
+
+    function undoCalSync() {
+        if (!confirm('Undo the last calendar sync (restores previous calendar assignments and deletes any calendars created by the sync)?')) {
+            return;
+        }
+        appendConsole('=== Undoing Last Calendar Sync ===', 'warn');
+        ajax('ekti_undo_calendar_sync', {}, function (resp) {
+            if (!resp.success) {
+                appendConsole('Undo error: ' + resp.data, 'error');
+                return;
+            }
+            var counts = resp.data.undone || {};
+            $.each(counts, function (type, n) {
+                appendConsole('  ' + type + ': ' + n, 'warn');
+            });
+            appendConsole('Undo complete.', 'warn');
+            scanCalendarSync();
+        });
+    }
+
+    /* ------------------------------------------------------------------ */
     /*  INIT                                                              */
     /* ------------------------------------------------------------------ */
 
@@ -667,6 +871,15 @@
         $('#ekti-sync-scan').on('click', scanTicketDetails);
         $('#ekti-sync-run').on('click', runSync);
         $('#ekti-sync-undo').on('click', undoSync);
+        $('#ekti-calsync-scan').on('click', scanCalendarSync);
+        $('#ekti-calsync-save').on('click', saveCalMapping);
+        $('#ekti-calsync-run').on('click', runCalSync);
+        $('#ekti-calsync-undo').on('click', undoCalSync);
+        // Show/hide the create-new-calendar name input.
+        $(document).on('change', '.ekti-cal-select', function () {
+            var key = $(this).data('loc-key');
+            $('.ekti-cal-new-name[data-loc-key="' + key + '"]').toggle($(this).val() === 'new');
+        });
         $('#ekti-load-log').on('click', loadLog);
         $('#ekti-clear-log').on('click', clearLog);
     });

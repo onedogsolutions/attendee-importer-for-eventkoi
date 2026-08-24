@@ -7,14 +7,15 @@ condensed version of each build step so progress and plan travel together in one
 top-level document.
 
 - **Branch:** `main`
-- **Plugin version:** 1.2.0
+- **Plugin version:** 1.3.0
 - **Last updated:** 2026-08-23
-- **Overall status:** ✅ Step 7 complete — **Ticket Details Sync** shipped
-  and executed on dev: 664 ticket rows backfilled with sale windows +
-  capacity, 33 multi-product events reconciled into 40 new + 37 converted
-  distinct ticket types, 291 product bindings written — fully audited,
-  undo verified, idempotent. Ready for the ticket import pipeline
-  (Auto-Match → mapping review → dry run → live import).
+- **Overall status:** ✅ Step 8 complete — **Calendar Sync (Locations)**
+  shipped and executed on dev: 414 calendar assignments applied
+  (Austin 209, San Antonio 156, The Bake Lab 49), fully audited,
+  undo + idempotency + create-new-calendar paths all verified. Dev
+  left in the synced state. The importer pipeline is feature-complete:
+  Auto-Match → mapping review → cleanup → ticket sync → calendar sync
+  → dry run → live import.
 
 ## Shared project facts (true for every step)
 
@@ -53,16 +54,18 @@ top-level document.
 | 5 | WooCommerce order linking (parent orders, charges, composite keys, WC meta) | ✅ Done | 0ca72b3 |
 | 6 | Pre-Import Cleanup (stale ticket dedupe + duplicate event merge, audit + undo) | ✅ Done | 7a1ee56 |
 | 7 | Ticket Details Sync (sale windows, capacity, multi-product reconciliation) | ✅ Done | eb57243 |
+| 8 | Calendar Sync (TEC locations → EventKoi calendars mapper) | ✅ Done | (see commit) |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
 
-**Step 7 (Ticket Details Sync) executed + verified on dev (2026-08-23).**
+**Step 8 (Calendar Sync) executed + verified on dev (2026-08-23).**
 
 - **Proceed with the ticket import** on dev: Auto-Match → review mapping →
   dry run → live import. Sync scan now reports 0 actionable items
-  (attendee imports resolve via `_ekti_tec_product_*` bindings).
+  (attendee imports resolve via `_ekti_tec_product_*` bindings); calendar
+  sync is applied and idempotent (re-scan reports 0 pending).
 - **3 review items remain** (inverted sale windows — TEC event published
   after the computed off-sale cutoff; window skipped, fields left NULL):
   Pie (TEC 44302), Fondant Hamburger Cake (TEC 48791), + 1 similar.
@@ -393,9 +396,86 @@ posts, no TEC source).
 
 ---
 
+### Step 8 — Calendar Sync (TEC locations → EventKoi calendars) ✅
+Translates The Events Calendar **locations** into EventKoi **calendars**.
+Discovery on dev (via ott-dev): TEC stores locations as `tribe_venue`
+CPT posts linked by `_EventVenueID` event meta (3 venues: Austin,
+San Antonio – Central, The Bake Lab; 412/419 mapped events carry the
+meta, the other 7 still have the location name in EventKoi's `location`
+post meta from the native import). EventKoi calendars are `event_cal`
+taxonomy terms; events hold multiple calendars (category calendars were
+already synced by EventKoi's native importer — names AND assignments
+match the 19 `tribe_events_cat` terms), but the 3 location calendars
+existed with ZERO assignments. Assignment is **append-only union**
+(never removes existing calendars), idempotent, and audited.
+
+New backend methods on the singleton class:
+- `normalize_location_name()` — entity-decodes, unifies en/em dashes,
+  lowercases, collapses to a `sanitize_key()`-safe slug key. Single
+  normalizer for both location keys and calendar-name comparison
+  ("San Antonio &#8211; Central" → `san-antonio-central`).
+- `get_tec_locations()` — distinct locations across `ekti_event_mapping`:
+  venue title via `_EventVenueID`, fallback EK `location` meta `name`.
+  Returns key → [ name, venue_id, events (tec_id → ek_id) ].
+- `get_eventkoi_calendars()` — all `event_cal` terms sorted by name.
+- `auto_map_locations()` — priority: exact normalized match →
+  containment (longest shared name) → `similar_text()` ≥ 85% (same
+  threshold as event fuzzy match). Per-location suggestion +
+  `match_source` (exact/fuzzy/none).
+- `scan_calendar_sync()` — read-only preview: locations with auto-map
+  suggestions (saved mapping wins over suggestion), per-location pending
+  counts (unique EK events lacking the target term), summary counts.
+- `create_eventkoi_calendar()` — case-insensitive dedup against existing
+  terms, else `wp_insert_term()` + copies EventKoi's display term-meta
+  set from a template calendar (first `event_cal` term with a `display`
+  meta key); audits a `create_term` op.
+- `run_calendar_sync($mapping, $chunk=100)` — resolves `new:<name>`
+  targets first (audited), persists the resolved mapping, then
+  union-appends each target term via `wp_set_object_terms( ..., true )`
+  (same pattern as `merge_loser_into()`'s calendar union). Dedupes by
+  ek_id+term_id, skips already-assigned events, audits each write as the
+  existing `set_terms` op. Chunked with an applied/errors/done protocol.
+- `undo_calendar_sync()` — replays the separate `ekti_cal_sync_audit`
+  ledger (same rationale as Step 7's separate `ekti_sync_audit`).
+- `replay_audit_ops()` gained the `create_term` case → `wp_delete_term()`.
+- `get_saved_location_mapping()` / `save_location_mapping()` /
+  `sanitize_location_mapping()` — `ekti_location_mapping` option
+  (location key → int term_id, or `new:<name>`).
+- AJAX: `ajax_scan_calendar_sync`, `ajax_save_location_mapping`,
+  `ajax_run_calendar_sync` (request mapping payload wins, else saved),
+  `ajax_undo_calendar_sync` — all nonce + `manage_options` gated.
+
+New admin panel **"Calendar Sync (Locations)"** (seventh panel): Scan
+renders one row per location (name + source, mapped-event count,
+auto-match badge ✓ exact / ~ fuzzy, calendar `<select>` with all
+calendars + "— None —" + "➕ Create new calendar…" revealing a name
+input); Save Mapping / Run Calendar Sync (JS confirm) / Undo Last
+Calendar Sync. `admin.js` gained `scanCalendarSync()` / `collectCalMapping()`
+/ `saveCalMapping()` / `loopCalSync()` (with a no-progress stop guard) /
+`runCalSync()` / `undoCalSync()`. Version bumped to 1.3.0.
+
+**Dev execution results (2026-08-23):** Scan found exactly 3 locations
+(419 mapped events): Austin → "Austin" exact, The Bake Lab → "The Bake
+Lab" exact, San Antonio – Central → "San Antonio" fuzzy; 414 assignments
+pending. Sync ran in 5 chunks of ≤100: 414 applied, 0 errors; calendar
+relationship counts Austin 209, San Antonio 156, The Bake Lab 49
+(term `count` shows 47/… because it only counts published posts).
+Spot-checked mapped events keep their category calendars AND gain the
+location calendar; unmapped EK events are untouched. Re-run applied 0
+(idempotent); re-scan reports 0 pending. Undo replayed all 414
+`set_terms` ops restoring exact prior term sets (counts back to 0).
+Create-new QA: mapped a location to a fresh "EKTI QA Test Calendar" —
+term created with the full 16-key display term-meta set copied from the
+template, 49 events assigned (47 publish + 2 draft relationships),
+undo deleted the term and restored every event (0 leftover
+relationships). QA calendar removed; production sync re-applied — dev
+left in the synced state.
+
+---
+
 ## Admin UI ✅
 
-Server-rendered PHP page (`render_admin_page()`) with six panels:
+Server-rendered PHP page (`render_admin_page()`) with seven panels:
 1. **Overview** — stats grid (TEC events, attendees, EventKoi events, mapped/
    unmapped events, attendees to import, WC orders to link, already imported)
    loaded via AJAX. Dismissible warning notice when WooCommerce is inactive.
@@ -416,6 +496,11 @@ Server-rendered PHP page (`render_admin_page()`) with six panels:
    buttons, progress bar reuse, three tables (ticket types to create or
    convert with price/capacity/site-local sale window, field updates with
    current → proposed values, review items).
+7. **Calendar Sync (Locations)** (v1.3.0) — Scan Locations / Save Mapping /
+   Run Calendar Sync / Undo Last Calendar Sync buttons, progress bar reuse,
+   one row per TEC location with source, mapped-event count, auto-match
+   badge, and a calendar dropdown (existing calendars + create-new with
+   inline name input).
 
 `admin.js` (jQuery IIFE): AJAX helper, console appender, stats loader
 (including WC order count + WC availability check), mapping loader/saver,
@@ -509,6 +594,18 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
   945 deleted tickets were named "General admission" — no distinct ticket
   type was ever deleted; they simply never existed in EventKoi (native
   importer only created a default placeholder per event).
+
+- 2026-08-23: **Step 8 — locations only, categories out of scope.**
+  ott-dev discovery showed EventKoi's native importer already created
+  AND assigned calendars for all 19 TEC event categories (names and
+  assignment counts match), so the mapper covers TEC *locations*
+  (venues) only. The auto-map-by-name algorithm is generic
+  (normalize → exact → containment → fuzzy ≥ 85%) and could serve
+  categories too if a site ever needs it. Scope is `ekti_event_mapping`
+  events only — unmapped TEC events never get imported, so there is no
+  EventKoi event to assign. New calendars copy their display term-meta
+  set from a template calendar rather than hard-coding EventKoi
+  internals, so the plugin stays resilient to EventKoi schema changes.
 
 - **No REST API:** the plugin uses `admin-ajax.php` rather than WP REST. This
   is deliberate for a migration tool — all operations are admin-initiated,
