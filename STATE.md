@@ -7,14 +7,13 @@ condensed version of each build step so progress and plan travel together in one
 top-level document.
 
 - **Branch:** `main`
-- **Plugin version:** 1.0.0
-- **Last updated:** 2026-08-20
-- **Overall status:** ✅ Phase 2 complete (5/5) — bootstrap, database layer,
-  event mapping + auto-match, migration engine with rollback, admin UI with
-  jQuery, **WooCommerce order linking** (parent orders, charges, order notes,
-  WC meta, composite keys, check-in codes). Duplicate TEC import handling
-  added. Plugin is feature-complete for the initial release. WooCommerce
-  dependency is now fully guarded.
+- **Plugin version:** 1.1.0
+- **Last updated:** 2026-08-23
+- **Overall status:** ✅ Step 6 complete — **Pre-Import Cleanup** shipped and
+  executed on dev: stale duplicate ticket types deleted (794) and duplicate
+  EventKoi events merged (151 pairs), fully audited and undoable. The dev
+  dataset is now clean and ready for the ticket import pipeline
+  (Auto-Match → mapping review → dry run → live import).
 
 ## Shared project facts (true for every step)
 
@@ -50,13 +49,29 @@ top-level document.
 | 2 | Database layer (TEC attendees, EventKoi events/tickets, mapping) | ✅ Done | b2a2594 |
 | 3 | Migration engine (batch processing, dry run, rollback) | ✅ Done | b2a2594 |
 | 4 | Event auto-match + duplicate TEC import handling | ✅ Done | 2bdb3c7, f63942a |
-| 5 | WooCommerce order linking (parent orders, charges, composite keys, WC meta) | ✅ Done | (pending) |
+| 5 | WooCommerce order linking (parent orders, charges, composite keys, WC meta) | ✅ Done | 0ca72b3 |
+| 6 | Pre-Import Cleanup (stale ticket dedupe + duplicate event merge, audit + undo) | ✅ Done | b270184 |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
 
-**Phase 2 (WooCommerce order linking) is feature-complete on `main`.**
+**Pre-import cleanup executed on dev (2026-08-23).** Dev DB backup taken
+before the destructive phases: `wp-content/uploads/db-backup-pre-cleanup-20260823.sql`.
+
+- **Proceed with the ticket import** on dev: Auto-Match → review mapping →
+  dry run → live import. Cleanup scan now reports 0 stale pairs and 0
+  mergeable groups.
+- **4 report-only review items** (single ticket whose price ≠ current TEC
+  price; not auto-fixed by design): Pan Dulce Workshop Series II (750 vs
+  700), Frosting Feast (55 vs 0), Pan Dulce Workshop Series (750 vs 800),
+  Dad & Me Flippin Awesome (35 vs 15).
+- **Pre-existing orphans** (predating this cleanup, from the earlier
+  manual pre-delete approach): 38 ticket rows + 2 `hold` test orders
+  reference events that were hard-deleted long ago (no post exists to
+  untrash). Ticket 980 is guard-protected because the 2 hold rows point at
+  it. Decide whether to purge these manually before/after import.
+
 Remaining before wider release:
 
 - **Live QA** on a WordPress install with real TEC + EventKoi + WooCommerce
@@ -246,9 +261,67 @@ Attendees tab, sales history, QR check-in, and status sync.
 
 ---
 
+### Step 6 — Pre-Import Cleanup (stale ticket dedupe + duplicate event merge) ✅
+EventKoi's native TEC event importer re-ran on 2026-08-23 and produced
+817 `eventkoi_event` posts with **151 duplicate pairs** (same
+`_tec_import_source_id`, identical `start_timestamp`) and **794 events
+carrying two same-name "General admission" tickets** (one stale from the
+2026-08-11 import with the outdated price, one fresh matching the current
+WC product `_price`). Verified beforehand: TEC has exactly one ticket
+product per event, 0 tickets sold, 0 attendee rows on any duplicate.
+
+New backend methods on the singleton class:
+- `get_tec_price_map()` — bulk TEC-event → current-price map via attendee
+  `_tribe_wooticket_product` → WC `_price`; fallback: single distinct
+  `_paid_price`; recovers names via `_tribe_deleted_product_name`.
+- `scan_cleanup()` — returns `stale_pairs` (same-name 2-ticket events with
+  no sales; keep = price matching TEC current price, else later
+  `created_at`/higher ID), `review` items (sales present, or single ticket
+  whose price ≠ TEC price), and `dup_groups` (by `_tec_import_source_id`,
+  canonical first using the same publish > eventkoi_expired > draft, then
+  lowest-ID resolver as `get_tec_import_source_mapping()`; flagged when
+  `start_timestamp` diverges within a group).
+- `run_ticket_dedupe($chunk=50)` — re-verifies hard guards
+  (`quantity_sold = 0` AND no `ticket_orders` rows) at execution time,
+  deletes the stale ticket, and records an `insert_ticket` audit op with
+  the full deleted row.
+- `run_event_merge($chunk=25)` — per group, single DB transaction:
+  matching name+price loser ticket → repoint any `ticket_orders.ticket_id`,
+  delete loser ticket (audited); drifted ticket → `UPDATE event_id` to
+  canonical instead. Repoints remaining `ticket_orders.event_id`, recounts
+  `quantity_sold` with EventKoi's `payment_status IN (...)` semantics,
+  adopts `quantity_available` only if canonical is NULL, repoints
+  `_ekti_tec_product_*` options, unions `event_cal` terms onto canonical
+  (append-only), repoints `_eventkoi_event_id` shop_order meta and
+  `ekti_event_mapping` values, then `wp_trash_post()` the loser (never
+  hard-deleted).
+- `undo_cleanup()` — replays the `ekti_cleanup_audit` ledger in reverse
+  (op types: `insert_ticket`, `update_ticket_event`, `update_ticket_fields`,
+  `update_ticket_orders_ticket`, `update_ticket_orders_event`,
+  `update_option`, `update_postmeta`, `set_terms`, `untrash_post`).
+- AJAX: `ajax_scan_cleanup`, `ajax_run_ticket_dedupe`, `ajax_run_event_merge`,
+  `ajax_undo_cleanup` — all nonce + `manage_options` gated via `check_ajax()`.
+- New admin panel **"Pre-Import Cleanup"** (fifth panel): Scan button renders
+  three tables (stale pairs, review items, duplicate groups with canonical
+  badge); Run Ticket Dedupe / Run Event Merge buttons with JS confirm and
+  chunked progress reuse; Undo Last Cleanup. `admin.js` gained
+  `scanCleanup()` / `loopCleanup()` / `runDedupe()` / `runMerge()` /
+  `undoCleanup()`. Version bumped to 1.1.0.
+
+**Dev execution results (2026-08-23):** Phase 1 deleted 794 stale tickets
+(ticket rows 1790 → 996, remaining stale pairs 0). Phase 2 merged 151/151
+groups with 0 flags and 0 errors (remaining groups 0; publish events
+793 → 642, trash = 151). Audit ledger: 1096 ops (945 `insert_ticket` =
+794 P1 + 151 P2 loser tickets; 151 `untrash_post`). Conservation verified:
+no event retains 2 tickets, `SUM(quantity_sold)` = 0 before and after,
+0 rows reference any event trashed by this cleanup, spot-checked canonical
+events show single ticket at current price with calendars intact.
+
+---
+
 ## Admin UI ✅
 
-Server-rendered PHP page (`render_admin_page()`) with four panels:
+Server-rendered PHP page (`render_admin_page()`) with five panels:
 1. **Overview** — stats grid (TEC events, attendees, EventKoi events, mapped/
    unmapped events, attendees to import, WC orders to link, already imported)
    loaded via AJAX. Dismissible warning notice when WooCommerce is inactive.
@@ -260,6 +333,11 @@ Server-rendered PHP page (`render_admin_page()`) with four panels:
    (green=success, red=error, yellow=warn, blue=info). Console shows
    composite keys and WC order IDs per attendee.
 4. **Import Log File** — Load/Clear buttons, `<pre>` viewer.
+5. **Pre-Import Cleanup** (v1.1.0) — Scan / Run Ticket Dedupe / Run Event
+   Merge / Undo Last Cleanup buttons, progress bar reuse, three review
+   tables (stale ticket pairs with keep-vs-delete + TEC current price,
+   review items, duplicate event groups with canonical badge and member
+   stats).
 
 `admin.js` (jQuery IIFE): AJAX helper, console appender, stats loader
 (including WC order count + WC availability check), mapping loader/saver,
@@ -309,6 +387,32 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
   multiple EventKoi events can share the same `_tec_import_source_id` when
   the same TEC event was imported more than once; the resolver picks the
   published one (or the earliest import when statuses are equal).
+
+- 2026-08-23: **Step 6 — Pre-Import Cleanup.** Implemented the two-phase
+  cleanup as a reusable plugin panel (rather than one-off SQL) so it can be
+  replayed at the production cutover with full audit + undo. Key design
+  decision: **no hard-coded dates in detection logic** — a stale ticket is
+  identified as the same-name pair member whose price does NOT match the
+  current TEC product `_price` (fallback: earlier `created_at`). Canonical
+  event selection mirrors the existing `get_tec_import_source_mapping()`
+  resolver so Auto-Match and the merge agree. Divergent `start_timestamp`
+  groups and any ticket with sales/order rows are excluded from automation
+  and surfaced as review items only.
+
+- 2026-08-23: **Dev deployment note.** The 1.0.0 plugin lived on dev in a
+  legacy directory `wp-content/plugins/tec-to-eventkoi-tickets-importer/`
+  while the zip builds as `eventkoi-tickets-importer/`. `wp plugin install
+  --force --activate` fataled on class redeclaration with both present;
+  resolved by deactivating the legacy plugin, activating the new one, and
+  deleting the legacy directory. Dev now runs 1.1.0 from
+  `wp-content/plugins/eventkoi-tickets-importer/`.
+
+- 2026-08-23: **Pre-existing orphan rows discovered during verification.**
+  38 ticket rows and 2 `hold`-status test `ticket_orders` rows reference
+  event IDs with NO post at all — victims of the earlier manual
+  "pre-delete duplicates" approach (posts hard-deleted, tickets left
+  behind). These predate this cleanup and are unrecoverable (nothing to
+  repoint to, nothing to untrash). Left in place; flagged in Next action.
 
 - **No REST API:** the plugin uses `admin-ajax.php` rather than WP REST. This
   is deliberate for a migration tool — all operations are admin-initiated,

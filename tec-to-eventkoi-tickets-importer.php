@@ -3,7 +3,7 @@
  * Plugin Name: EventKoi Tickets Importer
  * Plugin URI:  https://onedog.solutions
  * Description: Migrates tickets and attendees from The Events Calendar (Event Tickets / Event Tickets Plus) to EventKoi.
- * Version:     1.0.0
+ * Version:     1.1.0
  * Author:      One Dog Solutions
  * Author URI:  https://onedog.solutions
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'EKTI_VERSION', '1.0.0' );
+define( 'EKTI_VERSION', '1.1.0' );
 define( 'EKTI_LOG_DIR', WP_CONTENT_DIR . '/uploads' );
 define( 'EKTI_LOG_FILE', EKTI_LOG_DIR . '/eventkoi-import.log' );
 define( 'EKTI_BATCH_SIZE', 30 );
@@ -43,6 +43,10 @@ final class EventKoi_Tickets_Importer {
         add_action( 'wp_ajax_ekti_auto_match', [ $this, 'ajax_auto_match' ] );
         add_action( 'wp_ajax_ekti_run_batch', [ $this, 'ajax_run_batch' ] );
         add_action( 'wp_ajax_ekti_rollback', [ $this, 'ajax_rollback' ] );
+        add_action( 'wp_ajax_ekti_scan_cleanup', [ $this, 'ajax_scan_cleanup' ] );
+        add_action( 'wp_ajax_ekti_run_ticket_dedupe', [ $this, 'ajax_run_ticket_dedupe' ] );
+        add_action( 'wp_ajax_ekti_run_event_merge', [ $this, 'ajax_run_event_merge' ] );
+        add_action( 'wp_ajax_ekti_undo_cleanup', [ $this, 'ajax_undo_cleanup' ] );
         add_action( 'wp_ajax_ekti_get_log', [ $this, 'ajax_get_log' ] );
         add_action( 'wp_ajax_ekti_clear_log', [ $this, 'ajax_clear_log' ] );
     }
@@ -1162,6 +1166,629 @@ final class EventKoi_Tickets_Importer {
     }
 
     /* ------------------------------------------------------------------
+     * PRE-IMPORT CLEANUP (Step 6)
+     *
+     * Two-phase cleanup to run before the ticket import:
+     *   Phase 1 — delete stale duplicate ticket types (same-name pairs left
+     *             behind by repeated EventKoi event imports).
+     *   Phase 2 — merge duplicate eventkoi_event posts that share the same
+     *             _tec_import_source_id into one canonical event.
+     * Every destructive write is recorded in the ekti_cleanup_audit ledger
+     * so the whole cleanup can be undone.
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Bulk-resolve the current TEC ticket product price per TEC event.
+     *
+     * Uses the WooCommerce product attached to the event's attendees
+     * (_tribe_wooticket_product => _price), falling back to a single
+     * distinct _paid_price among attendees. Returns tec_id => float|null.
+     */
+    private function get_tec_price_map() {
+        global $wpdb;
+
+        $prod_rows = $wpdb->get_results(
+            "SELECT pm1.meta_value AS tec_id, pm2.meta_value AS product_id
+             FROM {$wpdb->postmeta} pm1
+             JOIN {$wpdb->postmeta} pm2 ON pm1.post_id = pm2.post_id
+             WHERE pm1.meta_key = '_tribe_wooticket_event'
+               AND pm2.meta_key = '_tribe_wooticket_product'",
+            ARRAY_A
+        );
+        $products_of = [];
+        $product_ids = [];
+        foreach ( $prod_rows as $r ) {
+            $products_of[ $r['tec_id'] ][ $r['product_id'] ] = true;
+            $product_ids[ $r['product_id'] ] = true;
+        }
+
+        $price_of_product = [];
+        if ( $product_ids ) {
+            $in   = implode( ',', array_map( 'intval', array_keys( $product_ids ) ) );
+            $rows = $wpdb->get_results(
+                "SELECT post_id, meta_value FROM {$wpdb->postmeta}
+                 WHERE meta_key = '_price' AND post_id IN ({$in})",
+                ARRAY_A
+            );
+            foreach ( $rows as $r ) {
+                $price_of_product[ (int) $r['post_id'] ] = floatval( $r['meta_value'] );
+            }
+        }
+
+        $paid_rows = $wpdb->get_results(
+            "SELECT pm1.meta_value AS tec_id, pm3.meta_value AS price
+             FROM {$wpdb->postmeta} pm1
+             JOIN {$wpdb->postmeta} pm3 ON pm1.post_id = pm3.post_id
+             WHERE pm1.meta_key = '_tribe_wooticket_event'
+               AND pm3.meta_key = '_paid_price' AND pm3.meta_value != ''",
+            ARRAY_A
+        );
+        $paid_of = [];
+        foreach ( $paid_rows as $r ) {
+            $paid_of[ $r['tec_id'] ][ $r['price'] ] = true;
+        }
+
+        $map = [];
+        foreach ( $products_of as $tec_id => $products ) {
+            $map[ $tec_id ] = null;
+            foreach ( array_keys( $products ) as $pid ) {
+                if ( isset( $price_of_product[ (int) $pid ] ) ) {
+                    $map[ $tec_id ] = $price_of_product[ (int) $pid ];
+                    break;
+                }
+            }
+            if ( null === $map[ $tec_id ] && isset( $paid_of[ $tec_id ] ) && 1 === count( $paid_of[ $tec_id ] ) ) {
+                $map[ $tec_id ] = floatval( array_key_first( $paid_of[ $tec_id ] ) );
+            }
+        }
+        foreach ( $paid_of as $tec_id => $prices ) {
+            if ( ! isset( $map[ $tec_id ] ) && 1 === count( $prices ) ) {
+                $map[ $tec_id ] = floatval( array_key_first( $prices ) );
+            }
+        }
+        return $map;
+    }
+
+    /**
+     * Scan for pre-import cleanup work.
+     *
+     * Returns:
+     *  - stale_pairs: same-name two-ticket events whose stale copy can be deleted.
+     *  - review:      items needing manual review (sales present, price anomalies).
+     *  - dup_groups:  duplicate eventkoi_event groups by _tec_import_source_id,
+     *                 sorted so the first member is the canonical event.
+     */
+    private function scan_cleanup() {
+        global $wpdb;
+
+        $stale_pairs = [];
+        $review      = [];
+        $dup_groups  = [];
+
+        $events = $wpdb->get_results(
+            "SELECT ID, post_title, post_status FROM {$wpdb->posts}
+             WHERE post_type = 'eventkoi_event'
+               AND post_status NOT IN ('trash', 'auto-draft')",
+            ARRAY_A
+        );
+        if ( empty( $events ) ) {
+            return [ 'stale_pairs' => $stale_pairs, 'review' => $review, 'dup_groups' => $dup_groups ];
+        }
+        $event_ids = array_map( 'intval', array_column( $events, 'ID' ) );
+        $in        = implode( ',', $event_ids );
+
+        // Tickets per event.
+        $tickets  = $wpdb->get_results(
+            "SELECT id, event_id, name, price, quantity_sold, created_at
+             FROM {$this->ek_table( 'tickets' )}
+             WHERE event_id IN ({$in})
+             ORDER BY event_id ASC, id ASC",
+            ARRAY_A
+        );
+        $by_event = [];
+        foreach ( $tickets as $t ) {
+            $by_event[ (int) $t['event_id'] ][] = $t;
+        }
+
+        // Attendee counts per event and per ticket.
+        $att_event  = [];
+        $att_ticket = [];
+        $rows       = $wpdb->get_results(
+            "SELECT event_id, ticket_id, COUNT(*) c
+             FROM {$this->ek_table( 'ticket_orders' )}
+             WHERE event_id IN ({$in})
+             GROUP BY event_id, ticket_id",
+            ARRAY_A
+        );
+        foreach ( $rows as $r ) {
+            $att_event[ (int) $r['event_id'] ]   = ( $att_event[ (int) $r['event_id'] ] ?? 0 ) + (int) $r['c'];
+            $att_ticket[ (int) $r['ticket_id'] ] = (int) $r['c'];
+        }
+
+        // TEC source + current price per event.
+        $tec_of = [];
+        $rows   = $wpdb->get_results(
+            "SELECT post_id, meta_value FROM {$wpdb->postmeta}
+             WHERE meta_key = '_tec_import_source_id' AND post_id IN ({$in})",
+            ARRAY_A
+        );
+        foreach ( $rows as $r ) {
+            $tec_of[ (int) $r['post_id'] ] = $r['meta_value'];
+        }
+        $price_map = $this->get_tec_price_map();
+
+        foreach ( $events as $e ) {
+            $id        = (int) $e['ID'];
+            $tks       = $by_event[ $id ] ?? [];
+            $tec_id    = $tec_of[ $id ] ?? null;
+            $tec_price = ( null !== $tec_id ) ? ( $price_map[ $tec_id ] ?? null ) : null;
+
+            if ( 2 === count( $tks ) && 0 === strcasecmp( trim( $tks[0]['name'] ), trim( $tks[1]['name'] ) ) ) {
+                $has_sales = ( (int) $tks[0]['quantity_sold'] > 0 || (int) $tks[1]['quantity_sold'] > 0
+                    || ( $att_ticket[ (int) $tks[0]['id'] ] ?? 0 ) > 0
+                    || ( $att_ticket[ (int) $tks[1]['id'] ] ?? 0 ) > 0 );
+                if ( $has_sales ) {
+                    $review[] = [
+                        'event_id' => $id,
+                        'title'    => $e['post_title'],
+                        'reason'   => 'Same-name ticket pair has sales or attendee rows; needs manual review.',
+                    ];
+                    continue;
+                }
+
+                $keep_idx = null;
+                $reason   = '';
+                if ( null !== $tec_price ) {
+                    $m0 = abs( floatval( $tks[0]['price'] ) - $tec_price ) < 0.001;
+                    $m1 = abs( floatval( $tks[1]['price'] ) - $tec_price ) < 0.001;
+                    if ( $m0 && ! $m1 ) {
+                        $keep_idx = 0;
+                        $reason   = 'price matches current TEC product';
+                    } elseif ( $m1 && ! $m0 ) {
+                        $keep_idx = 1;
+                        $reason   = 'price matches current TEC product';
+                    }
+                }
+                if ( null === $keep_idx ) {
+                    // Fallback: keep the newer ticket (later created_at, then higher ID).
+                    $cmp      = strcmp( $tks[0]['created_at'], $tks[1]['created_at'] );
+                    $keep_idx = ( $cmp < 0 || ( 0 === $cmp && (int) $tks[0]['id'] < (int) $tks[1]['id'] ) ) ? 1 : 0;
+                    $reason  .= ( $reason ? '; ' : '' ) . 'fallback: newer ticket kept';
+                }
+                $del_idx       = 1 - $keep_idx;
+                $stale_pairs[] = [
+                    'event_id'     => $id,
+                    'title'        => $e['post_title'],
+                    'tec_price'    => $tec_price,
+                    'keep_id'      => (int) $tks[ $keep_idx ]['id'],
+                    'keep_price'   => floatval( $tks[ $keep_idx ]['price'] ),
+                    'delete_id'    => (int) $tks[ $del_idx ]['id'],
+                    'delete_price' => floatval( $tks[ $del_idx ]['price'] ),
+                    'reason'       => $reason,
+                ];
+            } elseif ( 1 === count( $tks ) && null !== $tec_price && abs( floatval( $tks[0]['price'] ) - $tec_price ) >= 0.001 ) {
+                $review[] = [
+                    'event_id' => $id,
+                    'title'    => $e['post_title'],
+                    'reason'   => sprintf( 'Single ticket price %s differs from current TEC price %s.', $tks[0]['price'], $tec_price ),
+                ];
+            }
+        }
+
+        // Duplicate event groups by _tec_import_source_id.
+        $rows   = $wpdb->get_results(
+            "SELECT pm.meta_value AS tec_id, p.ID, p.post_title, p.post_status
+             FROM {$wpdb->postmeta} pm
+             JOIN {$wpdb->posts} p ON pm.post_id = p.ID
+             WHERE pm.meta_key = '_tec_import_source_id'
+               AND p.post_type = 'eventkoi_event'
+               AND p.post_status NOT IN ('trash', 'auto-draft')
+             ORDER BY p.ID ASC",
+            ARRAY_A
+        );
+        $groups = [];
+        foreach ( $rows as $r ) {
+            $groups[ $r['tec_id'] ][] = $r;
+        }
+
+        $status_priority = [ 'publish' => 0, 'eventkoi_expired' => 1, 'draft' => 2 ];
+
+        $member_ids = [];
+        foreach ( $groups as $g ) {
+            if ( count( $g ) > 1 ) {
+                foreach ( $g as $m ) {
+                    $member_ids[] = (int) $m['ID'];
+                }
+            }
+        }
+        $start_ts = [];
+        $cals     = [];
+        if ( $member_ids ) {
+            $min  = implode( ',', $member_ids );
+            $rows = $wpdb->get_results(
+                "SELECT post_id, meta_value FROM {$wpdb->postmeta}
+                 WHERE meta_key = 'start_timestamp' AND post_id IN ({$min})",
+                ARRAY_A
+            );
+            foreach ( $rows as $r ) {
+                $start_ts[ (int) $r['post_id'] ] = $r['meta_value'];
+            }
+            $rows = $wpdb->get_results(
+                "SELECT tr.object_id, t.name FROM {$wpdb->term_relationships} tr
+                 JOIN {$wpdb->term_taxonomy} tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+                 JOIN {$wpdb->terms} t ON tt.term_id = t.term_id
+                 WHERE tt.taxonomy = 'event_cal' AND tr.object_id IN ({$min})",
+                ARRAY_A
+            );
+            foreach ( $rows as $r ) {
+                $cals[ (int) $r['object_id'] ][] = $r['name'];
+            }
+        }
+
+        foreach ( $groups as $tec_id => $g ) {
+            if ( count( $g ) < 2 ) {
+                continue;
+            }
+            usort( $g, function ( $a, $b ) use ( $status_priority ) {
+                $pa = $status_priority[ $a['post_status'] ] ?? 99;
+                $pb = $status_priority[ $b['post_status'] ] ?? 99;
+                if ( $pa !== $pb ) {
+                    return $pa - $pb;
+                }
+                return (int) $a['ID'] - (int) $b['ID'];
+            } );
+            $ts_vals = array_unique( array_map( function ( $m ) use ( $start_ts ) {
+                return $start_ts[ (int) $m['ID'] ] ?? null;
+            }, $g ) );
+            $members = [];
+            foreach ( $g as $i => $m ) {
+                $mid       = (int) $m['ID'];
+                $members[] = [
+                    'id'        => $mid,
+                    'title'     => $m['post_title'],
+                    'status'    => $m['post_status'],
+                    'canonical' => ( 0 === $i ),
+                    'start_ts'  => $start_ts[ $mid ] ?? null,
+                    'tickets'   => count( $by_event[ $mid ] ?? [] ),
+                    'attendees' => $att_event[ $mid ] ?? 0,
+                    'cals'      => $cals[ $mid ] ?? [],
+                ];
+            }
+            $dup_groups[] = [
+                'tec_id'  => $tec_id,
+                'flagged' => count( $ts_vals ) > 1,
+                'members' => $members,
+            ];
+        }
+
+        return [ 'stale_pairs' => $stale_pairs, 'review' => $review, 'dup_groups' => $dup_groups ];
+    }
+
+    /**
+     * Append audit ops to the cleanup ledger.
+     */
+    private function audit_push( $ops ) {
+        if ( empty( $ops ) ) {
+            return;
+        }
+        $audit = get_option( 'ekti_cleanup_audit', [] );
+        if ( ! is_array( $audit ) ) {
+            $audit = [];
+        }
+        update_option( 'ekti_cleanup_audit', array_merge( $audit, $ops ), false );
+    }
+
+    /**
+     * Phase 1: delete the first chunk of stale duplicate ticket types.
+     *
+     * The stale list shrinks as items are processed, so callers always pass
+     * offset 0 and repeat until done.
+     */
+    private function run_ticket_dedupe( $chunk = 50 ) {
+        global $wpdb;
+        $scan  = $this->scan_cleanup();
+        $pairs = array_slice( $scan['stale_pairs'], 0, $chunk );
+
+        $results = [];
+        $deleted = 0;
+        $ops     = [];
+
+        foreach ( $pairs as $p ) {
+            $row = $wpdb->get_row( $wpdb->prepare(
+                "SELECT * FROM {$this->ek_table( 'tickets' )} WHERE id = %d",
+                $p['delete_id']
+            ), ARRAY_A );
+            if ( ! $row ) {
+                $results[] = [ 'event_id' => $p['event_id'], 'action' => 'skipped', 'reason' => 'ticket already removed' ];
+                continue;
+            }
+            $orders = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$this->ek_table( 'ticket_orders' )} WHERE ticket_id = %d",
+                $p['delete_id']
+            ) );
+            if ( (int) $row['quantity_sold'] > 0 || $orders > 0 ) {
+                $results[] = [ 'event_id' => $p['event_id'], 'action' => 'flagged', 'reason' => 'ticket has sales or orders' ];
+                continue;
+            }
+            $wpdb->delete( $this->ek_table( 'tickets' ), [ 'id' => $row['id'] ] );
+            $ops[] = [ 'type' => 'insert_ticket', 'row' => $row ];
+            $deleted++;
+            $results[] = [ 'event_id' => $p['event_id'], 'action' => 'deleted', 'ticket_id' => (int) $row['id'], 'keep_id' => $p['keep_id'] ];
+            $this->log( "Cleanup P1: deleted stale ticket #{$row['id']} ({$row['price']}) on event {$p['event_id']}; kept #{$p['keep_id']} ({$p['keep_price']})." );
+        }
+
+        $this->audit_push( $ops );
+
+        return [ 'processed' => count( $pairs ), 'deleted' => $deleted, 'done' => count( $pairs ) < $chunk, 'results' => $results ];
+    }
+
+    /**
+     * Phase 2: merge the first chunk of duplicate event groups.
+     */
+    private function run_event_merge( $chunk = 25 ) {
+        global $wpdb;
+        $scan   = $this->scan_cleanup();
+        $groups = array_slice( $scan['dup_groups'], 0, $chunk );
+
+        $results = [];
+        $merged  = 0;
+
+        foreach ( $groups as $g ) {
+            if ( $g['flagged'] ) {
+                $results[] = [ 'tec_id' => $g['tec_id'], 'action' => 'flagged', 'reason' => 'divergent start timestamps' ];
+                continue;
+            }
+
+            $canonical = null;
+            $losers    = [];
+            foreach ( $g['members'] as $m ) {
+                if ( $m['canonical'] ) {
+                    $canonical = $m['id'];
+                } else {
+                    $losers[] = $m['id'];
+                }
+            }
+
+            $ops = [];
+            $ok  = true;
+            $wpdb->query( 'START TRANSACTION' );
+
+            foreach ( $losers as $loser ) {
+                $ok = $this->merge_loser_into( $canonical, $loser, $ops );
+                if ( ! $ok ) {
+                    break;
+                }
+            }
+
+            if ( ! $ok ) {
+                $wpdb->query( 'ROLLBACK' );
+                $this->log( 'Cleanup P2: merge of TEC source ' . $g['tec_id'] . ' failed; rolled back. ' . $wpdb->last_error, 'ERROR' );
+                $results[] = [ 'tec_id' => $g['tec_id'], 'action' => 'error', 'reason' => $wpdb->last_error ];
+                continue;
+            }
+
+            $wpdb->query( 'COMMIT' );
+            $this->audit_push( $ops );
+            $merged++;
+            $results[] = [ 'tec_id' => $g['tec_id'], 'action' => 'merged', 'canonical' => $canonical, 'losers' => $losers ];
+            $this->log( 'Cleanup P2: merged TEC source ' . $g['tec_id'] . ' into canonical event ' . $canonical . ' (trashed: ' . implode( ',', $losers ) . ').' );
+        }
+
+        return [ 'processed' => count( $groups ), 'merged' => $merged, 'done' => count( $groups ) < $chunk, 'results' => $results ];
+    }
+
+    /**
+     * Move all ticket data from $loser into $canonical and trash $loser.
+     * Collects reversible audit ops into $ops. Returns false on DB error.
+     */
+    private function merge_loser_into( $canonical, $loser, &$ops ) {
+        global $wpdb;
+        $tickets_table       = $this->ek_table( 'tickets' );
+        $ticket_orders_table = $this->ek_table( 'ticket_orders' );
+
+        $canon_tickets = $wpdb->get_results( $wpdb->prepare(
+            "SELECT * FROM {$tickets_table} WHERE event_id = %d",
+            $canonical
+        ), ARRAY_A );
+        $loser_tickets = $wpdb->get_results( $wpdb->prepare(
+            "SELECT * FROM {$tickets_table} WHERE event_id = %d",
+            $loser
+        ), ARRAY_A );
+
+        $touched = []; // Canonical ticket IDs needing a quantity_sold recount.
+
+        foreach ( $loser_tickets as $lt ) {
+            $match = null;
+            foreach ( $canon_tickets as $ct ) {
+                if ( 0 === strcasecmp( trim( $ct['name'] ), trim( $lt['name'] ) )
+                    && abs( floatval( $ct['price'] ) - floatval( $lt['price'] ) ) < 0.001 ) {
+                    $match = $ct;
+                    break;
+                }
+            }
+
+            if ( $match ) {
+                // Repoint attendee rows, then drop the duplicate ticket type.
+                $moved = $wpdb->get_col( $wpdb->prepare(
+                    "SELECT id FROM {$ticket_orders_table} WHERE ticket_id = %d",
+                    $lt['id']
+                ) );
+                if ( $moved ) {
+                    if ( false === $wpdb->query( $wpdb->prepare(
+                        "UPDATE {$ticket_orders_table} SET ticket_id = %d WHERE ticket_id = %d",
+                        $match['id'], $lt['id']
+                    ) ) ) {
+                        return false;
+                    }
+                    $ops[] = [ 'type' => 'update_ticket_orders_ticket', 'ids' => array_map( 'intval', $moved ), 'old_ticket_id' => (int) $lt['id'] ];
+                }
+                if ( false === $wpdb->delete( $tickets_table, [ 'id' => $lt['id'] ] ) ) {
+                    return false;
+                }
+                $ops[] = [ 'type' => 'insert_ticket', 'row' => $lt ];
+
+                // Adopt quantity_available when the canonical ticket lacks one.
+                if ( null === $match['quantity_available'] && null !== $lt['quantity_available'] ) {
+                    if ( false === $wpdb->update( $tickets_table, [ 'quantity_available' => $lt['quantity_available'] ], [ 'id' => $match['id'] ] ) ) {
+                        return false;
+                    }
+                    $ops[] = [ 'type' => 'update_ticket_fields', 'id' => (int) $match['id'], 'old' => [ 'quantity_available' => $match['quantity_available'] ] ];
+                }
+                $touched[ (int) $match['id'] ] = true;
+
+                // Repoint importer product options that referenced the deleted ticket.
+                $opt_names = $wpdb->get_col( $wpdb->prepare(
+                    "SELECT option_name FROM {$wpdb->options} WHERE option_name LIKE %s AND option_value = %s",
+                    '_ekti_tec_product_%',
+                    $lt['id']
+                ) );
+                foreach ( $opt_names as $name ) {
+                    $old = get_option( $name );
+                    update_option( $name, (int) $match['id'] );
+                    $ops[] = [ 'type' => 'update_option', 'name' => $name, 'old' => $old ];
+                }
+            } else {
+                // No matching type on canonical: move the ticket over intact.
+                if ( false === $wpdb->update( $tickets_table, [ 'event_id' => $canonical ], [ 'id' => $lt['id'] ] ) ) {
+                    return false;
+                }
+                $ops[] = [ 'type' => 'update_ticket_event', 'id' => (int) $lt['id'], 'old_event_id' => $loser ];
+                $touched[ (int) $lt['id'] ] = true;
+            }
+        }
+
+        // Repoint any remaining attendee rows.
+        $remaining = $wpdb->get_col( $wpdb->prepare(
+            "SELECT id FROM {$ticket_orders_table} WHERE event_id = %d",
+            $loser
+        ) );
+        if ( $remaining ) {
+            if ( false === $wpdb->query( $wpdb->prepare(
+                "UPDATE {$ticket_orders_table} SET event_id = %d WHERE event_id = %d",
+                $canonical, $loser
+            ) ) ) {
+                return false;
+            }
+            $ops[] = [ 'type' => 'update_ticket_orders_event', 'ids' => array_map( 'intval', $remaining ), 'old_event_id' => $loser ];
+        }
+
+        // Recount quantity_sold on touched tickets.
+        foreach ( array_keys( $touched ) as $tid ) {
+            $cur  = $wpdb->get_row( $wpdb->prepare(
+                "SELECT quantity_sold FROM {$tickets_table} WHERE id = %d",
+                $tid
+            ), ARRAY_A );
+            $sold = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COALESCE(SUM(quantity), 0) FROM {$ticket_orders_table}
+                 WHERE ticket_id = %d
+                   AND payment_status IN ('complete', 'completed', 'succeeded', 'partially_refunded')",
+                $tid
+            ) );
+            if ( (int) $cur['quantity_sold'] !== $sold ) {
+                if ( false === $wpdb->update( $tickets_table, [ 'quantity_sold' => $sold ], [ 'id' => $tid ] ) ) {
+                    return false;
+                }
+                $ops[] = [ 'type' => 'update_ticket_fields', 'id' => $tid, 'old' => [ 'quantity_sold' => $cur['quantity_sold'] ] ];
+            }
+        }
+
+        // Union calendars onto canonical (append-only).
+        $loser_cals = wp_get_object_terms( $loser, 'event_cal', [ 'fields' => 'ids' ] );
+        $canon_cals = wp_get_object_terms( $canonical, 'event_cal', [ 'fields' => 'ids' ] );
+        if ( ! is_wp_error( $loser_cals ) && ! is_wp_error( $canon_cals ) ) {
+            $add = array_diff( array_map( 'intval', $loser_cals ), array_map( 'intval', $canon_cals ) );
+            if ( $add ) {
+                wp_set_object_terms( $canonical, array_values( $add ), 'event_cal', true );
+                $ops[] = [ 'type' => 'set_terms', 'post' => $canonical, 'old_term_ids' => array_map( 'intval', $canon_cals ) ];
+            }
+        }
+
+        // Repoint WC order meta.
+        $order_posts = $wpdb->get_col( $wpdb->prepare(
+            "SELECT post_id FROM {$wpdb->postmeta} WHERE meta_key = '_eventkoi_event_id' AND meta_value = %s",
+            $loser
+        ) );
+        foreach ( $order_posts as $post_id ) {
+            update_post_meta( (int) $post_id, '_eventkoi_event_id', $canonical );
+            $ops[] = [ 'type' => 'update_postmeta', 'post' => (int) $post_id, 'key' => '_eventkoi_event_id', 'old' => $loser ];
+        }
+
+        // Repoint saved mapping entries that target the loser.
+        $old_mapping = $this->get_saved_mapping();
+        $new_mapping = $old_mapping;
+        foreach ( $new_mapping as $tec_id => $ek_id ) {
+            if ( (int) $ek_id === $loser ) {
+                $new_mapping[ $tec_id ] = $canonical;
+            }
+        }
+        if ( $new_mapping !== $old_mapping ) {
+            $this->save_mapping( $new_mapping );
+            $ops[] = [ 'type' => 'update_option', 'name' => 'ekti_event_mapping', 'old' => $old_mapping ];
+        }
+
+        // Trash the loser (recoverable; never hard-delete).
+        if ( ! wp_trash_post( $loser ) ) {
+            return false;
+        }
+        $ops[] = [ 'type' => 'untrash_post', 'id' => $loser ];
+
+        return true;
+    }
+
+    /**
+     * Undo the last cleanup by replaying the audit ledger in reverse.
+     */
+    private function undo_cleanup() {
+        global $wpdb;
+        $audit = get_option( 'ekti_cleanup_audit', [] );
+        if ( empty( $audit ) ) {
+            return [ 'error' => 'Nothing to undo.' ];
+        }
+
+        $counts = [];
+        foreach ( array_reverse( $audit ) as $op ) {
+            switch ( $op['type'] ) {
+                case 'insert_ticket':
+                    $wpdb->insert( $this->ek_table( 'tickets' ), $op['row'] );
+                    break;
+                case 'update_ticket_event':
+                    $wpdb->update( $this->ek_table( 'tickets' ), [ 'event_id' => $op['old_event_id'] ], [ 'id' => $op['id'] ] );
+                    break;
+                case 'update_ticket_fields':
+                    $wpdb->update( $this->ek_table( 'tickets' ), $op['old'], [ 'id' => $op['id'] ] );
+                    break;
+                case 'update_ticket_orders_ticket':
+                    foreach ( $op['ids'] as $oid ) {
+                        $wpdb->update( $this->ek_table( 'ticket_orders' ), [ 'ticket_id' => $op['old_ticket_id'] ], [ 'id' => $oid ] );
+                    }
+                    break;
+                case 'update_ticket_orders_event':
+                    foreach ( $op['ids'] as $oid ) {
+                        $wpdb->update( $this->ek_table( 'ticket_orders' ), [ 'event_id' => $op['old_event_id'] ], [ 'id' => $oid ] );
+                    }
+                    break;
+                case 'update_option':
+                    update_option( $op['name'], $op['old'] );
+                    break;
+                case 'update_postmeta':
+                    update_post_meta( $op['post'], $op['key'], $op['old'] );
+                    break;
+                case 'set_terms':
+                    wp_set_object_terms( $op['post'], $op['old_term_ids'], 'event_cal', false );
+                    break;
+                case 'untrash_post':
+                    wp_untrash_post( $op['id'] );
+                    break;
+            }
+            $counts[ $op['type'] ] = ( $counts[ $op['type'] ] ?? 0 ) + 1;
+        }
+
+        delete_option( 'ekti_cleanup_audit' );
+        $this->log( 'Cleanup undo complete. ' . wp_json_encode( $counts ) );
+        return [ 'undone' => $counts ];
+    }
+
+    /* ------------------------------------------------------------------
      * AJAX HANDLERS
      * ------------------------------------------------------------------ */
 
@@ -1330,6 +1957,30 @@ final class EventKoi_Tickets_Importer {
         wp_send_json_success( $result );
     }
 
+    public function ajax_scan_cleanup() {
+        $this->check_ajax();
+        wp_send_json_success( $this->scan_cleanup() );
+    }
+
+    public function ajax_run_ticket_dedupe() {
+        $this->check_ajax();
+        wp_send_json_success( $this->run_ticket_dedupe() );
+    }
+
+    public function ajax_run_event_merge() {
+        $this->check_ajax();
+        wp_send_json_success( $this->run_event_merge() );
+    }
+
+    public function ajax_undo_cleanup() {
+        $this->check_ajax();
+        $result = $this->undo_cleanup();
+        if ( isset( $result['error'] ) ) {
+            wp_send_json_error( $result['error'] );
+        }
+        wp_send_json_success( $result );
+    }
+
     public function ajax_get_log() {
         $this->check_ajax();
         $lines = 50;
@@ -1381,6 +2032,52 @@ final class EventKoi_Tickets_Importer {
                 </div>
                 <div id="ekti-wc-warning" style="display:none;" class="notice notice-warning"><p>WooCommerce is not active. Order linking requires WooCommerce to be installed and active.</p></div>
                 <button class="button" id="ekti-refresh-stats">Refresh Stats</button>
+            </div>
+
+            <!-- Pre-Import Cleanup Panel -->
+            <div class="ekti-panel" id="ekti-cleanup-panel">
+                <h2>Pre-Import Cleanup</h2>
+                <p>Detect and remove stale duplicate ticket types and duplicate EventKoi events (same TEC source) before running the ticket import. All changes are audited and undoable.</p>
+                <div class="ekti-actions">
+                    <button class="button button-primary" id="ekti-cleanup-scan">Scan for Cleanup</button>
+                    <button class="button" id="ekti-cleanup-dedupe" disabled>Run Ticket Dedupe</button>
+                    <button class="button" id="ekti-cleanup-merge" disabled>Run Event Merge</button>
+                    <button class="button button-secondary" id="ekti-cleanup-undo" style="color:#a00;">Undo Last Cleanup</button>
+                </div>
+                <div id="ekti-cleanup-status" class="ekti-status"></div>
+                <div id="ekti-cleanup-progress-wrap" style="display:none;">
+                    <div class="ekti-progress-bar">
+                        <div class="ekti-progress-fill" id="ekti-cleanup-progress-fill" style="width:0%"></div>
+                    </div>
+                    <div class="ekti-progress-text" id="ekti-cleanup-progress-text">0%</div>
+                </div>
+                <div id="ekti-stale-table-wrap" style="display:none;">
+                    <h3>Stale Duplicate Tickets</h3>
+                    <table class="wp-list-table widefat fixed striped">
+                        <thead>
+                            <tr><th>Event ID</th><th>Title</th><th>Keep</th><th>Delete</th><th>TEC Price</th><th>Reason</th></tr>
+                        </thead>
+                        <tbody id="ekti-stale-tbody"></tbody>
+                    </table>
+                </div>
+                <div id="ekti-review-table-wrap" style="display:none;">
+                    <h3>Manual Review Required</h3>
+                    <table class="wp-list-table widefat fixed striped">
+                        <thead>
+                            <tr><th>Event ID</th><th>Title</th><th>Reason</th></tr>
+                        </thead>
+                        <tbody id="ekti-review-tbody"></tbody>
+                    </table>
+                </div>
+                <div id="ekti-dups-table-wrap" style="display:none;">
+                    <h3>Duplicate Event Groups</h3>
+                    <table class="wp-list-table widefat fixed striped">
+                        <thead>
+                            <tr><th>TEC Source</th><th>Role</th><th>Event ID</th><th>Status</th><th>Tickets</th><th>Attendees</th><th>Calendars</th></tr>
+                        </thead>
+                        <tbody id="ekti-dups-tbody"></tbody>
+                    </table>
+                </div>
             </div>
 
             <!-- Event Mapping Panel -->
