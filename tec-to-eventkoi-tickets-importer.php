@@ -3,7 +3,7 @@
  * Plugin Name: EventKoi Tickets Importer
  * Plugin URI:  https://onedog.solutions
  * Description: Migrates tickets and attendees from The Events Calendar (Event Tickets / Event Tickets Plus) to EventKoi.
- * Version:     1.1.0
+ * Version:     1.2.0
  * Author:      One Dog Solutions
  * Author URI:  https://onedog.solutions
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'EKTI_VERSION', '1.1.0' );
+define( 'EKTI_VERSION', '1.2.0' );
 define( 'EKTI_LOG_DIR', WP_CONTENT_DIR . '/uploads' );
 define( 'EKTI_LOG_FILE', EKTI_LOG_DIR . '/eventkoi-import.log' );
 define( 'EKTI_BATCH_SIZE', 30 );
@@ -47,6 +47,9 @@ final class EventKoi_Tickets_Importer {
         add_action( 'wp_ajax_ekti_run_ticket_dedupe', [ $this, 'ajax_run_ticket_dedupe' ] );
         add_action( 'wp_ajax_ekti_run_event_merge', [ $this, 'ajax_run_event_merge' ] );
         add_action( 'wp_ajax_ekti_undo_cleanup', [ $this, 'ajax_undo_cleanup' ] );
+        add_action( 'wp_ajax_ekti_scan_ticket_details', [ $this, 'ajax_scan_ticket_details' ] );
+        add_action( 'wp_ajax_ekti_run_ticket_details_sync', [ $this, 'ajax_run_ticket_details_sync' ] );
+        add_action( 'wp_ajax_ekti_undo_sync', [ $this, 'ajax_undo_sync' ] );
         add_action( 'wp_ajax_ekti_get_log', [ $this, 'ajax_get_log' ] );
         add_action( 'wp_ajax_ekti_clear_log', [ $this, 'ajax_clear_log' ] );
     }
@@ -806,9 +809,9 @@ final class EventKoi_Tickets_Importer {
             $product_id
         ) );
 
-        // Get stock from WooCommerce product if available.
-        $stock = get_post_meta( $product_id, '_stock', true );
-        $qty_available = $stock !== '' ? intval( $stock ) : null;
+        // Sale window + capacity from TEC source data (Step 7 rules).
+        $defaults      = $this->ticket_defaults( $tec_event_id, $ek_event_id, $product_id );
+        $qty_available = $defaults['quantity_available'];
 
         $inserted = $wpdb->insert( $tickets_table, [
             'event_id'           => $ek_event_id,
@@ -819,8 +822,8 @@ final class EventKoi_Tickets_Importer {
             'quantity_available' => $qty_available,
             'max_per_order'      => null,
             'quantity_sold'      => $attendee_count,
-            'sale_start'         => null,
-            'sale_end'           => null,
+            'sale_start'         => $defaults['sale_start'],
+            'sale_end'           => $defaults['sale_end'],
             'terms_conditions'   => null,
             'status'             => 'active',
             'sort_order'         => 0,
@@ -1739,17 +1742,44 @@ final class EventKoi_Tickets_Importer {
      * Undo the last cleanup by replaying the audit ledger in reverse.
      */
     private function undo_cleanup() {
-        global $wpdb;
         $audit = get_option( 'ekti_cleanup_audit', [] );
         if ( empty( $audit ) ) {
             return [ 'error' => 'Nothing to undo.' ];
         }
+        $counts = $this->replay_audit_ops( $audit );
+        delete_option( 'ekti_cleanup_audit' );
+        $this->log( 'Cleanup undo complete. ' . wp_json_encode( $counts ) );
+        return [ 'undone' => $counts ];
+    }
 
+    /**
+     * Undo the last ticket details sync (separate ledger from cleanup so
+     * undoing a sync never replays the verified pre-import cleanup).
+     */
+    private function undo_sync() {
+        $audit = get_option( 'ekti_sync_audit', [] );
+        if ( empty( $audit ) ) {
+            return [ 'error' => 'Nothing to undo.' ];
+        }
+        $counts = $this->replay_audit_ops( $audit );
+        delete_option( 'ekti_sync_audit' );
+        $this->log( 'Ticket details sync undo complete. ' . wp_json_encode( $counts ) );
+        return [ 'undone' => $counts ];
+    }
+
+    /**
+     * Replay a list of audit ops in reverse. Shared by cleanup and sync undo.
+     */
+    private function replay_audit_ops( $audit ) {
+        global $wpdb;
         $counts = [];
         foreach ( array_reverse( $audit ) as $op ) {
             switch ( $op['type'] ) {
                 case 'insert_ticket':
                     $wpdb->insert( $this->ek_table( 'tickets' ), $op['row'] );
+                    break;
+                case 'delete_ticket':
+                    $wpdb->delete( $this->ek_table( 'tickets' ), [ 'id' => $op['id'] ] );
                     break;
                 case 'update_ticket_event':
                     $wpdb->update( $this->ek_table( 'tickets' ), [ 'event_id' => $op['old_event_id'] ], [ 'id' => $op['id'] ] );
@@ -1770,6 +1800,9 @@ final class EventKoi_Tickets_Importer {
                 case 'update_option':
                     update_option( $op['name'], $op['old'] );
                     break;
+                case 'add_option':
+                    delete_option( $op['name'] );
+                    break;
                 case 'update_postmeta':
                     update_post_meta( $op['post'], $op['key'], $op['old'] );
                     break;
@@ -1782,10 +1815,634 @@ final class EventKoi_Tickets_Importer {
             }
             $counts[ $op['type'] ] = ( $counts[ $op['type'] ] ?? 0 ) + 1;
         }
+        return $counts;
+    }
 
-        delete_option( 'ekti_cleanup_audit' );
-        $this->log( 'Cleanup undo complete. ' . wp_json_encode( $counts ) );
-        return [ 'undone' => $counts ];
+    /**
+     * Append audit ops to the sync ledger.
+     */
+    private function audit_push_sync( $ops ) {
+        if ( empty( $ops ) ) {
+            return;
+        }
+        $audit = get_option( 'ekti_sync_audit', [] );
+        if ( ! is_array( $audit ) ) {
+            $audit = [];
+        }
+        update_option( 'ekti_sync_audit', array_merge( $audit, $ops ), false );
+    }
+
+    /* ------------------------------------------------------------------
+     * STEP 7 — TICKET DETAILS SYNC
+     *
+     * Backfills sale_start (event publish time), sale_end (6 AM on the day
+     * before the event) and quantity_available (TEC ticket capacity) on
+     * EventKoi ticket rows, and reconciles multi-product TEC events into
+     * distinct EventKoi ticket types. EventKoi stores the sale window as
+     * UTC 'Y-m-d H:i:s' strings (it parses them with strtotime( $v . ' UTC' )).
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Bulk-resolve TEC event => WC ticket products.
+     *
+     * Products are discovered via the product-side backlink
+     * (_tribe_wooticket_for_event) first, then attendee rows
+     * (_tribe_wooticket_product). Returns tec_id => list of
+     * [ 'id', 'name', 'price', 'capacity' ] sorted by product ID.
+     */
+    private function get_tec_product_map() {
+        global $wpdb;
+
+        $pairs = [];
+        $rows  = $wpdb->get_results(
+            "SELECT pm.meta_value AS tec_id, pm.post_id AS product_id
+             FROM {$wpdb->postmeta} pm
+             JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+             WHERE pm.meta_key = '_tribe_wooticket_for_event'
+               AND p.post_type = 'product'
+               AND p.post_status NOT IN ('trash', 'auto-draft')",
+            ARRAY_A
+        );
+        foreach ( $rows as $r ) {
+            $pairs[ (int) $r['tec_id'] ][ (int) $r['product_id'] ] = true;
+        }
+        $rows = $wpdb->get_results(
+            "SELECT DISTINCT pm1.meta_value AS tec_id, pm2.meta_value AS product_id
+             FROM {$wpdb->postmeta} pm1
+             JOIN {$wpdb->postmeta} pm2 ON pm1.post_id = pm2.post_id
+             WHERE pm1.meta_key = '_tribe_wooticket_event'
+               AND pm2.meta_key = '_tribe_wooticket_product'",
+            ARRAY_A
+        );
+        foreach ( $rows as $r ) {
+            $pairs[ (int) $r['tec_id'] ][ (int) $r['product_id'] ] = true;
+        }
+
+        $product_ids = [];
+        foreach ( $pairs as $prods ) {
+            foreach ( array_keys( $prods ) as $pid ) {
+                $product_ids[ $pid ] = true;
+            }
+        }
+
+        $titles = [];
+        $meta   = [];
+        if ( $product_ids ) {
+            $in   = implode( ',', array_keys( $product_ids ) );
+            $rows = $wpdb->get_results(
+                "SELECT ID, post_title FROM {$wpdb->posts} WHERE ID IN ({$in})",
+                ARRAY_A
+            );
+            foreach ( $rows as $r ) {
+                $titles[ (int) $r['ID'] ] = $r['post_title'];
+            }
+            $rows = $wpdb->get_results(
+                "SELECT post_id, meta_key, meta_value FROM {$wpdb->postmeta}
+                 WHERE meta_key IN ('_price', '_tribe_ticket_capacity') AND post_id IN ({$in})",
+                ARRAY_A
+            );
+            foreach ( $rows as $r ) {
+                $meta[ (int) $r['post_id'] ][ $r['meta_key'] ] = $r['meta_value'];
+            }
+        }
+
+        $map = [];
+        foreach ( $pairs as $tec_id => $prods ) {
+            $list = [];
+            foreach ( array_keys( $prods ) as $pid ) {
+                $m      = $meta[ $pid ] ?? [];
+                $list[] = [
+                    'id'       => $pid,
+                    'name'     => $titles[ $pid ] ?? '',
+                    'price'    => isset( $m['_price'] ) ? floatval( $m['_price'] ) : null,
+                    'capacity' => $m['_tribe_ticket_capacity'] ?? '',
+                ];
+            }
+            usort( $list, function ( $a, $b ) {
+                return $a['id'] - $b['id'];
+            } );
+            $map[ $tec_id ] = $list;
+        }
+        ksort( $map );
+        return $map;
+    }
+
+    /**
+     * Convert a site-local datetime string to a UTC 'Y-m-d H:i:s' string.
+     */
+    private function local_to_utc( $local ) {
+        $local = trim( (string) $local );
+        if ( '' === $local ) {
+            return null;
+        }
+        try {
+            $dt = new DateTime( $local, wp_timezone() );
+        } catch ( Exception $e ) {
+            return null;
+        }
+        $dt->setTimezone( new DateTimeZone( 'UTC' ) );
+        return $dt->format( 'Y-m-d H:i:s' );
+    }
+
+    /**
+     * Convert a UTC 'Y-m-d H:i:s' string to site-local (for display only).
+     */
+    private function utc_to_local( $utc ) {
+        if ( ! $utc ) {
+            return null;
+        }
+        try {
+            $dt = new DateTime( $utc, new DateTimeZone( 'UTC' ) );
+            $dt->setTimezone( wp_timezone() );
+            return $dt->format( 'Y-m-d H:i:s' );
+        } catch ( Exception $e ) {
+            return $utc;
+        }
+    }
+
+    /**
+     * Compute the proposed sale window for an event (UTC strings).
+     *
+     * sale_start = event publish time (TEC post_date, EventKoi fallback).
+     * sale_end   = 6 AM site time on the day before the event start date.
+     * An inverted window is reported for review and skipped.
+     */
+    private function compute_sale_window( $tec_post_date, $ek_post_date, $start_ts ) {
+        $sale_start = $this->local_to_utc( $tec_post_date ?: $ek_post_date );
+        $sale_end   = null;
+        if ( $start_ts ) {
+            try {
+                $dt  = new DateTime( '@' . (int) $start_ts );
+                $dt->setTimezone( wp_timezone() );
+                $end = new DateTime( $dt->format( 'Y-m-d' ) . ' 06:00:00', wp_timezone() );
+                $end->modify( '-1 day' );
+                $end->setTimezone( new DateTimeZone( 'UTC' ) );
+                $sale_end = $end->format( 'Y-m-d H:i:s' );
+            } catch ( Exception $e ) {
+                $sale_end = null;
+            }
+        }
+        $review = null;
+        if ( $sale_start && $sale_end && strcmp( $sale_end, $sale_start ) <= 0 ) {
+            $review     = 'Computed sale end (' . $sale_end . ' UTC) not after sale start (' . $sale_start . ' UTC); window skipped.';
+            $sale_start = null;
+            $sale_end   = null;
+        }
+        return [ 'sale_start' => $sale_start, 'sale_end' => $sale_end, 'review' => $review ];
+    }
+
+    /**
+     * Proposed field defaults for a freshly created ticket type.
+     */
+    private function ticket_defaults( $tec_event_id, $ek_event_id, $product_id ) {
+        $cap    = get_post_meta( $product_id, '_tribe_ticket_capacity', true );
+        $window = $this->compute_sale_window_for_event( $tec_event_id, $ek_event_id );
+        return [
+            'quantity_available' => ( '' !== $cap && is_numeric( $cap ) && (int) $cap >= 0 ) ? (int) $cap : null,
+            'sale_start'         => $window['sale_start'],
+            'sale_end'           => $window['sale_end'],
+        ];
+    }
+
+    /**
+     * Resolve the sale window for a TEC/EventKoi event pair from live data.
+     */
+    private function compute_sale_window_for_event( $tec_event_id, $ek_event_id ) {
+        $tec_post_date = null;
+        $tec           = get_post( $tec_event_id );
+        if ( $tec && 'trash' !== $tec->post_status ) {
+            $tec_post_date = $tec->post_date;
+        }
+        $ek_post_date = null;
+        $start_ts     = (int) get_post_meta( $ek_event_id, 'start_timestamp', true );
+        $ek           = get_post( $ek_event_id );
+        if ( $ek ) {
+            $ek_post_date = $ek->post_date;
+        }
+        if ( ! $start_ts && $tec ) {
+            $esd = get_post_meta( $tec_event_id, '_EventStartDate', true );
+            $utc = $this->local_to_utc( $esd );
+            if ( $utc ) {
+                $start_ts = (int) strtotime( $utc . ' UTC' );
+            }
+        }
+        return $this->compute_sale_window( $tec_post_date, $ek_post_date, $start_ts );
+    }
+
+    /**
+     * Queue per-ticket field backfill items (NULL-fill only) onto a scan.
+     */
+    private function queue_field_updates( &$items, &$counts, $t, $window, $cap ) {
+        $fields    = [];
+        $conflicts = [];
+        $proposed  = [
+            'quantity_available' => $cap,
+            'sale_start'         => $window['sale_start'],
+            'sale_end'           => $window['sale_end'],
+        ];
+        foreach ( $proposed as $field => $new ) {
+            if ( null === $new ) {
+                continue;
+            }
+            $cur = $t[ $field ];
+            if ( null === $cur || '' === $cur ) {
+                $fields[ $field ] = $new;
+            } elseif ( (string) $cur !== (string) $new ) {
+                $conflicts[] = $field . ' is ' . $cur . ', proposed ' . $new;
+            }
+        }
+        if ( $conflicts ) {
+            $items[] = [ 'type' => 'review', 'reason' => 'Ticket #' . $t['id'] . ' non-NULL conflict: ' . implode( '; ', $conflicts ) ];
+            $counts['reviews']++;
+        }
+        if ( ! $fields ) {
+            return;
+        }
+        $display = [];
+        foreach ( $fields as $field => $new ) {
+            $cur_l   = ( 'sale_start' === $field || 'sale_end' === $field ) ? $this->utc_to_local( $t[ $field ] ) : $t[ $field ];
+            $new_l   = ( 'sale_start' === $field || 'sale_end' === $field ) ? $this->utc_to_local( $new ) : $new;
+            $display[] = $field . ': ' . ( null === $cur_l || '' === $cur_l ? 'NULL' : $cur_l ) . ' → ' . $new_l;
+        }
+        $items[] = [
+            'type'           => 'update',
+            'ticket_id'      => (int) $t['id'],
+            'ticket_display' => html_entity_decode( $t['name'] ),
+            'fields'         => $fields,
+            'changes_display'=> implode( '; ', $display ),
+        ];
+        $counts['updates']++;
+    }
+
+    /**
+     * Scan mapped events for ticket details sync work (read-only).
+     *
+     * Returns per-event items (create / convert / bind / update / review)
+     * plus aggregate counts. Events are keyed off the canonical
+     * _tec_import_source_id resolver so Auto-Match and sync agree.
+     */
+    private function scan_ticket_details() {
+        global $wpdb;
+
+        $counts = [ 'creates' => 0, 'converts' => 0, 'binds' => 0, 'updates' => 0, 'reviews' => 0, 'pending_events' => 0 ];
+        $empty  = [ 'events' => [], 'counts' => $counts ];
+
+        $source_map = $this->get_tec_import_source_mapping();
+        if ( empty( $source_map ) ) {
+            return $empty;
+        }
+        ksort( $source_map );
+
+        $tec_ids = array_map( 'intval', array_keys( $source_map ) );
+        $ek_ids  = array_values( array_unique( array_map( 'intval', $source_map ) ) );
+        $in_tec  = implode( ',', $tec_ids );
+        $in_ek   = implode( ',', $ek_ids );
+
+        // Titles + publish dates on both sides.
+        $ek_posts = [];
+        foreach ( $wpdb->get_results( "SELECT ID, post_title, post_date FROM {$wpdb->posts} WHERE ID IN ({$in_ek})", ARRAY_A ) as $r ) {
+            $ek_posts[ (int) $r['ID'] ] = $r;
+        }
+        $tec_dates = [];
+        foreach ( $wpdb->get_results( "SELECT ID, post_date FROM {$wpdb->posts} WHERE ID IN ({$in_tec})", ARRAY_A ) as $r ) {
+            $tec_dates[ (int) $r['ID'] ] = $r['post_date'];
+        }
+
+        // Event start timestamps (EK meta, TEC _EventStartDate fallback).
+        $start_ts = [];
+        foreach ( $wpdb->get_results( "SELECT post_id, meta_value FROM {$wpdb->postmeta} WHERE meta_key = 'start_timestamp' AND post_id IN ({$in_ek})", ARRAY_A ) as $r ) {
+            $start_ts[ (int) $r['post_id'] ] = (int) $r['meta_value'];
+        }
+        $tec_start_dates = [];
+        foreach ( $wpdb->get_results( "SELECT post_id, meta_value FROM {$wpdb->postmeta} WHERE meta_key = '_EventStartDate' AND post_id IN ({$in_tec})", ARRAY_A ) as $r ) {
+            $tec_start_dates[ (int) $r['post_id'] ] = $r['meta_value'];
+        }
+
+        // Event-level TEC capacity fallback for product-less events.
+        $event_caps = [];
+        foreach ( $wpdb->get_results( "SELECT post_id, meta_value FROM {$wpdb->postmeta} WHERE meta_key = '_tribe_ticket_capacity' AND post_id IN ({$in_tec})", ARRAY_A ) as $r ) {
+            $event_caps[ (int) $r['post_id'] ] = $r['meta_value'];
+        }
+
+        // Existing tickets per EventKoi event.
+        $tickets      = [];
+        $all_ticket_ids = [];
+        foreach ( $wpdb->get_results( "SELECT id, event_id, name, price, quantity_available, quantity_sold, sale_start, sale_end FROM {$this->ek_table( 'tickets' )} WHERE event_id IN ({$in_ek}) ORDER BY event_id ASC, id ASC", ARRAY_A ) as $t ) {
+            $tickets[ (int) $t['event_id'] ][] = $t;
+            $all_ticket_ids[] = (int) $t['id'];
+        }
+        $orders_count = [];
+        if ( $all_ticket_ids ) {
+            $in_t = implode( ',', $all_ticket_ids );
+            foreach ( $wpdb->get_results( "SELECT ticket_id, COUNT(*) c FROM {$this->ek_table( 'ticket_orders' )} WHERE ticket_id IN ({$in_t}) GROUP BY ticket_id", ARRAY_A ) as $r ) {
+                $orders_count[ (int) $r['ticket_id'] ] = (int) $r['c'];
+            }
+        }
+
+        $product_map = $this->get_tec_product_map();
+        $capacity_of = function ( $prod ) {
+            $c = $prod['capacity'];
+            return ( '' !== $c && is_numeric( $c ) && (int) $c >= 0 ) ? (int) $c : null;
+        };
+
+        $events = [];
+        foreach ( $source_map as $tec_key => $ek_key ) {
+            $tec_id = (int) $tec_key;
+            $ek_id  = (int) $ek_key;
+            $tks    = $tickets[ $ek_id ] ?? [];
+            $prods  = $product_map[ $tec_id ] ?? [];
+
+            $ts = $start_ts[ $ek_id ] ?? 0;
+            if ( ! $ts && isset( $tec_start_dates[ $tec_id ] ) ) {
+                $utc = $this->local_to_utc( $tec_start_dates[ $tec_id ] );
+                if ( $utc ) {
+                    $ts = (int) strtotime( $utc . ' UTC' );
+                }
+            }
+            $window = $this->compute_sale_window( $tec_dates[ $tec_id ] ?? null, $ek_posts[ $ek_id ]['post_date'] ?? null, $ts );
+
+            $items = [];
+            if ( $window['review'] ) {
+                $items[] = [ 'type' => 'review', 'reason' => $window['review'] ];
+                $counts['reviews']++;
+            }
+
+            if ( $prods ) {
+                $assigned = [];
+                foreach ( $prods as $prod ) {
+                    $target  = null;
+                    $convert = false;
+
+                    // 1) Existing ticket with the same name.
+                    foreach ( $tks as $t ) {
+                        if ( ! isset( $assigned[ (int) $t['id'] ] ) && 0 === strcasecmp( trim( $t['name'] ), trim( $prod['name'] ) ) ) {
+                            $target = $t;
+                            break;
+                        }
+                    }
+                    // 2) Single product + single ticket: bind as-is (no rename).
+                    if ( ! $target && 1 === count( $prods ) && 1 === count( $tks ) ) {
+                        $target = $tks[0];
+                    }
+                    // 3) Multi-product: convert an unsold price-matching placeholder.
+                    if ( ! $target && count( $prods ) > 1 ) {
+                        foreach ( $tks as $t ) {
+                            if ( isset( $assigned[ (int) $t['id'] ] ) ) {
+                                continue;
+                            }
+                            if ( null !== $prod['price']
+                                && abs( floatval( $t['price'] ) - $prod['price'] ) < 0.001
+                                && 0 === (int) $t['quantity_sold']
+                                && 0 === ( $orders_count[ (int) $t['id'] ] ?? 0 ) ) {
+                                $target  = $t;
+                                $convert = true;
+                                break;
+                            }
+                        }
+                    }
+                    // 4) Create the missing ticket type.
+                    if ( ! $target ) {
+                        $items[] = [
+                            'type'         => 'create',
+                            'product_id'   => $prod['id'],
+                            'name'         => $prod['name'],
+                            'name_display' => html_entity_decode( $prod['name'] ),
+                            'price'        => $prod['price'],
+                            'capacity'     => $capacity_of( $prod ),
+                            'sale_start'   => $window['sale_start'],
+                            'sale_end'     => $window['sale_end'],
+                            'sale_start_l' => $this->utc_to_local( $window['sale_start'] ),
+                            'sale_end_l'   => $this->utc_to_local( $window['sale_end'] ),
+                        ];
+                        $counts['creates']++;
+                        $items[] = [ 'type' => 'bind', 'product_id' => $prod['id'], 'ticket_id' => null, 'mode' => 'new' ];
+                        $counts['binds']++;
+                        continue;
+                    }
+
+                    if ( $convert ) {
+                        $items[] = [
+                            'type'         => 'convert',
+                            'ticket_id'    => (int) $target['id'],
+                            'product_id'   => $prod['id'],
+                            'name'         => $prod['name'],
+                            'from_display' => html_entity_decode( $target['name'] ),
+                            'to_display'   => html_entity_decode( $prod['name'] ),
+                        ];
+                        $counts['converts']++;
+                    }
+                    $assigned[ (int) $target['id'] ] = true;
+
+                    // Bind the product => ticket option for the attendee import.
+                    $opt = '_ekti_tec_product_' . $tec_id . '_' . $prod['id'];
+                    $cur = get_option( $opt );
+                    if ( (int) $cur !== (int) $target['id'] ) {
+                        $items[] = [ 'type' => 'bind', 'product_id' => $prod['id'], 'ticket_id' => (int) $target['id'], 'mode' => $cur ? 'rebind' : 'new' ];
+                        $counts['binds']++;
+                    }
+
+                    $this->queue_field_updates( $items, $counts, $target, $window, $capacity_of( $prod ) );
+                }
+
+                // Leftover placeholders on multi-product events.
+                if ( count( $prods ) > 1 ) {
+                    foreach ( $tks as $t ) {
+                        if ( ! isset( $assigned[ (int) $t['id'] ] ) ) {
+                            $items[] = [ 'type' => 'review', 'reason' => 'Ticket #' . $t['id'] . ' "' . html_entity_decode( $t['name'] ) . '" left over after reconciliation; review manually.' ];
+                            $counts['reviews']++;
+                        }
+                    }
+                }
+            } else {
+                // No WC product: capacity falls back to event-level meta.
+                $cap = isset( $event_caps[ $tec_id ] ) && is_numeric( $event_caps[ $tec_id ] ) && (int) $event_caps[ $tec_id ] >= 0 ? (int) $event_caps[ $tec_id ] : null;
+                foreach ( $tks as $t ) {
+                    $this->queue_field_updates( $items, $counts, $t, $window, $cap );
+                }
+                if ( ! $tks ) {
+                    $items[] = [ 'type' => 'review', 'reason' => 'No EventKoi tickets and no WC products for this event.' ];
+                    $counts['reviews']++;
+                }
+            }
+
+            $actionable = false;
+            foreach ( $items as $it ) {
+                if ( in_array( $it['type'], [ 'create', 'convert', 'bind', 'update' ], true ) ) {
+                    $actionable = true;
+                    break;
+                }
+            }
+            if ( $items ) {
+                if ( $actionable ) {
+                    $counts['pending_events']++;
+                }
+                $events[] = [
+                    'tec_id'     => $tec_id,
+                    'ek_id'      => $ek_id,
+                    'title'      => html_entity_decode( $ek_posts[ $ek_id ]['post_title'] ?? ( '#' . $ek_id ) ),
+                    'items'      => $items,
+                    'actionable' => $actionable,
+                ];
+            }
+        }
+
+        return [ 'events' => $events, 'counts' => $counts ];
+    }
+
+    /**
+     * Apply a field update to one ticket row, recording a reversible op.
+     */
+    private function apply_ticket_update( $ticket_id, $fields, &$ops ) {
+        global $wpdb;
+        $row = $wpdb->get_row( $wpdb->prepare(
+            "SELECT * FROM {$this->ek_table( 'tickets' )} WHERE id = %d",
+            $ticket_id
+        ), ARRAY_A );
+        if ( ! $row ) {
+            return false;
+        }
+        $changed = [];
+        $old     = [];
+        foreach ( $fields as $key => $value ) {
+            if ( (string) $row[ $key ] !== (string) $value ) {
+                $changed[ $key ] = $value;
+                $old[ $key ]     = $row[ $key ];
+            }
+        }
+        if ( ! $changed ) {
+            return true;
+        }
+        $changed['updated_at'] = current_time( 'mysql' );
+        if ( false === $wpdb->update( $this->ek_table( 'tickets' ), $changed, [ 'id' => $ticket_id ] ) ) {
+            return false;
+        }
+        $ops[] = [ 'type' => 'update_ticket_fields', 'id' => (int) $ticket_id, 'old' => $old ];
+        return true;
+    }
+
+    /**
+     * Run the first chunk of pending ticket details sync work.
+     *
+     * The pending list shrinks as events are processed, so callers always
+     * repeat until done. Every write is recorded in the ekti_sync_audit
+     * ledger so the sync can be undone.
+     */
+    private function run_ticket_details_sync( $chunk = 50 ) {
+        global $wpdb;
+        $scan    = $this->scan_ticket_details();
+        $pending = array_values( array_filter( $scan['events'], function ( $e ) {
+            return $e['actionable'];
+        } ) );
+        $batch   = array_slice( $pending, 0, $chunk );
+
+        $results = [];
+        $tally   = [ 'created' => 0, 'converted' => 0, 'bound' => 0, 'updated' => 0 ];
+
+        foreach ( $batch as $e ) {
+            $event_ops   = [];
+            $ok          = true;
+            $last_create = null;
+            $sort_base   = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COALESCE(MAX(sort_order), 0) FROM {$this->ek_table( 'tickets' )} WHERE event_id = %d",
+                $e['ek_id']
+            ) );
+            $event_tally = [ 'created' => 0, 'converted' => 0, 'bound' => 0, 'updated' => 0 ];
+
+            $wpdb->query( 'START TRANSACTION' );
+            foreach ( $e['items'] as $item ) {
+                if ( ! $ok ) {
+                    break;
+                }
+                switch ( $item['type'] ) {
+                    case 'create':
+                        $now = current_time( 'mysql' );
+                        $sort_base++;
+                        $ok = (bool) $wpdb->insert( $this->ek_table( 'tickets' ), [
+                            'event_id'         => $e['ek_id'],
+                            'name'             => sanitize_text_field( $item['name'] ),
+                            'description'      => '',
+                            'price'            => $item['price'],
+                            'currency'         => 'USD',
+                            'quantity_available' => $item['capacity'],
+                            'max_per_order'    => null,
+                            'quantity_sold'    => 0,
+                            'sale_start'       => $item['sale_start'],
+                            'sale_end'         => $item['sale_end'],
+                            'terms_conditions' => null,
+                            'status'           => 'active',
+                            'sort_order'       => $sort_base,
+                            'created_at'       => $now,
+                            'updated_at'       => $now,
+                        ], [ '%d', '%s', '%s', '%f', '%s', '%d', '%d', '%d', '%s', '%s', '%s', '%s', '%d', '%s', '%s' ] );
+                        if ( $ok ) {
+                            $last_create = (int) $wpdb->insert_id;
+                            $event_ops[] = [ 'type' => 'delete_ticket', 'id' => $last_create ];
+                            $event_tally['created']++;
+                            $this->log( "Sync: created ticket type \"{$item['name']}\" (#{$last_create}) on EventKoi event {$e['ek_id']}." );
+                        }
+                        break;
+                    case 'convert':
+                        // Re-verify hard guards at execution time.
+                        $orders = (int) $wpdb->get_var( $wpdb->prepare(
+                            "SELECT COUNT(*) FROM {$this->ek_table( 'ticket_orders' )} WHERE ticket_id = %d",
+                            $item['ticket_id']
+                        ) );
+                        $cur = $wpdb->get_row( $wpdb->prepare(
+                            "SELECT quantity_sold FROM {$this->ek_table( 'tickets' )} WHERE id = %d",
+                            $item['ticket_id']
+                        ), ARRAY_A );
+                        if ( ! $cur || (int) $cur['quantity_sold'] > 0 || $orders > 0 ) {
+                            $ok = false;
+                            break;
+                        }
+                        $ok = $this->apply_ticket_update( $item['ticket_id'], [ 'name' => $item['name'] ], $event_ops );
+                        if ( $ok ) {
+                            $event_tally['converted']++;
+                            $this->log( "Sync: converted ticket #{$item['ticket_id']} to \"{$item['name']}\" on event {$e['ek_id']}." );
+                        }
+                        break;
+                    case 'bind':
+                        $tid = $item['ticket_id'] ?? $last_create;
+                        if ( ! $tid ) {
+                            $ok = false;
+                            break;
+                        }
+                        $opt = '_ekti_tec_product_' . $e['tec_id'] . '_' . $item['product_id'];
+                        $old = get_option( $opt );
+                        update_option( $opt, (int) $tid );
+                        $event_ops[] = $old ? [ 'type' => 'update_option', 'name' => $opt, 'old' => $old ] : [ 'type' => 'add_option', 'name' => $opt ];
+                        $event_tally['bound']++;
+                        break;
+                    case 'update':
+                        $ok = $this->apply_ticket_update( $item['ticket_id'], $item['fields'], $event_ops );
+                        if ( $ok ) {
+                            $event_tally['updated']++;
+                        }
+                        break;
+                }
+            }
+
+            if ( ! $ok ) {
+                $wpdb->query( 'ROLLBACK' );
+                $this->log( 'Sync: event ' . $e['ek_id'] . ' failed; rolled back. ' . $wpdb->last_error, 'ERROR' );
+                $results[] = [ 'tec_id' => $e['tec_id'], 'ek_id' => $e['ek_id'], 'action' => 'error', 'reason' => $wpdb->last_error ?: 'guard failed' ];
+                continue;
+            }
+
+            $wpdb->query( 'COMMIT' );
+            $this->audit_push_sync( $event_ops );
+            foreach ( $event_tally as $k => $v ) {
+                $tally[ $k ] += $v;
+            }
+            $results[] = array_merge( [ 'tec_id' => $e['tec_id'], 'ek_id' => $e['ek_id'], 'action' => 'synced', 'title' => $e['title'] ], $event_tally );
+        }
+
+        return [
+            'processed' => count( $batch ),
+            'tally'     => $tally,
+            'done'      => count( $pending ) <= count( $batch ),
+            'results'   => $results,
+        ];
     }
 
     /* ------------------------------------------------------------------
@@ -1981,6 +2638,25 @@ final class EventKoi_Tickets_Importer {
         wp_send_json_success( $result );
     }
 
+    public function ajax_scan_ticket_details() {
+        $this->check_ajax();
+        wp_send_json_success( $this->scan_ticket_details() );
+    }
+
+    public function ajax_run_ticket_details_sync() {
+        $this->check_ajax();
+        wp_send_json_success( $this->run_ticket_details_sync() );
+    }
+
+    public function ajax_undo_sync() {
+        $this->check_ajax();
+        $result = $this->undo_sync();
+        if ( isset( $result['error'] ) ) {
+            wp_send_json_error( $result['error'] );
+        }
+        wp_send_json_success( $result );
+    }
+
     public function ajax_get_log() {
         $this->check_ajax();
         $lines = 50;
@@ -2076,6 +2752,51 @@ final class EventKoi_Tickets_Importer {
                             <tr><th>TEC Source</th><th>Role</th><th>Event ID</th><th>Status</th><th>Tickets</th><th>Attendees</th><th>Calendars</th></tr>
                         </thead>
                         <tbody id="ekti-dups-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Ticket Details Sync Panel -->
+            <div class="ekti-panel" id="ekti-sync-panel">
+                <h2>Ticket Details Sync</h2>
+                <p>Backfills ticket sale windows (on sale at event publish time, off sale 6 AM the day before the event) and quantity available (TEC capacity), and reconciles multi-product TEC events into distinct ticket types. All changes are audited and undoable.</p>
+                <div class="ekti-actions">
+                    <button class="button button-primary" id="ekti-sync-scan">Scan Ticket Details</button>
+                    <button class="button" id="ekti-sync-run" disabled>Run Sync</button>
+                    <button class="button button-secondary" id="ekti-sync-undo" style="color:#a00;">Undo Last Sync</button>
+                </div>
+                <div id="ekti-sync-status" class="ekti-status"></div>
+                <div id="ekti-sync-progress-wrap" style="display:none;">
+                    <div class="ekti-progress-bar">
+                        <div class="ekti-progress-fill" id="ekti-sync-progress-fill" style="width:0%"></div>
+                    </div>
+                    <div class="ekti-progress-text" id="ekti-sync-progress-text">0%</div>
+                </div>
+                <div id="ekti-sync-types-wrap" style="display:none;">
+                    <h3>Ticket Types to Create / Convert</h3>
+                    <table class="wp-list-table widefat fixed striped">
+                        <thead>
+                            <tr><th>Event ID</th><th>Title</th><th>Action</th><th>Name</th><th>Price</th><th>Capacity</th><th>Sale Window (site time)</th></tr>
+                        </thead>
+                        <tbody id="ekti-sync-types-tbody"></tbody>
+                    </table>
+                </div>
+                <div id="ekti-sync-updates-wrap" style="display:none;">
+                    <h3>Field Updates</h3>
+                    <table class="wp-list-table widefat fixed striped">
+                        <thead>
+                            <tr><th>Event ID</th><th>Title</th><th>Ticket</th><th>Changes</th></tr>
+                        </thead>
+                        <tbody id="ekti-sync-updates-tbody"></tbody>
+                    </table>
+                </div>
+                <div id="ekti-sync-review-wrap" style="display:none;">
+                    <h3>Manual Review Required</h3>
+                    <table class="wp-list-table widefat fixed striped">
+                        <thead>
+                            <tr><th>Event ID</th><th>Title</th><th>Reason</th></tr>
+                        </thead>
+                        <tbody id="ekti-sync-review-tbody"></tbody>
                     </table>
                 </div>
             </div>

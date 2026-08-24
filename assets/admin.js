@@ -472,6 +472,179 @@
     }
 
     /* ------------------------------------------------------------------ */
+    /*  TICKET DETAILS SYNC                                               */
+    /* ------------------------------------------------------------------ */
+
+    var syncRunning = false;
+    var syncTotals  = { creates: 0, converts: 0, binds: 0, updates: 0, reviews: 0, pending_events: 0 };
+
+    function scanTicketDetails() {
+        appendConsole('Scanning ticket details...', 'info');
+        setStatus('#ekti-sync-status', '<span class="ekti-spinner"></span> Scanning...', 'info');
+        ajax('ekti_scan_ticket_details', {}, function (resp) {
+            if (!resp.success) {
+                appendConsole('Scan error: ' + resp.data, 'error');
+                setStatus('#ekti-sync-status', 'Scan failed.', 'error');
+                return;
+            }
+            var d = resp.data;
+            var c = d.counts;
+
+            // Ticket types to create / convert.
+            var $ty = $('#ekti-sync-types-tbody').empty();
+            var typeRows = 0;
+            $.each(d.events, function (i, ev) {
+                $.each(ev.items, function (j, it) {
+                    if (it.type === 'create') {
+                        $ty.append('<tr><td>' + ev.tec_id + '</td><td>' + escapeHtml(ev.title) + '</td>' +
+                            '<td><span style="color:#16a34a;font-size:11px;">create</span></td>' +
+                            '<td>' + escapeHtml(it.name_display) + '</td>' +
+                            '<td>$' + it.price + '</td>' +
+                            '<td>' + (it.capacity === null ? '\u221e unlimited' : it.capacity) + '</td>' +
+                            '<td>' + escapeHtml(it.sale_start_l || '\u2014') + ' \u2192 ' + escapeHtml(it.sale_end_l || '\u2014') + '</td></tr>');
+                        typeRows++;
+                    } else if (it.type === 'convert') {
+                        $ty.append('<tr><td>' + ev.tec_id + '</td><td>' + escapeHtml(ev.title) + '</td>' +
+                            '<td><span style="color:#d97706;font-size:11px;">convert #' + it.ticket_id + '</span></td>' +
+                            '<td>' + escapeHtml(it.from_display) + ' \u2192 ' + escapeHtml(it.to_display) + '</td>' +
+                            '<td>\u2014</td><td>\u2014</td><td>\u2014</td></tr>');
+                        typeRows++;
+                    }
+                });
+            });
+            $('#ekti-sync-types-wrap').toggle(typeRows > 0);
+
+            // Field updates table.
+            var $up = $('#ekti-sync-updates-tbody').empty();
+            var updateRows = 0;
+            $.each(d.events, function (i, ev) {
+                $.each(ev.items, function (j, it) {
+                    if (it.type === 'update') {
+                        $up.append('<tr><td>' + ev.tec_id + '</td><td>' + escapeHtml(ev.title) + '</td>' +
+                            '<td>#' + it.ticket_id + ' ' + escapeHtml(it.ticket_display) + '</td>' +
+                            '<td>' + escapeHtml(it.changes_display) + '</td></tr>');
+                        updateRows++;
+                    }
+                });
+            });
+            $('#ekti-sync-updates-wrap').toggle(updateRows > 0);
+
+            // Manual review table.
+            var $rv = $('#ekti-sync-review-tbody').empty();
+            var reviewRows = 0;
+            $.each(d.events, function (i, ev) {
+                $.each(ev.items, function (j, it) {
+                    if (it.type === 'review') {
+                        $rv.append('<tr><td>' + ev.tec_id + '</td><td>' + escapeHtml(ev.title) + '</td><td>' + escapeHtml(it.reason) + '</td></tr>');
+                        reviewRows++;
+                    }
+                });
+            });
+            $('#ekti-sync-review-wrap').toggle(reviewRows > 0);
+
+            syncTotals = c;
+            $('#ekti-sync-run').prop('disabled', syncRunning || c.pending_events === 0);
+
+            setStatus('#ekti-sync-status',
+                'Scan complete: <strong>' + c.creates + '</strong> ticket types to create, ' +
+                '<strong>' + c.converts + '</strong> to convert, ' +
+                '<strong>' + c.binds + '</strong> product bindings, ' +
+                '<strong>' + c.updates + '</strong> field updates across ' +
+                '<strong>' + c.pending_events + '</strong> events; ' +
+                '<strong>' + c.reviews + '</strong> items need manual review.',
+                c.reviews > 0 ? 'warning' : 'success'
+            );
+            appendConsole('Ticket details scan: ' + c.creates + ' creates, ' + c.converts + ' converts, ' + c.binds + ' binds, ' + c.updates + ' updates, ' + c.reviews + ' review items (' + c.pending_events + ' events pending).', 'info');
+        });
+    }
+
+    function updateSyncProgress(processed, total) {
+        var pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 100;
+        $('#ekti-sync-progress-fill').css('width', pct + '%');
+        $('#ekti-sync-progress-text').text(pct + '% (' + processed + '/' + total + ')');
+    }
+
+    function loopTicketSync(total) {
+        var processed = 0;
+        var grand = { created: 0, converted: 0, bound: 0, updated: 0 };
+        $('#ekti-sync-progress-wrap').show();
+        updateSyncProgress(0, total);
+
+        function step() {
+            ajax('ekti_run_ticket_details_sync', {}, function (resp) {
+                if (!resp.success) {
+                    appendConsole('Sync error: ' + resp.data, 'error');
+                    syncRunning = false;
+                    $('#ekti-sync-run').prop('disabled', false);
+                    return;
+                }
+                var d = resp.data;
+                $.each(d.results || [], function (i, r) {
+                    if (r.action === 'synced') {
+                        appendConsole('\u2713 Synced ' + r.title + ' (TEC ' + r.tec_id + '): created ' + r.created + ', converted ' + r.converted + ', bound ' + r.bound + ', updated ' + r.updated);
+                    } else if (r.action === 'error') {
+                        appendConsole('\u2717 Error ' + (r.ek_id || r.tec_id) + ': ' + r.reason, 'error');
+                    }
+                });
+                $.each(d.tally || {}, function (k, v) {
+                    grand[k] = (grand[k] || 0) + v;
+                });
+                processed += d.processed;
+                updateSyncProgress(processed, total);
+
+                if (d.done) {
+                    appendConsole('=== Ticket Details Sync complete: ' + grand.created + ' created, ' + grand.converted + ' converted, ' + grand.bound + ' bound, ' + grand.updated + ' updated ===', 'info');
+                    setStatus('#ekti-sync-status',
+                        'Sync complete: <strong>' + grand.created + '</strong> ticket types created, ' +
+                        '<strong>' + grand.converted + '</strong> converted, ' +
+                        '<strong>' + grand.bound + '</strong> product bindings, ' +
+                        '<strong>' + grand.updated + '</strong> field updates.',
+                        'success'
+                    );
+                    syncRunning = false;
+                    updateSyncProgress(total, total);
+                    scanTicketDetails();
+                    loadStats();
+                } else {
+                    setTimeout(step, 200);
+                }
+            });
+        }
+        step();
+    }
+
+    function runSync() {
+        if (syncRunning) return;
+        if (!confirm('Sync ticket details for ' + syncTotals.pending_events + ' events (' + syncTotals.creates + ' creates, ' + syncTotals.converts + ' converts, ' + syncTotals.binds + ' binds, ' + syncTotals.updates + ' updates)? Changes are audited and can be undone.')) {
+            return;
+        }
+        syncRunning = true;
+        $('#ekti-sync-run').prop('disabled', true);
+        appendConsole('=== Starting Ticket Details Sync ===', 'info');
+        loopTicketSync(syncTotals.pending_events);
+    }
+
+    function undoSync() {
+        if (!confirm('Undo the last ticket details sync (removes created tickets, reverts renames, field updates, and product bindings)?')) {
+            return;
+        }
+        appendConsole('=== Undoing Last Ticket Details Sync ===', 'warn');
+        ajax('ekti_undo_sync', {}, function (resp) {
+            if (!resp.success) {
+                appendConsole('Undo error: ' + resp.data, 'error');
+                return;
+            }
+            var counts = resp.data.undone || {};
+            $.each(counts, function (type, n) {
+                appendConsole('  ' + type + ': ' + n, 'warn');
+            });
+            appendConsole('Undo complete.', 'warn');
+            scanTicketDetails();
+            loadStats();
+        });
+    }
+
+    /* ------------------------------------------------------------------ */
     /*  INIT                                                              */
     /* ------------------------------------------------------------------ */
 
@@ -491,6 +664,9 @@
         $('#ekti-cleanup-dedupe').on('click', runDedupe);
         $('#ekti-cleanup-merge').on('click', runMerge);
         $('#ekti-cleanup-undo').on('click', undoCleanup);
+        $('#ekti-sync-scan').on('click', scanTicketDetails);
+        $('#ekti-sync-run').on('click', runSync);
+        $('#ekti-sync-undo').on('click', undoSync);
         $('#ekti-load-log').on('click', loadLog);
         $('#ekti-clear-log').on('click', clearLog);
     });

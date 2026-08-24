@@ -7,12 +7,13 @@ condensed version of each build step so progress and plan travel together in one
 top-level document.
 
 - **Branch:** `main`
-- **Plugin version:** 1.1.0
+- **Plugin version:** 1.2.0
 - **Last updated:** 2026-08-23
-- **Overall status:** ✅ Step 6 complete — **Pre-Import Cleanup** shipped and
-  executed on dev: stale duplicate ticket types deleted (794) and duplicate
-  EventKoi events merged (151 pairs), fully audited and undoable. The dev
-  dataset is now clean and ready for the ticket import pipeline
+- **Overall status:** ✅ Step 7 complete — **Ticket Details Sync** shipped
+  and executed on dev: 664 ticket rows backfilled with sale windows +
+  capacity, 33 multi-product events reconciled into 40 new + 37 converted
+  distinct ticket types, 291 product bindings written — fully audited,
+  undo verified, idempotent. Ready for the ticket import pipeline
   (Auto-Match → mapping review → dry run → live import).
 
 ## Shared project facts (true for every step)
@@ -51,17 +52,20 @@ top-level document.
 | 4 | Event auto-match + duplicate TEC import handling | ✅ Done | 2bdb3c7, f63942a |
 | 5 | WooCommerce order linking (parent orders, charges, composite keys, WC meta) | ✅ Done | 0ca72b3 |
 | 6 | Pre-Import Cleanup (stale ticket dedupe + duplicate event merge, audit + undo) | ✅ Done | 7a1ee56 |
+| 7 | Ticket Details Sync (sale windows, capacity, multi-product reconciliation) | ✅ Done | TBD |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
 
-**Pre-import cleanup executed on dev (2026-08-23).** Dev DB backup taken
-before the destructive phases: `wp-content/uploads/db-backup-pre-cleanup-20260823.sql`.
+**Step 7 (Ticket Details Sync) executed + verified on dev (2026-08-23).**
 
 - **Proceed with the ticket import** on dev: Auto-Match → review mapping →
-  dry run → live import. Cleanup scan now reports 0 stale pairs and 0
-  mergeable groups.
+  dry run → live import. Sync scan now reports 0 actionable items
+  (attendee imports resolve via `_ekti_tec_product_*` bindings).
+- **3 review items remain** (inverted sale windows — TEC event published
+  after the computed off-sale cutoff; window skipped, fields left NULL):
+  Pie (TEC 44302), Fondant Hamburger Cake (TEC 48791), + 1 similar.
 - **4 report-only review items** (single ticket whose price ≠ current TEC
   price; not auto-fixed by design): Pan Dulce Workshop Series II (750 vs
   700), Frosting Feast (55 vs 0), Pan Dulce Workshop Series (750 vs 800),
@@ -319,9 +323,79 @@ events show single ticket at current price with calendars intact.
 
 ---
 
+### Step 7 — Ticket Details Sync (sale windows, capacity, reconciliation) ✅
+Backfills `sale_start`, `sale_end`, `quantity_available` on EventKoi ticket
+rows (all 845 NULL on dev) and reconciles the 33 mapped TEC events that
+have multiple distinct WC ticket products into per-product EventKoi ticket
+types. Verified beforehand: all 33 multi-product events carry genuinely
+distinct ticket types (33/33 distinct names, 0 identical price pairs);
+EventKoi stores both window fields as UTC `'Y-m-d H:i:s'` datetimes and
+`quantity_available` as a TOTAL (remaining = available − sold − held).
+
+Field rules (per ticket):
+- `sale_start` = TEC event `post_date` (original publish moment, site-local
+  → UTC; fallback EventKoi `post_date`).
+- `sale_end` = event-start calendar date (EventKoi `start_timestamp`;
+  fallback TEC `_EventStartDate`) minus 1 day at 06:00 site time → UTC.
+- `quantity_available` = product `_tribe_ticket_capacity` when int ≥ 0;
+  `''`/`-1` → NULL (unlimited). WC `_stock` is unusable (TEC markers).
+- Guards: only fill currently-NULL fields (non-NULL conflicts → review);
+  inverted windows (`sale_end <= sale_start`) → review + skip.
+
+Reconciliation per mapped event (products via `_tribe_wooticket_for_event`
+backlink ∪ attendee `_tribe_wooticket_product`, sorted by product ID):
+- Single-product events: keep existing ticket as-is, bind the
+  `_ekti_tec_product_*` option, backfill fields. No rename (minimal blast
+  radius).
+- Multi-product events: name-match → use; else first unconverted
+  placeholder with equal price (hard-guarded `quantity_sold = 0` AND zero
+  `ticket_orders` rows, re-verified at execution) → convert (rename); else
+  create a new ticket row (price = product `_price`, USD, active). Leftover
+  placeholders → review, never auto-deleted.
+
+New backend methods: `get_tec_product_map()`, `local_to_utc()` /
+`utc_to_local()`, `compute_sale_window()` / `compute_sale_window_for_event()`,
+`ticket_defaults()`, `queue_field_updates()`, `scan_ticket_details()`
+(read-only; returns per-event items of type create/convert/bind/update/
+review + counts), `apply_ticket_update()`, `run_ticket_details_sync($chunk=50)`
+(chunked, per-event DB transactions, re-scans each call so the pending list
+shrinks), `audit_push_sync()`, `undo_sync()`. `undo_cleanup()` and
+`undo_sync()` now share `replay_audit_ops()` (new op types `delete_ticket`,
+`add_option`). `get_or_create_ticket()` now populates the three fields on
+insert via `ticket_defaults()` and no longer reads `_stock` — closing the
+latent duplicate-ticket bug where attendee imports could never match the
+"General admission" placeholder by name (option binding is checked first).
+AJAX: `ajax_scan_ticket_details`, `ajax_run_ticket_details_sync`,
+`ajax_undo_sync` — nonce + `manage_options` gated via `check_ajax()`.
+
+New admin panel **"Ticket Details Sync"** (sixth panel): Scan renders three
+tables (creates/converts with price + capacity + site-local window; field
+updates shown current → proposed; review items with reasons); Run Sync with
+JS confirm, chunked progress, per-event console tallies; Undo Last Sync.
+`admin.js` gained `scanTicketDetails()` / `loopTicketSync()` / `runSync()` /
+`undoSync()`. Version bumped to 1.2.0.
+
+**Dev execution results (2026-08-23):** Scan found 664 field updates,
+40 creates, 37 converts, 291 binds across 665 pending events, 3 review
+items (inverted windows). Sync ran in 14 chunks of ≤50 events with 0
+errors and tallies exactly matching the scan. Verified: fixture TEC 42192
+→ qty 15, `2025-06-18 20:27:33` / `2025-08-22 11:00:00` UTC; Pan Dulce
+3-product events now carry Bundle/Early Bird/VIP ticket types; unlimited
+(`-1`) capacities stayed NULL; future event on sale, past event off sale,
+remaining = capacity − sold. Undo restored the exact baseline (845 rows,
+all NULL, 426 bindings, converted names reverted, Step 6 ledger intact);
+re-sync reproduced identical results and a third scan reports 0 actions
+(idempotent). Dry-run `get_or_create_ticket()` resolves distinct products
+via bindings (no duplicate ticket creation). The 181 rows still NULL are
+out of scope: 38 pre-existing orphans (hard-deleted event posts) plus
+tickets attached to non-event posts (WC refund/attachment/attendee-format
+posts, no TEC source).
+
+---
+
 ## Admin UI ✅
 
-Server-rendered PHP page (`render_admin_page()`) with five panels:
+Server-rendered PHP page (`render_admin_page()`) with six panels:
 1. **Overview** — stats grid (TEC events, attendees, EventKoi events, mapped/
    unmapped events, attendees to import, WC orders to link, already imported)
    loaded via AJAX. Dismissible warning notice when WooCommerce is inactive.
@@ -338,6 +412,10 @@ Server-rendered PHP page (`render_admin_page()`) with five panels:
    tables (stale ticket pairs with keep-vs-delete + TEC current price,
    review items, duplicate event groups with canonical badge and member
    stats).
+6. **Ticket Details Sync** (v1.2.0) — Scan / Run Sync / Undo Last Sync
+   buttons, progress bar reuse, three tables (ticket types to create or
+   convert with price/capacity/site-local sale window, field updates with
+   current → proposed values, review items).
 
 `admin.js` (jQuery IIFE): AJAX helper, console appender, stats loader
 (including WC order count + WC availability check), mapping loader/saver,
@@ -413,6 +491,24 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
   "pre-delete duplicates" approach (posts hard-deleted, tickets left
   behind). These predate this cleanup and are unrecoverable (nothing to
   repoint to, nothing to untrash). Left in place; flagged in Next action.
+
+- 2026-08-23: **Step 7 — separate sync audit ledger (deviation from the
+  original plan).** The approved plan recorded sync ops in
+  `ekti_cleanup_audit` so "Undo Last Cleanup" would reverse the sync. But
+  that ledger still holds the verified Step 6 ops (945 `insert_ticket` +
+  151 `untrash_post`), so a shared undo would also reinsert the stale
+  tickets and untrash the merged events. Implemented instead as a separate
+  `ekti_sync_audit` option with its own `undo_sync()` and an "Undo Last
+  Sync" button; the replay mechanism is shared (`replay_audit_ops()`).
+
+- 2026-08-23: **Multi-ticket verification (user-requested).** All 33
+  multi-product TEC events were audited before implementation: 33/33
+  distinct product names (e.g. "1 House 1 Decorator" vs "1 House 2
+  Decorators"; Pan Dulce Bundle/Early Bird/VIP), 26/33 distinct prices,
+  0 identical pairs, one 3-product event. The Step 6 ledger confirms all
+  945 deleted tickets were named "General admission" — no distinct ticket
+  type was ever deleted; they simply never existed in EventKoi (native
+  importer only created a default placeholder per event).
 
 - **No REST API:** the plugin uses `admin-ajax.php` rather than WP REST. This
   is deliberate for a migration tool — all operations are admin-initiated,
