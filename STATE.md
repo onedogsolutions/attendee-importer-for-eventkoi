@@ -50,7 +50,7 @@ top-level document.
 | 3 | Migration engine (batch processing, dry run, rollback) | ✅ Done | b2a2594 |
 | 4 | Event auto-match + duplicate TEC import handling | ✅ Done | 2bdb3c7, f63942a |
 | 5 | WooCommerce order linking (parent orders, charges, composite keys, WC meta) | ✅ Done | 0ca72b3 |
-| 6 | Pre-Import Cleanup (stale ticket dedupe + duplicate event merge, audit + undo) | ✅ Done | b270184 |
+| 6 | Pre-Import Cleanup (stale ticket dedupe + duplicate event merge, audit + undo) | ✅ Done | 7a1ee56 |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
