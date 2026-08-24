@@ -54,7 +54,7 @@ top-level document.
 | 5 | WooCommerce order linking (parent orders, charges, composite keys, WC meta) | ✅ Done | 0ca72b3 |
 | 6 | Pre-Import Cleanup (stale ticket dedupe + duplicate event merge, audit + undo) | ✅ Done | 7a1ee56 |
 | 7 | Ticket Details Sync (sale windows, capacity, multi-product reconciliation) | ✅ Done | eb57243 |
-| 8 | Calendar Sync (TEC locations → EventKoi calendars mapper) | ✅ Done | (see commit) |
+| 8 | Calendar Sync (TEC locations → EventKoi calendars mapper) | ✅ Done | bfed7b7 |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
