@@ -3,7 +3,7 @@
  * Plugin Name: EventKoi Tickets Importer
  * Plugin URI:  https://onedog.solutions
  * Description: Migrates tickets and attendees from The Events Calendar (Event Tickets / Event Tickets Plus) to EventKoi.
- * Version:     1.4.0
+ * Version:     1.4.2
  * Author:      One Dog Solutions
  * Author URI:  https://onedog.solutions
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'EKTI_VERSION', '1.4.0' );
+define( 'EKTI_VERSION', '1.4.2' );
 define( 'EKTI_LOG_DIR', WP_CONTENT_DIR . '/uploads' );
 define( 'EKTI_LOG_FILE', EKTI_LOG_DIR . '/eventkoi-import.log' );
 define( 'EKTI_BATCH_SIZE', 30 );
@@ -509,6 +509,18 @@ final class EventKoi_Tickets_Importer {
                 continue;
             }
 
+            // Idempotency: skip attendees already imported from a previous run.
+            if ( get_post_meta( $att['ID'], '_eventkoi_imported_from_tec', true ) ) {
+                $state['skipped']++;
+                $results[] = [
+                    'attendee_id' => $att['ID'],
+                    'action'      => 'skipped',
+                    'reason'      => 'Already imported (attendee-level flag)',
+                ];
+                $state['processed']++;
+                continue;
+            }
+
             $ek_event_id = (int) $mapping[ $tec_event_id ];
 
             // Get or create EventKoi ticket type for this product.
@@ -532,6 +544,11 @@ final class EventKoi_Tickets_Importer {
                 continue;
             }
 
+            // Attach resolved EventKoi IDs before grouping so the WC order
+            // meta ticket_items carry real ticket IDs.
+            $att['_ek_event_id']  = $ek_event_id;
+            $att['_ek_ticket_id'] = $ek_ticket_id;
+
             // Track per-WC-order totals for parent order creation.
             if ( $wc_order_id ) {
                 if ( ! isset( $wc_order_totals[ $wc_order_id ] ) ) {
@@ -551,8 +568,6 @@ final class EventKoi_Tickets_Importer {
                 $wc_order_totals[ $wc_order_id ]['attendees'][] = $att;
             }
 
-            $att['_ek_event_id']  = $ek_event_id;
-            $att['_ek_ticket_id'] = $ek_ticket_id;
             $resolved[] = $att;
         }
 

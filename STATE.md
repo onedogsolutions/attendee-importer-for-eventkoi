@@ -7,15 +7,18 @@ condensed version of each build step so progress and plan travel together in one
 top-level document.
 
 - **Branch:** `main`
-- **Plugin version:** 1.3.0
-- **Last updated:** 2026-08-23
-- **Overall status:** ✅ Step 8 complete — **Calendar Sync (Locations)**
-  shipped and executed on dev: 414 calendar assignments applied
-  (Austin 209, San Antonio 156, The Bake Lab 49), fully audited,
-  undo + idempotency + create-new-calendar paths all verified. Dev
-  left in the synced state. The importer pipeline is feature-complete:
-  Auto-Match → mapping review → cleanup → ticket sync → calendar sync
-  → dry run → live import.
+- **Plugin version:** 1.4.2
+- **Last updated:** 2026-08-29
+- **Overall status:** ✅ **Live import executed on dev and fully verified**
+  (v1.4.2): 2421 ticket_orders / 1674 parent orders + charges / 419
+  tickets created, 856 orphan attendees correctly skipped, 0 errors;
+  per-event counts match the TEC source and the
+  `ekti_pre_import_inventory` snapshot with zero drift. A second full
+  run proved idempotency (0 creates, 3277 skips, row counts unchanged).
+  Includes v1.4.0 orphan skip, v1.4.1 attendee-level idempotency, and
+  v1.4.2 WC order-meta ticket_id fix + post-import meta reconciliation.
+  Native-importer clone cleanup applied: 333 duplicate events trashed
+  (reversible), zero published duplicate sources remain.
 
 ## Shared project facts (true for every step)
 
@@ -55,17 +58,46 @@ top-level document.
 | 6 | Pre-Import Cleanup (stale ticket dedupe + duplicate event merge, audit + undo) | ✅ Done | 7a1ee56 |
 | 7 | Ticket Details Sync (sale windows, capacity, multi-product reconciliation) | ✅ Done | eb57243 |
 | 8 | Calendar Sync (TEC locations → EventKoi calendars mapper) | ✅ Done | bfed7b7 |
+| 9 | Orphan skip (v1.4.0) + attendee idempotency (v1.4.1) + WC meta fix (v1.4.2) + live import on dev | ✅ Done | — |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
 
-**Step 8 (Calendar Sync) executed + verified on dev (2026-08-23).**
+**Live import executed + verified on dev (2026-08-29, v1.4.2).** The
+import ran via `novamira/execute-php` with a lock-protected,
+time-budgeted batch runner (20 s budget per call, well under the 30 s
+MCP timeout; offset advances per batch and the v1.4.1 flag makes any
+overlap safe).
 
-- **Proceed with the ticket import** on dev: Auto-Match → review mapping →
-  dry run → live import. Sync scan now reports 0 actionable items
-  (attendee imports resolve via `_ekti_tec_product_*` bindings); calendar
-  sync is applied and idempotent (re-scan reports 0 pending).
+- **Verification results:** all 2421 order_ids distinct, 0 rows outside
+  the mapping, 0 null ticket_ids, 0 orphan tickets, all `quantity_sold`
+  values match, checked_in 1/1 matches TEC, `_eventkoi_imported_from_tec`
+  flags on all 2421, per-event live comparison 0 mismatches, inventory
+  snapshot comparison 0 drift. The 5 mapped events absent from the
+  snapshot (45355, 45306, 47077, 49647, 49187) are the restored-from-
+  trash events carrying 22 attendees — reconciling 2399 + 22 + 856
+  orphans = 3277 total.
+- **Dev server state:** EventKoi v1.3.32.0, importer v1.4.2 active;
+  `ekti_event_mapping` 419 entries; `trash-past-events` 24 months;
+  333 native-importer clone events trashed (2026-08-29, reversible
+  ledger `ekti_event_dedupe_audit`) — event counts now 647 published /
+  23 draft / 333 trash; zero published duplicate sources remain.
+- **5 of 419 mapping targets are DRAFT events** (Buche De Noel, Kids
+  Class: Holiday Poptarts, Family Day Daddy Daughter Valentines, 2× Pan
+  Dulce Workshop Series II) — the EventKoi counterparts of the 5
+  restored-from-trash TEC events, holding the 22 attendees outside the
+  inventory snapshot. Publishing them is a content decision, not a
+  data-integrity issue.
+- **32 WC orders span multiple TEC events** (legacy artifact): parent
+  order + WC meta carry the first event; each ticket_orders row keeps
+  its attendee's true event (EventKoi's native model is one event per
+  order).
+- **Production cutover checklist addition:** TEC's cleaner settings are
+  per-site — verify on prod that `trash-past-events` ≥ 24 (or disabled)
+  and `delete-past-events` is absent/off BEFORE running any import
+  there. The 24-month window starts eating the oldest events
+  (~Aug 2027 on dev); the same applies to prod on its own clock.
 - **3 review items remain** (inverted sale windows — TEC event published
   after the computed off-sale cutoff; window skipped, fields left NULL):
   Pie (TEC 44302), Fondant Hamburger Cake (TEC 48791), + 1 similar.
@@ -606,6 +638,70 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
   EventKoi event to assign. New calendars copy their display term-meta
   set from a template calendar rather than hard-coding EventKoi
   internals, so the plugin stays resilient to EventKoi schema changes.
+
+- 2026-08-29: **Orphan skip + idempotency + live import (v1.4.0 →
+  v1.4.1).** Root-caused mystery event deletions to TEC's
+  `tribe_trash_event_cron` (`trash-past-events` raised 12 → 24 months;
+  9 events restored). 856 attendees on 139 permanently deleted TEC
+  events are skipped by `auto_match_events()` (v1.4.0) instead of
+  fuzzy-matching onto a different year's same-titled event. The first
+  import attempt exposed a doubling bug: random checkin codes inside
+  composite order keys (`wc_{order}:{ticket}:{code}`) broke the
+  DB-level duplicate check across re-runs after an MCP 30 s timeout
+  (PHP continued server-side) → 4295 ticket_orders. After cleanup,
+  v1.4.1 added the attendee-level `_eventkoi_imported_from_tec`
+  pre-check at the top of `process_batch()`. The clean re-import
+  produced exactly the expected numbers, and a deliberate second full
+  run created 0 rows (3277 skips) — idempotency proven empirically.
+
+- 2026-08-29: **v1.4.2 WC order-meta fix + post-import reconciliation.**
+  `process_batch()` grouped attendees into `$wc_order_totals` before
+  attaching `_ek_event_id`/`_ek_ticket_id`, so `_eventkoi_ticket_items`
+  was written with `ticket_id: null` (PHP value-copy of the array;
+  1754 "Undefined array key" warnings during the first run flagged it).
+  EventKoi consumers skip null ticket IDs defensively and treat the
+  ticket_orders table as source of truth, so nothing broke — but the
+  meta contributed nothing. Fixed the ordering in code (v1.4.2) and
+  reconciled all 1674 orders server-side, rebuilding ticket_items in
+  EventKoi's native format (one item per ticket type, real ticket_id,
+  per-seat `codes` from `checkin_token`). Verified: 0 orders with null
+  ticket_ids, 0 event-meta mismatches, 0 ERROR log lines.
+
+- 2026-08-29: **Old-event deletion prevention — user decision: keep 24 months.**
+  Re-verified the deletion mechanism with live evidence: TEC's
+  `tribe_trash_event_cron` (daily) trashes events ended >N months ago,
+  then WP's `wp_scheduled_delete` purges trash after 30 days
+  (`EMPTY_TRASH_DAYS=30`) — the pipeline that consumed the 139 lost
+  events. Fingerprint: oldest published TEC event is 2025-08-19,
+  exactly the 12-month boundary during the incident. Both importers
+  verified innocent (our plugin's only `wp_trash_post` is EventKoi-side
+  in the merge panel; rollback touches only EventKoi data; the native
+  EventKoi importer has no tribe_events deletion path). TEC's harsher
+  `delete-past-events` permanent-delete cron is OFF (option absent,
+  `tribe_del_event_cron` not scheduled). Current state: 0 events in
+  trash, 0 events older than 24 months → the cron trashes nothing
+  today. **User chose no change:** the 10 oldest events (ended
+  2025-08-19→2025-08-29) become trash-eligible ~Aug 2027 as the
+  24-month window slides — revisit before then. Recommended-but-
+  declined option was disabling auto-trash entirely
+  (`trash-past-events = 0` clears the cron per Event_Cleaner source).
+  Even if events are lost again, v1.4.0 orphan-skip caps the damage at
+  skipped attendees (no wrong-year mis-matching).
+
+- 2026-08-29: **Native-importer clone cleanup (dev).** Trashed all 333
+  duplicate `eventkoi_event` posts (exact clones sharing a
+  `_tec_import_source_id`, all published + calendar-assigned, 0 attached
+  ticket data — verified live). Guards re-checked per loser: no
+  ticket_orders/tickets rows, not a mapping target, published status;
+  loser calendars unioned onto the canonical (0 unions needed — exact
+  clones). Reversible via a NEW `ekti_event_dedupe_audit` ledger of 333
+  `untrash_post` ops — the same op format `replay_audit_ops()` already
+  reverses, so a UI "Undo" button can be added before the production
+  cutover replay. Separate ledger by design (same rationale as Step 7)
+  so undoing this never replays the verified Step 6 `ekti_cleanup_audit`
+  ops. Note: the cleanup call hit the 30 s MCP timeout but completed
+  server-side; the resumable design (skip already-trashed + ledger
+  repair) verified a clean 333/333 outcome.
 
 - **No REST API:** the plugin uses `admin-ajax.php` rather than WP REST. This
   is deliberate for a migration tool — all operations are admin-initiated,
