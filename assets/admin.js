@@ -109,7 +109,9 @@
                     'value="' + selected + '" selected'
                 );
                 var badge = '';
-                if (row.match_source === 'source') {
+                if (row.is_orphan) {
+                    badge = ' <span style="color:#dc2626;font-size:11px;" title="TEC event permanently deleted — attendees will be skipped">&#x26A0; orphan (deleted)</span>';
+                } else if (row.match_source === 'source') {
                     badge = ' <span style="color:#16a34a;font-size:11px;" title="Matched via EventKoi import log">&#x2713; import log</span>';
                 } else if (row.match_source === 'manual') {
                     badge = ' <span style="color:#d97706;font-size:11px;" title="Matched via title similarity or manual">~ title/fuzzy</span>';
@@ -159,14 +161,15 @@
                 return;
             }
             var d = resp.data;
+            var orphanMsg = d.orphaned > 0 ? ', <strong style="color:#dc2626;">' + d.orphaned + '</strong> orphaned (deleted TEC events skipped)' : '';
             setStatus('#ekti-mapping-status',
                 'Auto-match complete: <strong>' + d.matched + '</strong> matched (' +
                 d.source_matched + ' via import log, ' +
                 d.title_matched + ' exact title, ' +
-                d.fuzzy_matched + ' fuzzy), <strong>' + d.unmatched + '</strong> unmatched.',
+                d.fuzzy_matched + ' fuzzy), <strong>' + d.unmatched + '</strong> unmatched' + orphanMsg + '.',
                 d.unmatched > 0 ? 'warning' : 'success'
             );
-            appendConsole('Auto-match: ' + d.matched + ' matched (' + d.source_matched + ' source, ' + d.title_matched + ' title, ' + d.fuzzy_matched + ' fuzzy), ' + d.unmatched + ' unmatched.', d.unmatched > 0 ? 'warn' : 'info');
+            appendConsole('Auto-match: ' + d.matched + ' matched (' + d.source_matched + ' source, ' + d.title_matched + ' title, ' + d.fuzzy_matched + ' fuzzy), ' + d.unmatched + ' unmatched' + (d.orphaned > 0 ? ', ' + d.orphaned + ' orphaned (deleted)' : '') + '.', d.unmatched > 0 ? 'warn' : 'info');
             loadMapping();
             loadStats();
         });

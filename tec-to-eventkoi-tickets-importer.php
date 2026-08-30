@@ -3,7 +3,7 @@
  * Plugin Name: EventKoi Tickets Importer
  * Plugin URI:  https://onedog.solutions
  * Description: Migrates tickets and attendees from The Events Calendar (Event Tickets / Event Tickets Plus) to EventKoi.
- * Version:     1.3.0
+ * Version:     1.4.0
  * Author:      One Dog Solutions
  * Author URI:  https://onedog.solutions
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'EKTI_VERSION', '1.3.0' );
+define( 'EKTI_VERSION', '1.4.0' );
 define( 'EKTI_LOG_DIR', WP_CONTENT_DIR . '/uploads' );
 define( 'EKTI_LOG_FILE', EKTI_LOG_DIR . '/eventkoi-import.log' );
 define( 'EKTI_BATCH_SIZE', 30 );
@@ -280,6 +280,9 @@ final class EventKoi_Tickets_Importer {
      *   1. Primary: _tec_import_source_id (authoritative from EventKoi's importer).
      *   2. Secondary: Exact title match.
      *   3. Fallback: Fuzzy title match (≥85% similarity).
+     *
+     * Orphan attendees (whose TEC event was permanently deleted) are skipped
+     * to prevent misassigning them to a different year's same-titled event.
      */
     private function auto_match_events() {
         $tec_event_ids = $this->get_tec_event_ids_with_attendees();
@@ -300,6 +303,7 @@ final class EventKoi_Tickets_Importer {
         $source_matched   = 0;
         $title_matched    = 0;
         $fuzzy_matched    = 0;
+        $orphaned         = 0;
 
         foreach ( $tec_event_ids as $tec_id ) {
             // Strategy 1: Authoritative _tec_import_source_id mapping.
@@ -312,14 +316,16 @@ final class EventKoi_Tickets_Importer {
 
             // Strategy 2 & 3: Title-based matching (for events not in EventKoi's import).
             $tec_post = get_post( $tec_id );
-            $title    = '';
 
-            if ( $tec_post ) {
-                $title = $tec_post->post_title;
-            } else {
-                // TEC event deleted — use product name from attendees.
-                $title = $this->get_product_name_for_tec_event( $tec_id ) ?: '';
+            // Skip orphan attendees from deleted TEC events — no reliable way
+            // to determine which year's instance they belonged to.  Title
+            // matching would misassign them to a different year's event.
+            if ( ! $tec_post ) {
+                $orphaned++;
+                continue;
             }
+
+            $title = $tec_post->post_title;
 
             if ( empty( $title ) ) {
                 $unmatched++;
@@ -352,9 +358,13 @@ final class EventKoi_Tickets_Importer {
 
         $this->save_mapping( $mapping );
 
+        if ( $orphaned > 0 ) {
+            $this->log( "Auto-match: {$orphaned} orphan TEC events (permanently deleted) skipped to prevent cross-year mismatches." );
+        }
+
         $this->log( sprintf(
-            'Auto-match: %d total matched (%d via _tec_import_source_id, %d exact title, %d fuzzy). %d unmatched.',
-            $matched, $source_matched, $title_matched, $fuzzy_matched, $unmatched
+            'Auto-match: %d total matched (%d via _tec_import_source_id, %d exact title, %d fuzzy). %d unmatched. %d orphaned (deleted TEC events skipped).',
+            $matched, $source_matched, $title_matched, $fuzzy_matched, $unmatched, $orphaned
         ) );
 
         return [
@@ -364,6 +374,7 @@ final class EventKoi_Tickets_Importer {
             'title_matched'     => $title_matched,
             'fuzzy_matched'     => $fuzzy_matched,
             'unmatched'         => $unmatched,
+            'orphaned'          => $orphaned,
             'mapping'           => $mapping,
         ];
     }
@@ -3019,7 +3030,10 @@ final class EventKoi_Tickets_Importer {
         $rows = [];
         foreach ( $tec_event_ids as $tec_id ) {
             $tec_post = get_post( $tec_id );
-            $tec_title = $tec_post ? $tec_post->post_title : '(Deleted) ' . $this->get_product_name_for_tec_event( $tec_id );
+            $is_orphan = ! $tec_post;
+            $tec_title = $tec_post
+                ? $tec_post->post_title
+                : '(Deleted — orphan attendees)';
             $attendee_count = (int) $wpdb->get_var( $wpdb->prepare(
                 "SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = '_tribe_wooticket_event' AND meta_value = %s",
                 $tec_id
@@ -3040,6 +3054,7 @@ final class EventKoi_Tickets_Importer {
                 'attendee_count' => $attendee_count,
                 'ek_event_id'    => isset( $mapping[ $tec_id ] ) ? $mapping[ $tec_id ] : null,
                 'match_source'   => $match_source,
+                'is_orphan'      => $is_orphan,
             ];
         }
 
@@ -3071,7 +3086,7 @@ final class EventKoi_Tickets_Importer {
     public function ajax_auto_match() {
         $this->check_ajax();
         $result = $this->auto_match_events();
-        $this->log( "Auto-match complete: {$result['matched']} matched, {$result['unmatched']} unmatched." );
+        $this->log( "Auto-match complete: {$result['matched']} matched, {$result['unmatched']} unmatched, {$result['orphaned']} orphaned (deleted TEC events skipped)." );
         wp_send_json_success( $result );
     }
 
