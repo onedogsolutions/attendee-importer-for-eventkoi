@@ -3,7 +3,7 @@
  * Plugin Name: EventKoi Tickets Importer
  * Plugin URI:  https://onedog.solutions
  * Description: Migrates tickets and attendees from The Events Calendar (Event Tickets / Event Tickets Plus) to EventKoi.
- * Version:     1.4.2
+ * Version:     1.5.0
  * Author:      One Dog Solutions
  * Author URI:  https://onedog.solutions
  * License:     GPL-2.0-or-later
@@ -14,10 +14,12 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'EKTI_VERSION', '1.4.2' );
+define( 'EKTI_VERSION', '1.5.0' );
 define( 'EKTI_LOG_DIR', WP_CONTENT_DIR . '/uploads' );
 define( 'EKTI_LOG_FILE', EKTI_LOG_DIR . '/eventkoi-import.log' );
 define( 'EKTI_BATCH_SIZE', 30 );
+define( 'EKTI_LOCATION_TAXONOMY', 'locations' );
+define( 'EKTI_INSTRUCTOR_TAXONOMY', 'instructors' );
 
 /**
  * Main plugin class.
@@ -54,6 +56,11 @@ final class EventKoi_Tickets_Importer {
         add_action( 'wp_ajax_ekti_save_location_mapping', [ $this, 'ajax_save_location_mapping' ] );
         add_action( 'wp_ajax_ekti_run_calendar_sync', [ $this, 'ajax_run_calendar_sync' ] );
         add_action( 'wp_ajax_ekti_undo_calendar_sync', [ $this, 'ajax_undo_calendar_sync' ] );
+        add_action( 'wp_ajax_ekti_scan_taxonomy_sync', [ $this, 'ajax_scan_taxonomy_sync' ] );
+        add_action( 'wp_ajax_ekti_save_taxonomy_mapping', [ $this, 'ajax_save_taxonomy_mapping' ] );
+        add_action( 'wp_ajax_ekti_run_taxonomy_sync', [ $this, 'ajax_run_taxonomy_sync' ] );
+        add_action( 'wp_ajax_ekti_undo_taxonomy_sync', [ $this, 'ajax_undo_taxonomy_sync' ] );
+        add_action( 'wp_ajax_ekti_remove_organizer_fields', [ $this, 'ajax_remove_organizer_fields' ] );
         add_action( 'wp_ajax_ekti_get_log', [ $this, 'ajax_get_log' ] );
         add_action( 'wp_ajax_ekti_clear_log', [ $this, 'ajax_clear_log' ] );
     }
@@ -1837,13 +1844,15 @@ final class EventKoi_Tickets_Importer {
                     update_post_meta( $op['post'], $op['key'], $op['old'] );
                     break;
                 case 'set_terms':
-                    wp_set_object_terms( $op['post'], $op['old_term_ids'], 'event_cal', false );
+                    $term_taxonomy = ! empty( $op['taxonomy'] ) ? $op['taxonomy'] : 'event_cal';
+                    wp_set_object_terms( $op['post'], $op['old_term_ids'], $term_taxonomy, false );
                     break;
                 case 'untrash_post':
                     wp_untrash_post( $op['id'] );
                     break;
                 case 'create_term':
-                    wp_delete_term( $op['term_id'], 'event_cal' );
+                    $term_taxonomy = ! empty( $op['taxonomy'] ) ? $op['taxonomy'] : 'event_cal';
+                    wp_delete_term( $op['term_id'], $term_taxonomy );
                     break;
             }
             $counts[ $op['type'] ] = ( $counts[ $op['type'] ] ?? 0 ) + 1;
@@ -2955,6 +2964,708 @@ final class EventKoi_Tickets_Importer {
     }
 
     /* ------------------------------------------------------------------
+     * TAXONOMY SYNC (LOCATIONS & INSTRUCTORS)
+     *
+     * EventKoi added two new taxonomies: Locations and Instructors.
+     * This engine maps TEC venues -> Locations and TEC organizers ->
+     * Instructors, using the same idempotent, append-only, audited pattern
+     * as Calendar Sync but keeping its own ledgers so the legacy calendar
+     * sync remains independently undoable.
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Resolve a sync type to its registered taxonomy slug.
+     */
+    private function get_taxonomy_for_type( $type ) {
+        if ( 'locations' === $type ) {
+            return EKTI_LOCATION_TAXONOMY;
+        }
+        if ( 'instructors' === $type ) {
+            return EKTI_INSTRUCTOR_TAXONOMY;
+        }
+        return '';
+    }
+
+    /**
+     * All terms for a given taxonomy, sorted by name.
+     */
+    private function get_taxonomy_terms( $taxonomy ) {
+        $terms = get_terms( [ 'taxonomy' => $taxonomy, 'hide_empty' => false ] );
+        if ( is_wp_error( $terms ) ) {
+            return [];
+        }
+        $out = [];
+        foreach ( $terms as $t ) {
+            $out[] = [
+                'term_id' => (int) $t->term_id,
+                'name'    => $t->name,
+                'slug'    => $t->slug,
+                'count'   => (int) $t->count,
+            ];
+        }
+        usort( $out, function ( $a, $b ) {
+            return strcasecmp( $a['name'], $b['name'] );
+        } );
+        return $out;
+    }
+
+    /**
+     * Find a template term in the taxonomy that carries EventKoi display
+     * meta, if any. New terms copy that meta set.
+     */
+    private function get_taxonomy_template_id( $taxonomy ) {
+        global $wpdb;
+        return (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT tm.term_id FROM {$wpdb->termmeta} tm
+                 JOIN {$wpdb->term_taxonomy} tt ON tm.term_id = tt.term_id
+                 WHERE tt.taxonomy = %s AND tm.meta_key = 'display'
+                 ORDER BY tm.term_id ASC LIMIT 1",
+                $taxonomy
+            )
+        );
+    }
+
+    /**
+     * Create a term in the target taxonomy, reusing an existing term when
+     * the normalized name already exists. Audits a create_term op.
+     */
+    private function create_taxonomy_term( $taxonomy, $name, &$ops ) {
+        $name = sanitize_text_field( $name );
+        if ( '' === $name ) {
+            return new WP_Error( 'ekti_empty_term_name', 'Term name is empty.' );
+        }
+        $norm = $this->normalize_location_name( $name );
+        foreach ( $this->get_taxonomy_terms( $taxonomy ) as $term ) {
+            if ( $this->normalize_location_name( $term['name'] ) === $norm ) {
+                return $term['term_id'];
+            }
+        }
+        $created = wp_insert_term( $name, $taxonomy );
+        if ( is_wp_error( $created ) ) {
+            return $created;
+        }
+        $term_id = (int) $created['term_id'];
+        $template_id = $this->get_taxonomy_template_id( $taxonomy );
+        if ( $template_id ) {
+            $meta = get_term_meta( $template_id );
+            foreach ( $meta as $meta_key => $values ) {
+                if ( is_array( $values ) && isset( $values[0] ) ) {
+                    add_term_meta( $term_id, $meta_key, $values[0] );
+                }
+            }
+        }
+        $ops[] = [ 'type' => 'create_term', 'taxonomy' => $taxonomy, 'term_id' => $term_id, 'name' => $name ];
+        $this->log( "Taxonomy sync ({$taxonomy}): created term \"{$name}\" (#{$term_id})." );
+        return $term_id;
+    }
+
+    /**
+     * Auto-match source names to existing terms by exact/containment/fuzzy
+     * name content. Returns suggestions keyed by source key.
+     */
+    private function auto_map_sources_to_terms( $sources, $terms ) {
+        $by_norm = [];
+        foreach ( $terms as $term ) {
+            $nk = $this->normalize_location_name( $term['name'] );
+            if ( '' !== $nk && ! isset( $by_norm[ $nk ] ) ) {
+                $by_norm[ $nk ] = $term;
+            }
+        }
+        $suggestions = [];
+        foreach ( $sources as $key => $source ) {
+            $best = [ 'term_id' => null, 'term_name' => null, 'match_source' => 'none' ];
+            if ( isset( $by_norm[ $key ] ) ) {
+                $best = [
+                    'term_id'      => $by_norm[ $key ]['term_id'],
+                    'term_name'    => $by_norm[ $key ]['name'],
+                    'match_source' => 'exact',
+                ];
+            } else {
+                $contain = null;
+                foreach ( $terms as $term ) {
+                    $norm = $this->normalize_location_name( $term['name'] );
+                    if ( '' === $norm ) {
+                        continue;
+                    }
+                    if ( false !== strpos( $key, $norm ) || false !== strpos( $norm, $key ) ) {
+                        if ( null === $contain
+                            || strlen( $norm ) > strlen( $this->normalize_location_name( $contain['name'] ) ) ) {
+                            $contain = $term;
+                        }
+                    }
+                }
+                if ( $contain ) {
+                    $best = [
+                        'term_id'      => $contain['term_id'],
+                        'term_name'    => $contain['name'],
+                        'match_source' => 'fuzzy',
+                    ];
+                } else {
+                    $fuzzy_best = null;
+                    $fuzzy_pct  = 0;
+                    foreach ( $terms as $term ) {
+                        similar_text( $key, $this->normalize_location_name( $term['name'] ), $pct );
+                        if ( $pct > $fuzzy_pct ) {
+                            $fuzzy_pct  = $pct;
+                            $fuzzy_best = $term;
+                        }
+                    }
+                    if ( $fuzzy_best && $fuzzy_pct >= 85.0 ) {
+                        $best = [
+                            'term_id'      => $fuzzy_best['term_id'],
+                            'term_name'    => $fuzzy_best['name'],
+                            'match_source' => 'fuzzy',
+                        ];
+                    }
+                }
+            }
+            $suggestions[ $key ] = $best;
+        }
+        return $suggestions;
+    }
+
+    /**
+     * Persist / load / sanitize a taxonomy mapping (source key => term_id
+     * or "new:<name>").
+     */
+    private function get_saved_taxonomy_mapping( $type ) {
+        $mapping = get_option( "ekti_taxonomy_mapping_{$type}", [] );
+        return is_array( $mapping ) ? $mapping : [];
+    }
+
+    private function save_taxonomy_mapping( $type, $mapping ) {
+        update_option( "ekti_taxonomy_mapping_{$type}", $mapping, false );
+    }
+
+    private function sanitize_taxonomy_mapping( $mapping ) {
+        $clean = [];
+        if ( ! is_array( $mapping ) ) {
+            return $clean;
+        }
+        foreach ( $mapping as $key => $value ) {
+            $key = sanitize_key( $key );
+            if ( '' === $key || '' === $value || null === $value ) {
+                continue;
+            }
+            if ( is_string( $value ) && 0 === strpos( $value, 'new:' ) ) {
+                $name = sanitize_text_field( substr( $value, 4 ) );
+                if ( '' !== $name ) {
+                    $clean[ $key ] = 'new:' . $name;
+                }
+            } else {
+                $tid = (int) $value;
+                if ( $tid > 0 ) {
+                    $clean[ $key ] = $tid;
+                }
+            }
+        }
+        return $clean;
+    }
+
+    /**
+     * Append ops to a per-type taxonomy sync audit ledger.
+     */
+    private function audit_push_tax_sync( $type, $ops ) {
+        if ( empty( $ops ) ) {
+            return;
+        }
+        $option = "ekti_tax_sync_audit_{$type}";
+        $audit  = get_option( $option, [] );
+        if ( ! is_array( $audit ) ) {
+            $audit = [];
+        }
+        update_option( $option, array_merge( $audit, $ops ), false );
+    }
+
+    /**
+     * Source collector dispatcher.
+     */
+    private function get_tec_taxonomy_sources( $type ) {
+        if ( 'instructors' === $type ) {
+            return $this->get_tec_organizer_sources();
+        }
+        return $this->get_tec_location_sources();
+    }
+
+    private function get_tec_location_sources() {
+        return $this->get_tec_locations();
+    }
+
+    /**
+     * Collect distinct TEC organizers across the saved event mapping.
+     *
+     * Primary source: TEC organizer post title via _EventOrganizerID meta.
+     * Fallback: the organizer value stored by EventKoi's native importer
+     * in a custom field (detected automatically).
+     */
+    private function get_tec_organizer_sources() {
+        $mapping = $this->get_saved_mapping();
+        $sources = [];
+        foreach ( $mapping as $tec_id => $ek_id ) {
+            $tec_id = (int) $tec_id;
+            $ek_id  = (int) $ek_id;
+            if ( ! $ek_id || ! get_post( $ek_id ) ) {
+                continue;
+            }
+            $names = [];
+            $oids  = get_post_meta( $tec_id, '_EventOrganizerID', true );
+            if ( ! is_array( $oids ) ) {
+                $oids = $oids ? [ $oids ] : [];
+            }
+            foreach ( $oids as $oid ) {
+                $oid = (int) $oid;
+                if ( ! $oid ) {
+                    continue;
+                }
+                $org = get_post( $oid );
+                if ( $org && '' !== trim( $org->post_title ) ) {
+                    $name = html_entity_decode( $org->post_title, ENT_QUOTES );
+                    $key  = $this->normalize_location_name( $name );
+                    if ( '' === $key ) {
+                        continue;
+                    }
+                    if ( ! isset( $sources[ $key ] ) ) {
+                        $sources[ $key ] = [ 'name' => $name, 'source_id' => $oid, 'events' => [] ];
+                    }
+                    $sources[ $key ]['events'][ $tec_id ] = $ek_id;
+                }
+            }
+            if ( empty( $names ) ) {
+                $fallback = $this->get_eventkoi_organizer_fallback( $ek_id );
+                if ( $fallback ) {
+                    $name = $fallback;
+                    $key  = $this->normalize_location_name( $name );
+                    if ( '' !== $key ) {
+                        if ( ! isset( $sources[ $key ] ) ) {
+                            $sources[ $key ] = [ 'name' => $name, 'source_id' => 0, 'events' => [] ];
+                        }
+                        $sources[ $key ]['events'][ $tec_id ] = $ek_id;
+                    }
+                }
+            }
+        }
+        ksort( $sources );
+        return $sources;
+    }
+
+    /**
+     * Read the organizer value that EventKoi's native importer stored as a
+     * custom field, if any.
+     */
+    private function get_eventkoi_organizer_fallback( $ek_id ) {
+        $detected = $this->detect_organizer_field();
+        if ( is_wp_error( $detected ) || empty( $detected['meta_key'] ) ) {
+            return '';
+        }
+        $value = get_post_meta( $ek_id, $detected['meta_key'], true );
+        if ( is_array( $value ) && isset( $value['name'] ) ) {
+            $value = $value['name'];
+        }
+        return is_string( $value ) ? trim( $value ) : '';
+    }
+
+    /**
+     * Detect the custom field that holds the imported organizer.
+     * Prefers ACF (field group title/label match) and falls back to a
+     * postmeta scan using known TEC organizer names.
+     */
+    private function detect_organizer_field() {
+        $cache_key = 'ekti_organizer_field_detected';
+        $cached    = wp_cache_get( $cache_key );
+        if ( false !== $cached ) {
+            return $cached;
+        }
+        $result = $this->detect_organizer_field_acf();
+        if ( is_wp_error( $result ) ) {
+            $result = $this->detect_organizer_field_meta();
+        }
+        wp_cache_set( $cache_key, $result );
+        return $result;
+    }
+
+    private function detect_organizer_field_acf() {
+        if ( ! function_exists( 'acf_get_field_groups' ) || ! function_exists( 'acf_get_fields' ) ) {
+            return new WP_Error( 'ekti_no_acf', 'ACF not active.' );
+        }
+        $groups   = acf_get_field_groups( [ 'post_type' => 'eventkoi_event' ] );
+        $best     = null;
+        $best_score = 0;
+        foreach ( $groups as $group ) {
+            $fields = acf_get_fields( $group['key'] );
+            if ( empty( $fields ) || ! is_array( $fields ) ) {
+                continue;
+            }
+            foreach ( $fields as $field ) {
+                $label = strtolower( (string) ( $field['label'] ?? '' ) );
+                $name  = strtolower( (string) ( $field['name'] ?? '' ) );
+                $score = 0;
+                if ( 'organizer' === $label || 'organizer' === $name || 'instructor' === $label || 'instructor' === $name ) {
+                    $score = 100;
+                } elseif ( false !== strpos( $label, 'organizer' ) || false !== strpos( $name, 'organizer' )
+                    || false !== strpos( $label, 'instructor' ) || false !== strpos( $name, 'instructor' ) ) {
+                    $score = 50;
+                }
+                if ( $score > $best_score ) {
+                    $best_score = $score;
+                    $best       = [
+                        'source'      => 'acf',
+                        'meta_key'    => $field['name'],
+                        'field_key'   => $field['key'],
+                        'group_id'    => $group['ID'] ?? 0,
+                        'group_title' => $group['title'] ?? '',
+                    ];
+                }
+            }
+        }
+        if ( $best ) {
+            return $best;
+        }
+        return new WP_Error( 'ekti_no_acf_organizer', 'No ACF organizer field found.' );
+    }
+
+    private function detect_organizer_field_meta() {
+        global $wpdb;
+        $tec_ids = $this->get_tec_event_ids_with_attendees();
+        $names   = [];
+        foreach ( $tec_ids as $tec_id ) {
+            $oids = get_post_meta( (int) $tec_id, '_EventOrganizerID', true );
+            if ( ! is_array( $oids ) ) {
+                $oids = $oids ? [ $oids ] : [];
+            }
+            foreach ( $oids as $oid ) {
+                $oid = (int) $oid;
+                if ( ! $oid ) {
+                    continue;
+                }
+                $org = get_post( $oid );
+                if ( $org && '' !== trim( $org->post_title ) ) {
+                    $names[] = $org->post_title;
+                }
+            }
+        }
+        $names = array_unique( array_filter( $names ) );
+        if ( empty( $names ) ) {
+            return new WP_Error( 'ekti_no_organizer_names', 'No TEC organizer names found to match.' );
+        }
+        $placeholders = implode( ',', array_fill( 0, count( $names ), '%s' ) );
+        $row          = $wpdb->get_row(
+            $wpdb->prepare(
+                "SELECT pm.meta_key, COUNT(DISTINCT pm.post_id) AS event_count
+                 FROM {$wpdb->postmeta} pm
+                 JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+                 WHERE p.post_type = 'eventkoi_event'
+                   AND pm.meta_value IN ({$placeholders})
+                 GROUP BY pm.meta_key
+                 ORDER BY event_count DESC
+                 LIMIT 1",
+                ...$names
+            ),
+            ARRAY_A
+        );
+        if ( empty( $row ) ) {
+            return new WP_Error( 'ekti_no_meta_match', 'No eventkoi_event meta key matches organizer names.' );
+        }
+        return [
+            'source'      => 'meta',
+            'meta_key'    => $row['meta_key'],
+            'field_key'   => '',
+            'group_id'    => 0,
+            'group_title' => '',
+        ];
+    }
+
+    /**
+     * Read-only preview of what the organizer custom field cleanup will do.
+     */
+    private function scan_organizer_field_cleanup() {
+        $detected = $this->detect_organizer_field();
+        if ( is_wp_error( $detected ) ) {
+            return [ 'detected' => false, 'reason' => $detected->get_error_message() ];
+        }
+        global $wpdb;
+        $event_count = (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta}
+                 WHERE meta_key = %s AND meta_value != '' AND meta_value IS NOT NULL",
+                $detected['meta_key']
+            )
+        );
+        return [
+            'detected'    => true,
+            'source'      => $detected['source'],
+            'meta_key'    => $detected['meta_key'],
+            'group_id'    => $detected['group_id'],
+            'group_title' => $detected['group_title'],
+            'event_count' => $event_count,
+        ];
+    }
+
+    /**
+     * Back up then remove the organizer custom field group and its per-event
+     * meta values.
+     */
+    private function remove_organizer_custom_field_group() {
+        $detected = $this->detect_organizer_field();
+        if ( is_wp_error( $detected ) ) {
+            return $detected;
+        }
+        $backup = $this->backup_organizer_field_group( $detected );
+        global $wpdb;
+        $meta_keys = [ $detected['meta_key'] ];
+        // ACF stores a companion field-key reference under the same key
+        // prefixed with an underscore (e.g. "organizer" + "_organizer").
+        if ( 'acf' === $detected['source'] ) {
+            if ( 0 !== strpos( $detected['meta_key'], '_' ) ) {
+                $meta_keys[] = '_' . $detected['meta_key'];
+            } else {
+                $meta_keys[] = substr( $detected['meta_key'], 1 );
+            }
+        }
+        $deleted_meta = 0;
+        foreach ( array_unique( $meta_keys ) as $mk ) {
+            $deleted_meta += $wpdb->delete(
+                $wpdb->postmeta,
+                [ 'meta_key' => $mk ],
+                [ '%s' ]
+            );
+        }
+        if ( 'acf' === $detected['source'] && ! empty( $detected['group_id'] ) ) {
+            $children = get_posts( [
+                'post_type'      => 'acf-field',
+                'post_parent'    => $detected['group_id'],
+                'posts_per_page' => -1,
+                'fields'         => 'ids',
+            ] );
+            foreach ( $children as $child_id ) {
+                wp_delete_post( $child_id, true );
+            }
+            wp_delete_post( $detected['group_id'], true );
+        }
+        update_option( 'ekti_organizer_field_backup', $backup, false );
+        $this->log( "Organizer custom field group removed: {$detected['group_title']} (meta_key: {$detected['meta_key']}, {$deleted_meta} event meta rows deleted)." );
+        return [
+            'removed'      => true,
+            'meta_key'     => $detected['meta_key'],
+            'group_title'  => $detected['group_title'],
+            'deleted_meta' => $deleted_meta,
+            'backup_saved' => true,
+        ];
+    }
+
+    /**
+     * Serialize the field group and field definitions into an option so the
+     * cleanup can be reconstructed manually if anything goes wrong.
+     */
+    private function backup_organizer_field_group( $detected ) {
+        $backup = [
+            'detected'  => $detected,
+            'timestamp' => current_time( 'mysql' ),
+        ];
+        if ( 'acf' === $detected['source']
+            && function_exists( 'acf_get_field_group' )
+            && ! empty( $detected['group_id'] ) ) {
+            $group  = acf_get_field_group( $detected['group_id'] );
+            $fields = function_exists( 'acf_get_fields' ) ? acf_get_fields( $group['key'] ) : [];
+            $backup['acf_group']  = $group;
+            $backup['acf_fields'] = $fields;
+        } elseif ( ! empty( $detected['group_id'] ) ) {
+            $backup['posts'] = [];
+            $group           = get_post( $detected['group_id'] );
+            if ( $group ) {
+                $backup['posts'][] = $group->to_array();
+                $children = get_posts( [
+                    'post_type'      => 'acf-field',
+                    'post_parent'    => $detected['group_id'],
+                    'posts_per_page' => -1,
+                ] );
+                foreach ( $children as $child ) {
+                    $backup['posts'][] = $child->to_array();
+                }
+            }
+        }
+        return $backup;
+    }
+
+    /**
+     * Read-only scan: sources, terms, auto-map suggestions, and pending
+     * assignment counts for a taxonomy sync type.
+     */
+    private function scan_taxonomy_sync( $type ) {
+        $taxonomy = $this->get_taxonomy_for_type( $type );
+        if ( ! $taxonomy ) {
+            return new WP_Error( 'ekti_invalid_type', 'Invalid taxonomy sync type.' );
+        }
+        $sources     = $this->get_tec_taxonomy_sources( $type );
+        $terms       = $this->get_taxonomy_terms( $taxonomy );
+        $suggestions = $this->auto_map_sources_to_terms( $sources, $terms );
+        $saved       = $this->get_saved_taxonomy_mapping( $type );
+        $rows        = [];
+        $counts      = [
+            'sources'           => count( $sources ),
+            'mapped_events'     => 0,
+            'pending'           => 0,
+            'new_terms'         => 0,
+            'unmapped_sources'  => 0,
+        ];
+        foreach ( $sources as $key => $source ) {
+            $sugg = isset( $suggestions[ $key ] ) ? $suggestions[ $key ] : [ 'term_id' => null, 'term_name' => null, 'match_source' => 'none' ];
+            $selected = isset( $saved[ $key ] ) ? $saved[ $key ] : $sugg['term_id'];
+            $is_new   = is_string( $selected ) && 0 === strpos( $selected, 'new:' );
+            $term_id  = $is_new ? 0 : (int) $selected;
+            $pending  = 0;
+            $seen     = [];
+            foreach ( $source['events'] as $ek_id ) {
+                $counts['mapped_events']++;
+                if ( isset( $seen[ $ek_id ] ) ) {
+                    continue;
+                }
+                $seen[ $ek_id ] = true;
+                if ( $is_new ) {
+                    $pending++;
+                    continue;
+                }
+                if ( $term_id <= 0 ) {
+                    continue;
+                }
+                $current = wp_get_object_terms( $ek_id, $taxonomy, [ 'fields' => 'ids' ] );
+                if ( is_wp_error( $current ) || ! in_array( $term_id, array_map( 'intval', $current ), true ) ) {
+                    $pending++;
+                }
+            }
+            if ( $is_new ) {
+                $counts['new_terms']++;
+            } elseif ( $term_id <= 0 ) {
+                $counts['unmapped_sources']++;
+            }
+            $counts['pending'] += $pending;
+            $rows[] = [
+                'key'                 => $key,
+                'name'                => $source['name'],
+                'source_id'           => $source['source_id'],
+                'source'              => $source['source_id']
+                    ? ( 'instructors' === $type ? 'tec_organizer' : 'tec_venue' )
+                    : 'eventkoi_meta',
+                'event_count'         => count( $source['events'] ),
+                'match_source'        => $sugg['match_source'],
+                'suggested_term_id'   => $sugg['term_id'],
+                'suggested_term_name' => $sugg['term_name'],
+                'selected'            => ( '' === $selected || null === $selected ) ? '' : (string) $selected,
+                'pending'             => $pending,
+            ];
+        }
+        return [
+            'sources' => $rows,
+            'terms'   => $terms,
+            'counts'  => $counts,
+        ];
+    }
+
+    /**
+     * Apply a taxonomy mapping: create any "new:" terms, persist the
+     * mapping, then union-append terms to mapped EventKoi events.
+     */
+    private function run_taxonomy_sync( $type, $mapping, $chunk = 100 ) {
+        $taxonomy = $this->get_taxonomy_for_type( $type );
+        if ( ! $taxonomy ) {
+            return [ 'error' => 'Invalid taxonomy sync type.' ];
+        }
+        $ops = [];
+        foreach ( $mapping as $key => $target ) {
+            if ( is_string( $target ) && 0 === strpos( $target, 'new:' ) ) {
+                $term_id = $this->create_taxonomy_term( $taxonomy, substr( $target, 4 ), $ops );
+                if ( is_wp_error( $term_id ) ) {
+                    if ( $ops ) {
+                        $this->audit_push_tax_sync( $type, $ops );
+                    }
+                    return [ 'error' => $term_id->get_error_message() ];
+                }
+                $mapping[ $key ] = $term_id;
+            }
+        }
+        if ( $ops ) {
+            $this->audit_push_tax_sync( $type, $ops );
+        }
+        $this->save_taxonomy_mapping( $type, $mapping );
+        $sources = $this->get_tec_taxonomy_sources( $type );
+        $pending = [];
+        $seen    = [];
+        foreach ( $mapping as $key => $term_id ) {
+            $term_id = (int) $term_id;
+            if ( $term_id <= 0 || ! isset( $sources[ $key ] ) ) {
+                continue;
+            }
+            foreach ( $sources[ $key ]['events'] as $tec_id => $ek_id ) {
+                if ( isset( $seen[ $ek_id . ':' . $term_id ] ) ) {
+                    continue;
+                }
+                $seen[ $ek_id . ':' . $term_id ] = true;
+                $current = wp_get_object_terms( $ek_id, $taxonomy, [ 'fields' => 'ids' ] );
+                if ( is_wp_error( $current ) ) {
+                    continue;
+                }
+                $current = array_map( 'intval', $current );
+                if ( in_array( $term_id, $current, true ) ) {
+                    continue;
+                }
+                $pending[] = [
+                    'tec_id'  => $tec_id,
+                    'ek_id'   => $ek_id,
+                    'term_id' => $term_id,
+                    'current' => $current,
+                ];
+            }
+        }
+        $batch     = array_slice( $pending, 0, $chunk );
+        $results   = [];
+        $applied   = 0;
+        $errors    = 0;
+        $batch_ops = [];
+        foreach ( $batch as $p ) {
+            $set = wp_set_object_terms( $p['ek_id'], [ $p['term_id'] ], $taxonomy, true );
+            if ( is_wp_error( $set ) ) {
+                $errors++;
+                $results[] = [ 'action' => 'error', 'ek_id' => $p['ek_id'], 'reason' => $set->get_error_message() ];
+                continue;
+            }
+            $batch_ops[] = [ 'type' => 'set_terms', 'taxonomy' => $taxonomy, 'post' => $p['ek_id'], 'old_term_ids' => $p['current'] ];
+            $applied++;
+            $results[] = [ 'action' => 'assigned', 'ek_id' => $p['ek_id'], 'tec_id' => $p['tec_id'], 'term_id' => $p['term_id'] ];
+        }
+        if ( $batch_ops ) {
+            $this->audit_push_tax_sync( $type, $batch_ops );
+        }
+        if ( $applied || $errors ) {
+            $this->log( sprintf(
+                'Taxonomy sync (%s): %d assigned, %d errors (%d still pending).',
+                $type, $applied, $errors, count( $pending ) - count( $batch )
+            ) );
+        }
+        return [
+            'processed' => count( $batch ),
+            'applied'   => $applied,
+            'errors'    => $errors,
+            'done'      => count( $pending ) <= count( $batch ),
+            'results'   => $results,
+        ];
+    }
+
+    /**
+     * Undo the last taxonomy sync for a type.
+     */
+    private function undo_taxonomy_sync( $type ) {
+        $option = "ekti_tax_sync_audit_{$type}";
+        $audit  = get_option( $option, [] );
+        if ( empty( $audit ) ) {
+            return [ 'error' => 'Nothing to undo.' ];
+        }
+        $counts = $this->replay_audit_ops( $audit );
+        delete_option( $option );
+        $this->log( "Taxonomy sync ({$type}) undo complete. " . wp_json_encode( $counts ) );
+        return [ 'undone' => $counts ];
+    }
+
+    /* ------------------------------------------------------------------
      * AJAX HANDLERS
      * ------------------------------------------------------------------ */
 
@@ -3212,6 +3923,71 @@ final class EventKoi_Tickets_Importer {
         wp_send_json_success( $result );
     }
 
+    public function ajax_scan_taxonomy_sync() {
+        $this->check_ajax();
+        $type = isset( $_POST['type'] ) ? sanitize_key( $_POST['type'] ) : '';
+        $result = $this->scan_taxonomy_sync( $type );
+        if ( is_wp_error( $result ) ) {
+            wp_send_json_error( $result->get_error_message() );
+        }
+        wp_send_json_success( $result );
+    }
+
+    public function ajax_save_taxonomy_mapping() {
+        $this->check_ajax();
+        $type    = isset( $_POST['type'] ) ? sanitize_key( $_POST['type'] ) : '';
+        $mapping = isset( $_POST['mapping'] ) ? json_decode( stripslashes( $_POST['mapping'] ), true ) : [];
+        $clean   = $this->sanitize_taxonomy_mapping( $mapping );
+        $this->save_taxonomy_mapping( $type, $clean );
+        $this->log( 'Taxonomy mapping saved. ' . count( $clean ) . " {$type} sources mapped." );
+        wp_send_json_success( [ 'saved' => count( $clean ) ] );
+    }
+
+    public function ajax_run_taxonomy_sync() {
+        $this->check_ajax();
+        $type = isset( $_POST['type'] ) ? sanitize_key( $_POST['type'] ) : '';
+        if ( isset( $_POST['mapping'] ) ) {
+            $clean = $this->sanitize_taxonomy_mapping( json_decode( stripslashes( $_POST['mapping'] ), true ) );
+            $this->save_taxonomy_mapping( $type, $clean );
+        } else {
+            $clean = $this->get_saved_taxonomy_mapping( $type );
+        }
+        if ( empty( $clean ) ) {
+            wp_send_json_error( 'No taxonomy mapping saved. Scan and save a mapping first.' );
+        }
+        $result = $this->run_taxonomy_sync( $type, $clean );
+        if ( isset( $result['error'] ) ) {
+            wp_send_json_error( $result['error'] );
+        }
+        wp_send_json_success( $result );
+    }
+
+    public function ajax_undo_taxonomy_sync() {
+        $this->check_ajax();
+        $type   = isset( $_POST['type'] ) ? sanitize_key( $_POST['type'] ) : '';
+        $result = $this->undo_taxonomy_sync( $type );
+        if ( isset( $result['error'] ) ) {
+            wp_send_json_error( $result['error'] );
+        }
+        wp_send_json_success( $result );
+    }
+
+    public function ajax_remove_organizer_fields() {
+        $this->check_ajax();
+        $preview = empty( $_POST['confirm'] ) || 'true' !== $_POST['confirm'];
+        if ( $preview ) {
+            wp_send_json_success( $this->scan_organizer_field_cleanup() );
+        }
+        if ( ! isset( $_POST['confirm'] ) || 'true' !== $_POST['confirm'] ) {
+            wp_send_json_error( 'Confirmation required.' );
+        }
+        $result = $this->remove_organizer_custom_field_group();
+        if ( is_wp_error( $result ) ) {
+            wp_send_json_error( $result->get_error_message() );
+        }
+        wp_send_json_success( $result );
+    }
+
     public function ajax_get_log() {
         $this->check_ajax();
         $lines = 50;
@@ -3358,8 +4134,8 @@ final class EventKoi_Tickets_Importer {
 
             <!-- Calendar Sync Panel -->
             <div class="ekti-panel" id="ekti-calsync-panel">
-                <h2>Calendar Sync (Locations)</h2>
-                <p>Map The Events Calendar locations to EventKoi calendars. The selected calendar is added to each mapped EventKoi event — existing calendars are never removed. All changes are audited and undoable.</p>
+                <h2>Legacy: Calendar Sync (Locations)</h2>
+                <p><strong>Deprecated:</strong> EventKoi now has a dedicated Locations taxonomy. Use the new <strong>Taxonomy Sync</strong> panel below for Locations. This legacy panel remains available only to undo previous calendar assignments.</p>
                 <div class="ekti-actions">
                     <button class="button button-primary" id="ekti-calsync-scan">Scan Locations</button>
                     <button class="button" id="ekti-calsync-save" disabled>Save Mapping</button>
@@ -3381,6 +4157,77 @@ final class EventKoi_Tickets_Importer {
                         </thead>
                         <tbody id="ekti-calsync-tbody"></tbody>
                     </table>
+                </div>
+            </div>
+
+            <!-- Taxonomy Sync Panel -->
+            <div class="ekti-panel" id="ekti-taxonomy-panel">
+                <h2>Taxonomy Sync</h2>
+                <p>Map The Events Calendar locations and organizers to EventKoi's new <strong>Locations</strong> and <strong>Instructors</strong> taxonomies. Existing term assignments are never removed. All changes are audited and undoable.</p>
+
+                <!-- Locations -->
+                <div class="ekti-tax-section" id="ekti-tax-locations-section" style="margin-top:1.5em;">
+                    <h3>Locations</h3>
+                    <p class="description">Map TEC venues to EventKoi Locations taxonomy terms.</p>
+                    <div class="ekti-actions">
+                        <button class="button button-primary" id="ekti-tax-locations-scan">Scan Locations</button>
+                        <button class="button" id="ekti-tax-locations-save" disabled>Save Mapping</button>
+                        <button class="button" id="ekti-tax-locations-run" disabled>Run Location Sync</button>
+                        <button class="button button-secondary" id="ekti-tax-locations-undo" style="color:#a00;">Undo Last Location Sync</button>
+                    </div>
+                    <div id="ekti-tax-locations-status" class="ekti-status"></div>
+                    <div id="ekti-tax-locations-progress-wrap" style="display:none;">
+                        <div class="ekti-progress-bar">
+                            <div class="ekti-progress-fill" id="ekti-tax-locations-progress-fill" style="width:0%"></div>
+                        </div>
+                        <div class="ekti-progress-text" id="ekti-tax-locations-progress-text">0%</div>
+                    </div>
+                    <div id="ekti-tax-locations-table-wrap" style="display:none;">
+                        <h4>TEC Location &rarr; EventKoi Location</h4>
+                        <table class="wp-list-table widefat fixed striped">
+                            <thead>
+                                <tr><th>TEC Source</th><th>Source</th><th>Mapped Events</th><th>Auto-Match</th><th>EventKoi Location</th><th>Pending</th></tr>
+                            </thead>
+                            <tbody id="ekti-tax-locations-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Instructors -->
+                <div class="ekti-tax-section" id="ekti-tax-instructors-section" style="margin-top:2.5em;">
+                    <h3>Instructors</h3>
+                    <p class="description">Map TEC organizers to EventKoi Instructors taxonomy terms.</p>
+                    <div class="ekti-actions">
+                        <button class="button button-primary" id="ekti-tax-instructors-scan">Scan Instructors</button>
+                        <button class="button" id="ekti-tax-instructors-save" disabled>Save Mapping</button>
+                        <button class="button" id="ekti-tax-instructors-run" disabled>Run Instructor Sync</button>
+                        <button class="button button-secondary" id="ekti-tax-instructors-undo" style="color:#a00;">Undo Last Instructor Sync</button>
+                    </div>
+                    <div id="ekti-tax-instructors-status" class="ekti-status"></div>
+                    <div id="ekti-tax-instructors-progress-wrap" style="display:none;">
+                        <div class="ekti-progress-bar">
+                            <div class="ekti-progress-fill" id="ekti-tax-instructors-progress-fill" style="width:0%"></div>
+                        </div>
+                        <div class="ekti-progress-text" id="ekti-tax-instructors-progress-text">0%</div>
+                    </div>
+                    <div id="ekti-tax-instructors-table-wrap" style="display:none;">
+                        <h4>TEC Organizer &rarr; EventKoi Instructor</h4>
+                        <table class="wp-list-table widefat fixed striped">
+                            <thead>
+                                <tr><th>TEC Source</th><th>Source</th><th>Mapped Events</th><th>Auto-Match</th><th>EventKoi Instructor</th><th>Pending</th></tr>
+                            </thead>
+                            <tbody id="ekti-tax-instructors-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div id="ekti-tax-instructors-cleanup" style="margin-top:1.5em; padding-top:1em; border-top:1px solid #c3c4c7;">
+                        <h4>Custom Field Cleanup</h4>
+                        <p class="description">After instructors are synced, remove the native-import Organizer custom field group.</p>
+                        <div class="ekti-actions">
+                            <button class="button" id="ekti-tax-instructors-scan-fields">Scan Organizer Fields</button>
+                            <button class="button button-secondary" id="ekti-tax-instructors-remove-fields" disabled style="color:#a00;">Remove Organizer Custom Fields</button>
+                        </div>
+                        <div id="ekti-tax-instructors-cleanup-status" class="ekti-status"></div>
+                    </div>
                 </div>
             </div>
 

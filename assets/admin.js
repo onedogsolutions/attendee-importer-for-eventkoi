@@ -852,6 +852,261 @@
     }
 
     /* ------------------------------------------------------------------ */
+    /*  TAXONOMY SYNC (LOCATIONS & INSTRUCTORS)                           */
+    /* ------------------------------------------------------------------ */
+
+    var taxSyncRunning = { locations: false, instructors: false };
+    var taxSyncTotals  = { locations: { pending: 0, new_terms: 0 }, instructors: { pending: 0, new_terms: 0 } };
+    var organizerCleanup = { detected: false };
+
+    function collectTaxMapping(type) {
+        var mapping = {};
+        $('.ekti-tax-select[data-tax-type="' + type + '"]').each(function () {
+            var key = $(this).data('source-key');
+            var val = $(this).val();
+            if (val === 'new') {
+                var name = $.trim($('.ekti-tax-new-name[data-tax-type="' + type + '"][data-source-key="' + key + '"]').val());
+                if (name !== '') {
+                    mapping[key] = 'new:' + name;
+                }
+            } else if (val !== '') {
+                mapping[key] = val;
+            }
+        });
+        return mapping;
+    }
+
+    function scanTaxonomySync(type) {
+        appendConsole('Scanning ' + type + '...', 'info');
+        setStatus('#ekti-tax-' + type + '-status', '<span class="ekti-spinner"></span> Scanning...', 'info');
+        ajax('ekti_scan_taxonomy_sync', { type: type }, function (resp) {
+            if (!resp.success) {
+                appendConsole('Scan error (' + type + '): ' + resp.data, 'error');
+                setStatus('#ekti-tax-' + type + '-status', 'Scan failed: ' + escapeHtml(resp.data), 'error');
+                return;
+            }
+            var d = resp.data;
+            var c = d.counts;
+
+            var termOptions = '<option value="">\u2014 None \u2014</option>';
+            $.each(d.terms, function (i, term) {
+                termOptions += '<option value="' + term.term_id + '">' + escapeHtml(term.name) + ' (' + term.count + ')</option>';
+            });
+            termOptions += '<option value="new">\u2795 Create new term\u2026</option>';
+
+            var $tb = $('#ekti-tax-' + type + '-tbody').empty();
+            $.each(d.sources, function (i, src) {
+                var sourceLabel = src.source === 'eventkoi_meta'
+                    ? 'EventKoi meta fallback'
+                    : (src.source === 'tec_organizer' ? 'TEC organizer #' + src.source_id : 'TEC venue #' + src.source_id);
+
+                var badge;
+                if (src.match_source === 'exact') {
+                    badge = '<span style="color:#16a34a;font-size:11px;" title="Exact name match">&#x2713; exact</span>';
+                } else if (src.match_source === 'fuzzy') {
+                    badge = '<span style="color:#d97706;font-size:11px;" title="Similar name match">~ fuzzy: ' + escapeHtml(src.suggested_term_name || '') + '</span>';
+                } else {
+                    badge = '<span style="color:#646970;font-size:11px;">no match</span>';
+                }
+
+                var selected = src.selected;
+                var isNew = selected.indexOf('new:') === 0;
+                var selectHtml = termOptions;
+                if (isNew) {
+                    selectHtml = selectHtml.replace('value="new"', 'value="new" selected');
+                } else if (selected !== '') {
+                    selectHtml = selectHtml.replace(
+                        'value="' + selected + '"',
+                        'value="' + selected + '" selected'
+                    );
+                }
+                var newInput = '<input type="text" class="ekti-tax-new-name" data-tax-type="' + type + '" data-source-key="' + src.key + '" placeholder="New term name" value="' + escapeHtml(isNew ? selected.substring(4) : src.name) + '" style="' + (isNew ? '' : 'display:none;') + 'margin-left:6px;" />';
+
+                $tb.append('<tr>' +
+                    '<td><strong>' + escapeHtml(src.name) + '</strong></td>' +
+                    '<td>' + sourceLabel + '</td>' +
+                    '<td>' + src.event_count + '</td>' +
+                    '<td>' + badge + '</td>' +
+                    '<td><select class="ekti-tax-select" data-tax-type="' + type + '" data-source-key="' + src.key + '">' + selectHtml + '</select>' + newInput + '</td>' +
+                    '<td>' + src.pending + '</td>' +
+                    '</tr>');
+            });
+
+            $('#ekti-tax-' + type + '-table-wrap').toggle(d.sources.length > 0);
+            taxSyncTotals[type] = { pending: c.pending, new_terms: c.new_terms };
+            $('#ekti-tax-' + type + '-save').prop('disabled', taxSyncRunning[type] || d.sources.length === 0);
+            $('#ekti-tax-' + type + '-run').prop('disabled', taxSyncRunning[type] || c.pending === 0);
+
+            setStatus('#ekti-tax-' + type + '-status',
+                'Scan complete: <strong>' + c.sources + '</strong> ' + type + ' sources across ' +
+                '<strong>' + c.mapped_events + '</strong> mapped events; ' +
+                '<strong>' + c.pending + '</strong> term assignments pending' +
+                (c.new_terms > 0 ? ' (<strong>' + c.new_terms + '</strong> new terms to create)' : '') +
+                (c.unmapped_sources > 0 ? '; <strong>' + c.unmapped_sources + '</strong> sources unmapped' : '') + '.',
+                c.pending > 0 ? 'info' : 'success'
+            );
+            appendConsole('Taxonomy scan (' + type + '): ' + c.sources + ' sources, ' + c.pending + ' assignments pending' + (c.new_terms > 0 ? ', ' + c.new_terms + ' terms to create' : '') + '.', 'info');
+        });
+    }
+
+    function saveTaxMapping(type) {
+        var mapping = collectTaxMapping(type);
+        appendConsole('Saving ' + type + ' mapping (' + Object.keys(mapping).length + ' sources)...', 'info');
+        ajax('ekti_save_taxonomy_mapping', { type: type, mapping: JSON.stringify(mapping) }, function (resp) {
+            if (!resp.success) {
+                appendConsole('Error saving ' + type + ' mapping: ' + resp.data, 'error');
+                return;
+            }
+            appendConsole(type + ' mapping saved. ' + resp.data.saved + ' sources.', 'info');
+            setStatus('#ekti-tax-' + type + '-status', type.charAt(0).toUpperCase() + type.slice(1) + ' mapping saved.', 'success');
+        });
+    }
+
+    function updateTaxSyncProgress(type, processed, total) {
+        var pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 100;
+        $('#ekti-tax-' + type + '-progress-fill').css('width', pct + '%');
+        $('#ekti-tax-' + type + '-progress-text').text(pct + '% (' + processed + '/' + total + ')');
+    }
+
+    function loopTaxSync(type, mapping, total) {
+        var processed = 0;
+        var applied   = 0;
+        var errors    = 0;
+        $('#ekti-tax-' + type + '-progress-wrap').show();
+        updateTaxSyncProgress(type, 0, total);
+
+        function step() {
+            ajax('ekti_run_taxonomy_sync', { type: type, mapping: JSON.stringify(mapping) }, function (resp) {
+                if (!resp.success) {
+                    appendConsole(type + ' sync error: ' + resp.data, 'error');
+                    taxSyncRunning[type] = false;
+                    $('#ekti-tax-' + type + '-run').prop('disabled', false);
+                    return;
+                }
+                var d = resp.data;
+                $.each(d.results || [], function (i, r) {
+                    if (r.action === 'assigned') {
+                        appendConsole('\u2713 EventKoi #' + r.ek_id + ' (TEC ' + r.tec_id + ') \u2192 term #' + r.term_id);
+                    } else if (r.action === 'error') {
+                        appendConsole('\u2717 Error EK #' + r.ek_id + ': ' + r.reason, 'error');
+                    }
+                });
+                processed += d.applied;
+                applied += d.applied;
+                errors += (d.errors || 0);
+                updateTaxSyncProgress(type, processed, total);
+
+                if (d.done) {
+                    appendConsole('=== ' + type + ' sync complete: ' + applied + ' assignments' + (errors > 0 ? ', ' + errors + ' errors' : '') + ' ===', 'info');
+                    setStatus('#ekti-tax-' + type + '-status',
+                        'Sync complete: <strong>' + applied + '</strong> term assignments applied' +
+                        (errors > 0 ? ', <strong>' + errors + '</strong> errors' : '') + '.',
+                        errors > 0 ? 'warning' : 'success'
+                    );
+                    taxSyncRunning[type] = false;
+                    updateTaxSyncProgress(type, total, total);
+                    scanTaxonomySync(type);
+                } else if (d.applied === 0) {
+                    appendConsole(type + ' sync stopped: no progress made with ' + (total - processed) + ' items still pending.', 'error');
+                    taxSyncRunning[type] = false;
+                    $('#ekti-tax-' + type + '-run').prop('disabled', false);
+                } else {
+                    setTimeout(step, 200);
+                }
+            });
+        }
+        step();
+    }
+
+    function runTaxSync(type) {
+        if (taxSyncRunning[type]) return;
+        var mapping = collectTaxMapping(type);
+        if (Object.keys(mapping).length === 0) {
+            setStatus('#ekti-tax-' + type + '-status', 'No ' + type + ' mapped. Choose an EventKoi term for at least one source.', 'warning');
+            return;
+        }
+        if (!confirm('Apply ' + taxSyncTotals[type].pending + ' ' + type + ' term assignments' +
+            (taxSyncTotals[type].new_terms > 0 ? ' (creating ' + taxSyncTotals[type].new_terms + ' new term(s))' : '') +
+            '? Existing terms are never removed. Changes are audited and can be undone.')) {
+            return;
+        }
+        taxSyncRunning[type] = true;
+        $('#ekti-tax-' + type + '-run').prop('disabled', true);
+        appendConsole('=== Starting ' + type + ' Sync ===', 'info');
+        loopTaxSync(type, mapping, taxSyncTotals[type].pending);
+    }
+
+    function undoTaxSync(type) {
+        if (!confirm('Undo the last ' + type + ' sync (restores previous term assignments and deletes any terms created by the sync)?')) {
+            return;
+        }
+        appendConsole('=== Undoing Last ' + type + ' Sync ===', 'warn');
+        ajax('ekti_undo_taxonomy_sync', { type: type }, function (resp) {
+            if (!resp.success) {
+                appendConsole('Undo error (' + type + '): ' + resp.data, 'error');
+                return;
+            }
+            var counts = resp.data.undone || {};
+            $.each(counts, function (k, n) {
+                appendConsole('  ' + k + ': ' + n, 'warn');
+            });
+            appendConsole('Undo complete.', 'warn');
+            scanTaxonomySync(type);
+        });
+    }
+
+    function scanOrganizerFields() {
+        appendConsole('Scanning organizer custom fields...', 'info');
+        setStatus('#ekti-tax-instructors-cleanup-status', '<span class="ekti-spinner"></span> Scanning...', 'info');
+        ajax('ekti_remove_organizer_fields', {}, function (resp) {
+            if (!resp.success) {
+                appendConsole('Organizer field scan error: ' + resp.data, 'error');
+                setStatus('#ekti-tax-instructors-cleanup-status', 'Scan failed: ' + escapeHtml(resp.data), 'error');
+                organizerCleanup.detected = false;
+                $('#ekti-tax-instructors-remove-fields').prop('disabled', true);
+                return;
+            }
+            var d = resp.data;
+            if (!d.detected) {
+                setStatus('#ekti-tax-instructors-cleanup-status', 'No organizer custom field group detected: ' + escapeHtml(d.reason), 'warning');
+                organizerCleanup.detected = false;
+                $('#ekti-tax-instructors-remove-fields').prop('disabled', true);
+                return;
+            }
+            organizerCleanup.detected = true;
+            $('#ekti-tax-instructors-remove-fields').prop('disabled', false);
+            setStatus('#ekti-tax-instructors-cleanup-status',
+                'Detected <strong>' + escapeHtml(d.group_title || 'organizer field') + '</strong> (meta_key: ' + escapeHtml(d.meta_key) + ', ' +
+                d.event_count + ' events with data). Backup will be saved before removal.',
+                'info'
+            );
+        });
+    }
+
+    function removeOrganizerFields() {
+        if (!organizerCleanup.detected) return;
+        if (!confirm('This will permanently delete the Organizer custom field group and all per-event Organizer meta values. A backup is saved to the ekti_organizer_field_backup option. Continue?')) {
+            return;
+        }
+        appendConsole('=== Removing Organizer Custom Fields ===', 'warn');
+        ajax('ekti_remove_organizer_fields', { confirm: 'true' }, function (resp) {
+            if (!resp.success) {
+                appendConsole('Remove organizer fields error: ' + resp.data, 'error');
+                setStatus('#ekti-tax-instructors-cleanup-status', 'Removal failed: ' + escapeHtml(resp.data), 'error');
+                return;
+            }
+            var d = resp.data;
+            appendConsole('Removed organizer field group: ' + d.group_title + ' (meta_key: ' + d.meta_key + ', ' + d.deleted_meta + ' meta rows deleted).', 'warn');
+            setStatus('#ekti-tax-instructors-cleanup-status',
+                'Removed <strong>' + escapeHtml(d.group_title) + '</strong>. ' + d.deleted_meta + ' event meta rows deleted. Backup saved.',
+                'success'
+            );
+            $('#ekti-tax-instructors-remove-fields').prop('disabled', true);
+            organizerCleanup.detected = false;
+        });
+    }
+
+    /* ------------------------------------------------------------------ */
     /*  INIT                                                              */
     /* ------------------------------------------------------------------ */
 
@@ -878,10 +1133,26 @@
         $('#ekti-calsync-save').on('click', saveCalMapping);
         $('#ekti-calsync-run').on('click', runCalSync);
         $('#ekti-calsync-undo').on('click', undoCalSync);
+        $('#ekti-tax-locations-scan').on('click', function () { scanTaxonomySync('locations'); });
+        $('#ekti-tax-locations-save').on('click', function () { saveTaxMapping('locations'); });
+        $('#ekti-tax-locations-run').on('click', function () { runTaxSync('locations'); });
+        $('#ekti-tax-locations-undo').on('click', function () { undoTaxSync('locations'); });
+        $('#ekti-tax-instructors-scan').on('click', function () { scanTaxonomySync('instructors'); });
+        $('#ekti-tax-instructors-save').on('click', function () { saveTaxMapping('instructors'); });
+        $('#ekti-tax-instructors-run').on('click', function () { runTaxSync('instructors'); });
+        $('#ekti-tax-instructors-undo').on('click', function () { undoTaxSync('instructors'); });
+        $('#ekti-tax-instructors-scan-fields').on('click', scanOrganizerFields);
+        $('#ekti-tax-instructors-remove-fields').on('click', removeOrganizerFields);
         // Show/hide the create-new-calendar name input.
         $(document).on('change', '.ekti-cal-select', function () {
             var key = $(this).data('loc-key');
             $('.ekti-cal-new-name[data-loc-key="' + key + '"]').toggle($(this).val() === 'new');
+        });
+        // Show/hide the create-new-taxonomy-term name input.
+        $(document).on('change', '.ekti-tax-select', function () {
+            var type = $(this).data('tax-type');
+            var key  = $(this).data('source-key');
+            $('.ekti-tax-new-name[data-tax-type="' + type + '"][data-source-key="' + key + '"]').toggle($(this).val() === 'new');
         });
         $('#ekti-load-log').on('click', loadLog);
         $('#ekti-clear-log').on('click', clearLog);

@@ -7,9 +7,9 @@ condensed version of each build step so progress and plan travel together in one
 top-level document.
 
 - **Branch:** `main`
-- **Plugin version:** 1.4.2
-- **Last updated:** 2026-08-29
-- **Overall status:** ✅ **Live import executed on dev and fully verified**
+- **Plugin version:** 1.5.0
+- **Last updated:** 2026-08-31
+- **Overall status:** ✅ **v1.5.0 taxonomy sync (Locations + Instructors) and organizer custom field cleanup deployed and verified on ott-dev**
   (v1.4.2): 2421 ticket_orders / 1674 parent orders + charges / 419
   tickets created, 856 orphan attendees correctly skipped, 0 errors;
   per-event counts match the TEC source and the
@@ -59,16 +59,21 @@ top-level document.
 | 7 | Ticket Details Sync (sale windows, capacity, multi-product reconciliation) | ✅ Done | eb57243 |
 | 8 | Calendar Sync (TEC locations → EventKoi calendars mapper) | ✅ Done | bfed7b7 |
 | 9 | Orphan skip (v1.4.0) + attendee idempotency (v1.4.1) + WC meta fix (v1.4.2) + live import on dev | ✅ Done | — |
+| 10 | Taxonomy Sync — Locations (TEC venues → EventKoi `locations` taxonomy) | ✅ Done | — |
+| 11 | Taxonomy Sync — Instructors (TEC organizers → EventKoi `instructors` taxonomy) | ✅ Done | — |
+| 12 | Organizer custom field cleanup (backup + remove native-import Organizer field group) | ✅ Done | — |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
 
-**Live import executed + verified on dev (2026-08-29, v1.4.2).** The
-import ran via `novamira/execute-php` with a lock-protected,
-time-budgeted batch runner (20 s budget per call, well under the 30 s
-MCP timeout; offset advances per batch and the v1.4.1 flag makes any
-overlap safe).
+**v1.5.0 complete and verified on ott-dev.** Plugin zip deployed (v1.5.0),
+Locations and Instructors taxonomy syncs applied, and the native-import
+organizer custom field (`organizer_name`) backed up and removed. Sample
+EventKoi events now carry `locations` and `instructors` terms; the
+"Imported Fields" organizer meta is gone. Remaining before wider release:
+update readme/changelog, consider an uninstall cleanup routine, and run
+prod cutover checklist.
 
 - **Verification results:** all 2421 order_ids distinct, 0 rows outside
   the mapping, 0 null ticket_ids, 0 orphan tickets, all `quantity_sold`
@@ -702,6 +707,19 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
   ops. Note: the cleanup call hit the 30 s MCP timeout but completed
   server-side; the resumable design (skip already-trashed + ledger
   repair) verified a clean 333/333 outcome.
+
+- 2026-08-31: **v1.5.0 taxonomy sync + organizer field cleanup (dev).**
+  Deployed `eventkoi-tickets-importer` v1.5.0 to ott-dev. The TEC→EventKoi
+  event mapping option (`ekti_event_mapping`) was rebuilt from
+  `_tec_import_source_id` meta (660 mapped events). Locations sync mapped
+  3 sources (Austin, San Antonio – Central, The Bake Lab) to existing
+  `locations` taxonomy terms; 658 term assignments applied, 0 errors.
+  Instructors sync created 28 new `instructors` terms from TEC organizers
+  and applied 633 assignments, 0 errors. The native-import organizer
+  meta key (`organizer_name`) was detected via postmeta scan, backed up
+  to `ekti_organizer_field_backup`, and 605 event meta rows deleted.
+  Spot-check: sample EventKoi event carries both `locations` and
+  `instructors` terms and no longer has `organizer_name` meta.
 
 - **No REST API:** the plugin uses `admin-ajax.php` rather than WP REST. This
   is deliberate for a migration tool — all operations are admin-initiated,
