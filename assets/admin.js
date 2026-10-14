@@ -856,7 +856,10 @@
     /* ------------------------------------------------------------------ */
 
     var taxSyncRunning = { locations: false, instructors: false };
-    var taxSyncTotals  = { locations: { pending: 0, new_terms: 0 }, instructors: { pending: 0, new_terms: 0 } };
+    var taxSyncTotals  = {
+        locations:   { pending: 0, new_terms: 0, field_updates: 0, field_conflicts: 0 },
+        instructors: { pending: 0, new_terms: 0 }
+    };
     var organizerCleanup = { detected: false };
 
     function collectTaxMapping(type) {
@@ -876,6 +879,38 @@
         return mapping;
     }
 
+    /* Address Data cell for the locations table (Saved Locations). */
+    function locationFieldsCell(src, savedLocations) {
+        var dim = 'style="color:#646970;font-size:11px;"';
+        if (!savedLocations || !savedLocations.active) {
+            return '<span ' + dim + '>&mdash;</span>';
+        }
+        if (!src.source_id) {
+            return '<span ' + dim + '>no TEC venue</span>';
+        }
+        if (!src.fields) {
+            return '<span ' + dim + '>no target term</span>';
+        }
+        var f = src.fields;
+        if (!f.pending && !f.conflicts) {
+            return '<span style="color:#16a34a;font-size:11px;" title="All mapped address fields match the TEC venue">&#x2713; complete</span>';
+        }
+        var tip = [];
+        $.each(f.slots, function (i, s) {
+            tip.push(s.label + ': "' + (s.current === '' ? '(empty)' : s.current) + '" \u2192 "' + s.proposed + '"');
+        });
+        var parts = [];
+        if (f.pending > 0) {
+            parts.push(f.pending + ' field' + (f.pending > 1 ? 's' : '') + ' to fill');
+        }
+        if (f.conflicts > 0) {
+            parts.push(f.conflicts + ' conflict' + (f.conflicts > 1 ? 's' : '') + ' \u2014 review');
+        }
+        var color = f.conflicts > 0 ? '#d97706' : '#2271b1';
+        return '<span style="color:' + color + ';font-size:11px;" title="' + escapeHtml(tip.join('\n')) + '">' +
+            (f.is_new ? '(new term) ' : '') + escapeHtml(parts.join('; ')) + '</span>';
+    }
+
     function scanTaxonomySync(type) {
         appendConsole('Scanning ' + type + '...', 'info');
         setStatus('#ekti-tax-' + type + '-status', '<span class="ekti-spinner"></span> Scanning...', 'info');
@@ -893,6 +928,30 @@
                 termOptions += '<option value="' + term.term_id + '">' + escapeHtml(term.name) + ' (' + term.count + ')</option>';
             });
             termOptions += '<option value="new">\u2795 Create new term\u2026</option>';
+
+            // Saved Locations designation status (locations only).
+            if (type === 'locations') {
+                var $desig = $('#ekti-tax-locations-designation');
+                var sl = d.saved_locations;
+                if (sl && sl.active && Object.keys(sl.slots || {}).length > 0) {
+                    $desig.show().html(
+                        '<div class="notice notice-success" style="margin:0.5em 0;"><p>' +
+                        'Saved Locations active on taxonomy <strong>"' + escapeHtml(sl.taxonomy) + '"</strong> (' +
+                        Object.keys(sl.slots).length + ' address slot(s) mapped). TEC venue addresses are copied onto terms during the sync.' +
+                        '</p></div>'
+                    );
+                } else if (sl) {
+                    $desig.show().html(
+                        '<div class="notice notice-warning" style="margin:0.5em 0;"><p>' + escapeHtml(sl.warning) + '</p></div>'
+                    );
+                } else {
+                    $desig.hide();
+                }
+                if (sl && sl.legacy_meta_events > 0) {
+                    $desig.append('<p style="color:#646970;font-size:11px;margin:0.25em 0;">' +
+                        sl.legacy_meta_events + ' event(s) still carry legacy built-in location meta. EventKoi keeps it as a manual-mode fallback; term address data takes precedence. No cleanup is performed.</p>');
+                }
+            }
 
             var $tb = $('#ekti-tax-' + type + '-tbody').empty();
             $.each(d.sources, function (i, src) {
@@ -928,24 +987,47 @@
                     '<td>' + src.event_count + '</td>' +
                     '<td>' + badge + '</td>' +
                     '<td><select class="ekti-tax-select" data-tax-type="' + type + '" data-source-key="' + src.key + '">' + selectHtml + '</select>' + newInput + '</td>' +
+                    (type === 'locations' ? '<td>' + locationFieldsCell(src, d.saved_locations) + '</td>' : '') +
                     '<td>' + src.pending + '</td>' +
                     '</tr>');
             });
 
             $('#ekti-tax-' + type + '-table-wrap').toggle(d.sources.length > 0);
-            taxSyncTotals[type] = { pending: c.pending, new_terms: c.new_terms };
+            taxSyncTotals[type] = {
+                pending: c.pending,
+                new_terms: c.new_terms,
+                field_updates: c.field_updates || 0,
+                field_conflicts: c.field_conflicts || 0
+            };
+            var canRun = c.pending > 0 || (c.field_updates || 0) > 0;
+            if (type === 'locations' && $('#ekti-tax-locations-overwrite').prop('checked')) {
+                canRun = canRun || (c.field_conflicts || 0) > 0;
+            }
             $('#ekti-tax-' + type + '-save').prop('disabled', taxSyncRunning[type] || d.sources.length === 0);
-            $('#ekti-tax-' + type + '-run').prop('disabled', taxSyncRunning[type] || c.pending === 0);
+            $('#ekti-tax-' + type + '-run').prop('disabled', taxSyncRunning[type] || !canRun);
+
+            var fieldInfo = '';
+            if (type === 'locations' && d.saved_locations && d.saved_locations.active) {
+                if ((c.field_updates || 0) > 0) {
+                    fieldInfo += '; <strong>' + c.field_updates + '</strong> empty address field(s) to fill';
+                }
+                if ((c.field_conflicts || 0) > 0) {
+                    fieldInfo += '; <strong>' + c.field_conflicts + '</strong> address conflict(s) \u2014 review-only unless overwrite is checked';
+                }
+            }
 
             setStatus('#ekti-tax-' + type + '-status',
                 'Scan complete: <strong>' + c.sources + '</strong> ' + type + ' sources across ' +
                 '<strong>' + c.mapped_events + '</strong> mapped events; ' +
                 '<strong>' + c.pending + '</strong> term assignments pending' +
                 (c.new_terms > 0 ? ' (<strong>' + c.new_terms + '</strong> new terms to create)' : '') +
-                (c.unmapped_sources > 0 ? '; <strong>' + c.unmapped_sources + '</strong> sources unmapped' : '') + '.',
-                c.pending > 0 ? 'info' : 'success'
+                (c.unmapped_sources > 0 ? '; <strong>' + c.unmapped_sources + '</strong> sources unmapped' : '') +
+                fieldInfo + '.',
+                (c.pending > 0 || (c.field_updates || 0) > 0) ? 'info' : 'success'
             );
-            appendConsole('Taxonomy scan (' + type + '): ' + c.sources + ' sources, ' + c.pending + ' assignments pending' + (c.new_terms > 0 ? ', ' + c.new_terms + ' terms to create' : '') + '.', 'info');
+            appendConsole('Taxonomy scan (' + type + '): ' + c.sources + ' sources, ' + c.pending + ' assignments pending' + (c.new_terms > 0 ? ', ' + c.new_terms + ' terms to create' : '') +
+                (type === 'locations' && (c.field_updates || 0) > 0 ? ', ' + c.field_updates + ' address field(s) to fill' : '') +
+                (type === 'locations' && (c.field_conflicts || 0) > 0 ? ', ' + c.field_conflicts + ' conflict(s)' : '') + '.', 'info');
         });
     }
 
@@ -968,15 +1050,22 @@
         $('#ekti-tax-' + type + '-progress-text').text(pct + '% (' + processed + '/' + total + ')');
     }
 
-    function loopTaxSync(type, mapping, total) {
+    function loopTaxSync(type, mapping, total, extra) {
         var processed = 0;
         var applied   = 0;
         var errors    = 0;
+        var fieldsWritten = 0;
+        var firstStep = true;
         $('#ekti-tax-' + type + '-progress-wrap').show();
         updateTaxSyncProgress(type, 0, total);
 
         function step() {
-            ajax('ekti_run_taxonomy_sync', { type: type, mapping: JSON.stringify(mapping) }, function (resp) {
+            var data = { type: type, mapping: JSON.stringify(mapping) };
+            if (firstStep && extra) {
+                $.extend(data, extra);
+            }
+            firstStep = false;
+            ajax('ekti_run_taxonomy_sync', data, function (resp) {
                 if (!resp.success) {
                     appendConsole(type + ' sync error: ' + resp.data, 'error');
                     taxSyncRunning[type] = false;
@@ -987,6 +1076,8 @@
                 $.each(d.results || [], function (i, r) {
                     if (r.action === 'assigned') {
                         appendConsole('\u2713 EventKoi #' + r.ek_id + ' (TEC ' + r.tec_id + ') \u2192 term #' + r.term_id);
+                    } else if (r.action === 'fields') {
+                        appendConsole('\u2192 term #' + r.term_id + ': wrote ' + r.written + ' address field(s)');
                     } else if (r.action === 'error') {
                         appendConsole('\u2717 Error EK #' + r.ek_id + ': ' + r.reason, 'error');
                     }
@@ -994,12 +1085,16 @@
                 processed += d.applied;
                 applied += d.applied;
                 errors += (d.errors || 0);
+                fieldsWritten += (d.fields_written || 0);
                 updateTaxSyncProgress(type, processed, total);
 
                 if (d.done) {
-                    appendConsole('=== ' + type + ' sync complete: ' + applied + ' assignments' + (errors > 0 ? ', ' + errors + ' errors' : '') + ' ===', 'info');
+                    appendConsole('=== ' + type + ' sync complete: ' + applied + ' assignments' +
+                        (fieldsWritten > 0 ? ', ' + fieldsWritten + ' address field writes' : '') +
+                        (errors > 0 ? ', ' + errors + ' errors' : '') + ' ===', 'info');
                     setStatus('#ekti-tax-' + type + '-status',
                         'Sync complete: <strong>' + applied + '</strong> term assignments applied' +
+                        (fieldsWritten > 0 ? ', <strong>' + fieldsWritten + '</strong> address field writes' : '') +
                         (errors > 0 ? ', <strong>' + errors + '</strong> errors' : '') + '.',
                         errors > 0 ? 'warning' : 'success'
                     );
@@ -1025,15 +1120,35 @@
             setStatus('#ekti-tax-' + type + '-status', 'No ' + type + ' mapped. Choose an EventKoi term for at least one source.', 'warning');
             return;
         }
-        if (!confirm('Apply ' + taxSyncTotals[type].pending + ' ' + type + ' term assignments' +
-            (taxSyncTotals[type].new_terms > 0 ? ' (creating ' + taxSyncTotals[type].new_terms + ' new term(s))' : '') +
-            '? Existing terms are never removed. Changes are audited and can be undone.')) {
+        var totals = taxSyncTotals[type];
+        var msg;
+        var extra = null;
+        if (type === 'locations') {
+            var overwrite = $('#ekti-tax-locations-overwrite').prop('checked');
+            extra = { overwrite: overwrite ? 'true' : 'false', sync_fields: 'true' };
+            msg = 'Apply ' + totals.pending + ' location term assignment(s)' +
+                (totals.new_terms > 0 ? ' (creating ' + totals.new_terms + ' new term(s) populated with TEC address data)' : '');
+            if (totals.field_updates > 0) {
+                msg += ' and fill ' + totals.field_updates + ' empty term address field(s)';
+            }
+            if (overwrite && totals.field_conflicts > 0) {
+                msg += ' and overwrite ' + totals.field_conflicts + ' conflicting address field(s)';
+            }
+            msg += '? Empty address fields on mapped terms are filled from the TEC venue' +
+                (overwrite ? '; non-empty fields are overwritten with TEC data' : '; non-empty fields are left alone (review conflicts in the table)') +
+                '. Existing terms are never removed. Changes are audited and can be undone.';
+        } else {
+            msg = 'Apply ' + totals.pending + ' ' + type + ' term assignments' +
+                (totals.new_terms > 0 ? ' (creating ' + totals.new_terms + ' new term(s))' : '') +
+                '? Existing terms are never removed. Changes are audited and can be undone.';
+        }
+        if (!confirm(msg)) {
             return;
         }
         taxSyncRunning[type] = true;
         $('#ekti-tax-' + type + '-run').prop('disabled', true);
         appendConsole('=== Starting ' + type + ' Sync ===', 'info');
-        loopTaxSync(type, mapping, taxSyncTotals[type].pending);
+        loopTaxSync(type, mapping, totals.pending, extra);
     }
 
     function undoTaxSync(type) {
@@ -1137,6 +1252,15 @@
         $('#ekti-tax-locations-save').on('click', function () { saveTaxMapping('locations'); });
         $('#ekti-tax-locations-run').on('click', function () { runTaxSync('locations'); });
         $('#ekti-tax-locations-undo').on('click', function () { undoTaxSync('locations'); });
+        // Toggling overwrite re-evaluates whether a location sync can run
+        // (conflicts are only writable with overwrite checked).
+        $('#ekti-tax-locations-overwrite').on('change', function () {
+            if (taxSyncRunning.locations) return;
+            var t = taxSyncTotals.locations;
+            var canRun = t.pending > 0 || t.field_updates > 0 ||
+                ($(this).prop('checked') && t.field_conflicts > 0);
+            $('#ekti-tax-locations-run').prop('disabled', !canRun);
+        });
         $('#ekti-tax-instructors-scan').on('click', function () { scanTaxonomySync('instructors'); });
         $('#ekti-tax-instructors-save').on('click', function () { saveTaxMapping('instructors'); });
         $('#ekti-tax-instructors-run').on('click', function () { runTaxSync('instructors'); });

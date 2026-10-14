@@ -7,18 +7,18 @@ condensed version of each build step so progress and plan travel together in one
 top-level document.
 
 - **Branch:** `main`
-- **Plugin version:** 1.5.0
-- **Last updated:** 2026-08-31
-- **Overall status:** ✅ **v1.5.0 taxonomy sync (Locations + Instructors) and organizer custom field cleanup deployed and verified on ott-dev**
-  (v1.4.2): 2421 ticket_orders / 1674 parent orders + charges / 419
-  tickets created, 856 orphan attendees correctly skipped, 0 errors;
-  per-event counts match the TEC source and the
-  `ekti_pre_import_inventory` snapshot with zero drift. A second full
-  run proved idempotency (0 creates, 3277 skips, row counts unchanged).
-  Includes v1.4.0 orphan skip, v1.4.1 attendee-level idempotency, and
-  v1.4.2 WC order-meta ticket_id fix + post-import meta reconciliation.
-  Native-importer clone cleanup applied: 333 duplicate events trashed
-  (reversible), zero published duplicate sources remain.
+- **Plugin version:** 1.6.0
+- **Last updated:** 2026-10-14
+- **Overall status:** ✅ **v1.6.0 Saved Locations term field sync deployed and fully QA'd
+  on ott-dev (EventKoi v1.4.6.1).** TEC venue addresses now copy onto
+  Saved Locations term fields (`eventkoi_field_*` term meta) during the
+  Locations sync — fill-empty by default, overwrite opt-in, every write
+  audited as a `set_termmeta` op and undoable. Scan surfaces the
+  designation state, per-term address status (fields to fill / conflicts
+  to review), and a report-only legacy-meta count. Create-with-fields,
+  fill-empty idempotency, overwrite, and both undo branches (delete +
+  restore) verified live; dev left byte-identical to its pre-QA synced
+  state.
 
 ## Shared project facts (true for every step)
 
@@ -62,16 +62,21 @@ top-level document.
 | 10 | Taxonomy Sync — Locations (TEC venues → EventKoi `locations` taxonomy) | ✅ Done | — |
 | 11 | Taxonomy Sync — Instructors (TEC organizers → EventKoi `instructors` taxonomy) | ✅ Done | — |
 | 12 | Organizer custom field cleanup (backup + remove native-import Organizer field group) | ✅ Done | — |
+| 13 | Saved Locations term field sync (TEC venue addresses → builder term fields, overwrite + undo) | ✅ Done | — |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
 
-**v1.5.0 complete and verified on ott-dev.** Plugin zip deployed (v1.5.0),
-Locations and Instructors taxonomy syncs applied, and the native-import
-organizer custom field (`organizer_name`) backed up and removed. Sample
-EventKoi events now carry `locations` and `instructors` terms; the
-"Imported Fields" organizer meta is gone. Remaining before wider release:
+**v1.6.0 complete and verified on ott-dev.** Saved Locations term field
+sync shipped: TEC venue addresses copy onto `locations` term builder
+fields during the Locations sync (fill-empty default, overwrite opt-in),
+with designation detection, conflict surfacing, audited `set_termmeta`
+writes, and full undo. QA on ott-dev (2026-10-14) verified scan,
+create-with-fields, fill-empty idempotency, overwrite, and both undo
+branches; dev left byte-identical to its pre-QA synced state (658
+assignments, manually-curated term data intact, importer deactivated to
+match pre-test state). Remaining before wider release:
 update readme/changelog, consider an uninstall cleanup routine, and run
 prod cutover checklist.
 
@@ -83,11 +88,14 @@ prod cutover checklist.
   snapshot (45355, 45306, 47077, 49647, 49187) are the restored-from-
   trash events carrying 22 attendees — reconciling 2399 + 22 + 856
   orphans = 3277 total.
-- **Dev server state:** EventKoi v1.3.32.0, importer v1.4.2 active;
-  `ekti_event_mapping` 419 entries; `trash-past-events` 24 months;
-  333 native-importer clone events trashed (2026-08-29, reversible
-  ledger `ekti_event_dedupe_audit`) — event counts now 647 published /
-  23 draft / 333 trash; zero published duplicate sources remain.
+- **Dev server state:** EventKoi v1.4.6.1, importer v1.6.0 installed
+  but INACTIVE (pre-test state restored after QA); `ekti_event_mapping`
+  419 entries; `trash-past-events` 24 months; 333 native-importer clone
+  events trashed (2026-08-29, reversible ledger `ekti_event_dedupe_audit`)
+  — zero published duplicate sources remain. Saved Locations designation
+  active on the `locations` builder taxonomy (8/8 slots mapped); 658
+  events carry location terms; 3 terms carry manually-curated address
+  data with 11 review-only TEC divergences.
 - **5 of 419 mapping targets are DRAFT events** (Buche De Noel, Kids
   Class: Holiday Poptarts, Family Day Daddy Daughter Valentines, 2× Pan
   Dulce Workshop Series II) — the EventKoi counterparts of the 5
@@ -508,6 +516,69 @@ undo deleted the term and restored every event (0 leftover
 relationships). QA calendar removed; production sync re-applied — dev
 left in the synced state.
 
+### Step 13 — Saved Locations term field sync (v1.6.0) ✅
+
+EventKoi v1.4.6 shipped the Taxonomy Builder + Saved Locations
+designation: `locations` is a builder taxonomy whose term fields
+(`eventkoi_field_*` term meta) map to address slots via
+`eventkoi_location_taxonomy_map`, and `Event::get_locations()` resolves
+an event's address from its assigned term (mode `taxonomy` by default;
+legacy `location` post meta kept as manual-mode fallback). The importer
+now copies TEC venue addresses onto those term fields:
+
+- **Detection (option reads only, no EventKoi class dependency):**
+  `get_location_taxonomy_slug()` follows the `eventkoi_location_taxonomy`
+  designation (validated against `eventkoi_event`) with a stock
+  `locations` fallback; `get_saved_location_field_map()` returns the
+  slot→field map + field definitions; `get_venue_address_data()` builds
+  the slot-keyed venue payload (state via `_VenueStateProvince` →
+  `_VenueState`); `split_venue_address()` puts a trailing unit segment
+  ("Ste 203", "#102", …) on address line 2.
+- **Writer:** `sync_location_term_fields()` — fill-empty by default
+  (empty TEC values never write or clear), overwrite as an explicit
+  checkbox; every write audited as a `set_termmeta` op (`old` = prior
+  value or null). `create_taxonomy_term()` populates a new term's
+  fields from its venue and no longer copies `eventkoi_field_*` meta
+  from the template term (a new location must not inherit another
+  location's address).
+- **Scan:** `saved_locations` block (designation state + setup warning,
+  slot map, field defs), per-source address analysis (pending fills +
+  conflicts with current→proposed per slot), counts
+  `field_updates`/`field_conflicts`, and a report-only count of events
+  still carrying legacy `location` meta (no cleanup by design —
+  EventKoi keeps it as manual-mode fallback and term rows win).
+- **Run:** `run_taxonomy_sync(…, $overwrite, $sync_fields)` applies the
+  field sync once per mapped term on the first chunk (JS stops sending
+  `sync_fields` afterwards, so overwrite never logs duplicate ops);
+  created terms get their fields at creation time and those writes are
+  surfaced in the results/console (`→ term #X: wrote N address
+  field(s)`).
+- **Undo:** `replay_audit_ops()` gained the `set_termmeta` case —
+  `old === null` deletes the meta, otherwise restores the exact prior
+  value; reverse replay order restores fields before `create_term`
+  deletes the term.
+- **Admin UI:** Locations section gained the overwrite checkbox, a
+  designation status line, and an "Address Data" column (✓ complete /
+  N fields to fill / M conflicts — review, with a slot-diff tooltip);
+  the run confirm dialog mentions field writes and completion counts
+  include them.
+
+**Dev QA results (2026-10-14, importer v1.6.0 / EventKoi v1.4.6.1):**
+Scan: designation active, 8/8 slots mapped, 0 pending field writes, 11
+review-only conflicts (Austin zip 78757 vs 78758, "#203" vs "Ste 203",
+"Texas" vs "TX", San Antonio + Bake Lab longitude/address variants),
+659 events with legacy meta reported. Create-with-fields: "QA Test
+Venue" created with 7 TEC fields; `Event::get_locations()` returned the
+term-derived row alongside the existing term; undo deleted the term and
+replayed all 7 `set_termmeta` ops. Fill-empty: blanked city → exactly 1
+refill, second run wrote 0 (idempotent); undo deleted all 8 metas
+(old=null branch proven on a live term). Overwrite: bogus city → TEC
+value written with `old:"BOGUS CITY"` recorded; undo restored the exact
+prior value (old≠null branch). Final restore run re-applied all 658
+assignments with 0 field writes / 11 conflicts skipped; term meta,
+ledger, and scan output verified identical to the pre-QA baseline; QA
+terms removed; importer deactivated (pre-test state).
+
 ---
 
 ## Admin UI ✅
@@ -720,6 +791,27 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
   to `ekti_organizer_field_backup`, and 605 event meta rows deleted.
   Spot-check: sample EventKoi event carries both `locations` and
   `instructors` terms and no longer has `organizer_name` meta.
+
+- 2026-10-14: **Step 13 — Saved Locations term field sync (v1.6.0).**
+  Fill-empty is the default write policy and overwrite is an explicit
+  opt-in checkbox because the dev terms carry manually-curated data that
+  diverges from TEC in 11 places (zip, longitude, "Texas" vs "TX",
+  two-line address split) — a silent overwrite would destroy deliberate
+  curation, so divergences surface as review-only conflicts instead.
+  Detection reads EventKoi's options directly
+  (`eventkoi_location_taxonomy`, `eventkoi_taxonomies`,
+  `eventkoi_location_taxonomy_map`) rather than its classes, consistent
+  with the importer's existing no-class-dependency pattern. Legacy
+  `location`/`locations` post meta is deliberately NOT cleaned: EventKoi
+  preserves it as the manual-mode fallback and `Event::get_locations()`
+  prefers term rows, so the scan reports the count only. The field sync
+  runs on the first chunk only (JS drops the `sync_fields` flag
+  afterwards) so overwrite mode never records duplicate audit ops for
+  the same write. Note: the pre-QA ledger still held the v1.5.0 sync's
+  658 `set_terms` ops, so each QA undo also reverted those assignments
+  (ledger semantics — undo replays everything); the final restore run
+  re-applied all 658 assignments and rebuilt an equivalent ledger,
+  leaving dev verified-identical to pre-QA.
 
 - **No REST API:** the plugin uses `admin-ajax.php` rather than WP REST. This
   is deliberate for a migration tool — all operations are admin-initiated,

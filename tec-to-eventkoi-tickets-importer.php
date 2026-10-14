@@ -3,7 +3,7 @@
  * Plugin Name: EventKoi Tickets Importer
  * Plugin URI:  https://onedog.solutions
  * Description: Migrates tickets and attendees from The Events Calendar (Event Tickets / Event Tickets Plus) to EventKoi.
- * Version:     1.5.0
+ * Version:     1.6.0
  * Author:      One Dog Solutions
  * Author URI:  https://onedog.solutions
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'EKTI_VERSION', '1.5.0' );
+define( 'EKTI_VERSION', '1.6.0' );
 define( 'EKTI_LOG_DIR', WP_CONTENT_DIR . '/uploads' );
 define( 'EKTI_LOG_FILE', EKTI_LOG_DIR . '/eventkoi-import.log' );
 define( 'EKTI_BATCH_SIZE', 30 );
@@ -28,6 +28,23 @@ final class EventKoi_Tickets_Importer {
 
     /** @var self */
     private static $instance;
+
+    /**
+     * Location slots EventKoi's Saved Locations feature can map to term
+     * fields (mirrors EventKoi's Location_Taxonomy::SLOTS).
+     *
+     * @var string[]
+     */
+    private $location_slots = [
+        'address1',
+        'address2',
+        'city',
+        'state',
+        'country',
+        'zip',
+        'latitude',
+        'longitude',
+    ];
 
     public static function instance() {
         if ( ! self::$instance ) {
@@ -1854,6 +1871,13 @@ final class EventKoi_Tickets_Importer {
                     $term_taxonomy = ! empty( $op['taxonomy'] ) ? $op['taxonomy'] : 'event_cal';
                     wp_delete_term( $op['term_id'], $term_taxonomy );
                     break;
+                case 'set_termmeta':
+                    if ( null === $op['old'] ) {
+                        delete_term_meta( (int) $op['term_id'], $op['key'] );
+                    } else {
+                        update_term_meta( (int) $op['term_id'], $op['key'], $op['old'] );
+                    }
+                    break;
             }
             $counts[ $op['type'] ] = ( $counts[ $op['type'] ] ?? 0 ) + 1;
         }
@@ -2565,6 +2589,13 @@ final class EventKoi_Tickets_Importer {
             $locations[ $key ]['events'][ $tec_id ] = $ek_id;
         }
 
+        // Attach TEC venue address data for the Saved Locations sync.
+        foreach ( $locations as $key => $loc ) {
+            if ( $loc['venue_id'] ) {
+                $locations[ $key ]['venue_data'] = $this->get_venue_address_data( $loc['venue_id'] );
+            }
+        }
+
         ksort( $locations );
         return $locations;
     }
@@ -2974,16 +3005,266 @@ final class EventKoi_Tickets_Importer {
      * ------------------------------------------------------------------ */
 
     /**
-     * Resolve a sync type to its registered taxonomy slug.
+     * Resolve a sync type to its registered taxonomy slug. The locations
+     * type follows EventKoi's Saved Locations designation.
      */
     private function get_taxonomy_for_type( $type ) {
         if ( 'locations' === $type ) {
-            return EKTI_LOCATION_TAXONOMY;
+            return $this->get_location_taxonomy_slug();
         }
         if ( 'instructors' === $type ) {
             return EKTI_INSTRUCTOR_TAXONOMY;
         }
         return '';
+    }
+
+    /**
+     * Taxonomy slug for the locations sync type: EventKoi's Saved
+     * Locations designation when it points at a usable taxonomy, else
+     * the stock `locations` taxonomy when it is registered.
+     */
+    private function get_location_taxonomy_slug() {
+        $slug = sanitize_key( (string) get_option( 'eventkoi_location_taxonomy', '' ) );
+        if ( '' !== $slug
+            && taxonomy_exists( $slug )
+            && is_object_in_taxonomy( 'eventkoi_event', $slug ) ) {
+            return $slug;
+        }
+        if ( taxonomy_exists( EKTI_LOCATION_TAXONOMY )
+            && is_object_in_taxonomy( 'eventkoi_event', EKTI_LOCATION_TAXONOMY ) ) {
+            return EKTI_LOCATION_TAXONOMY;
+        }
+        return '';
+    }
+
+    /**
+     * EventKoi Saved Locations designation state: whether one is active,
+     * the slot → term-field-key map, and the builder field definitions.
+     * Read straight from EventKoi's options rather than its classes so
+     * the importer keeps working regardless of EventKoi internals.
+     */
+    private function get_saved_location_field_map() {
+        $inactive = [
+            'active'         => false,
+            'taxonomy'       => '',
+            'slots'          => [],
+            'unmapped_slots' => [],
+            'field_defs'     => [],
+        ];
+        $slug     = sanitize_key( (string) get_option( 'eventkoi_location_taxonomy', '' ) );
+        if ( '' === $slug
+            || ! taxonomy_exists( $slug )
+            || ! is_object_in_taxonomy( 'eventkoi_event', $slug ) ) {
+            return $inactive;
+        }
+
+        $definitions = get_option( 'eventkoi_taxonomies', [] );
+        $definition  = is_array( $definitions ) && isset( $definitions[ $slug ] ) && is_array( $definitions[ $slug ] )
+            ? $definitions[ $slug ]
+            : [];
+
+        $field_defs = [];
+        if ( ! empty( $definition['fields'] ) && is_array( $definition['fields'] ) ) {
+            foreach ( $definition['fields'] as $field ) {
+                if ( ! is_array( $field ) || empty( $field['key'] ) ) {
+                    continue;
+                }
+                $key = sanitize_key( (string) $field['key'] );
+                if ( '' === $key ) {
+                    continue;
+                }
+                $field_defs[ $key ] = [
+                    'label' => isset( $field['label'] ) ? (string) $field['label'] : $key,
+                    'type'  => isset( $field['type'] ) ? sanitize_key( (string) $field['type'] ) : 'text',
+                ];
+            }
+        }
+
+        $map   = get_option( 'eventkoi_location_taxonomy_map', [] );
+        $map   = is_array( $map ) ? $map : [];
+        $slots = [];
+        foreach ( $this->location_slots as $slot ) {
+            $field_key = isset( $map[ $slot ] ) ? sanitize_key( (string) $map[ $slot ] ) : '';
+            if ( '' !== $field_key && isset( $field_defs[ $field_key ] ) ) {
+                $slots[ $slot ] = $field_key;
+            }
+        }
+
+        return [
+            'active'         => true,
+            'taxonomy'       => $slug,
+            'slots'          => $slots,
+            'unmapped_slots' => array_values( array_diff( $this->location_slots, array_keys( $slots ) ) ),
+            'field_defs'     => $field_defs,
+        ];
+    }
+
+    /**
+     * Address payload for a TEC venue post, keyed by location slot.
+     */
+    private function get_venue_address_data( $venue_id ) {
+        $venue_id = (int) $venue_id;
+        if ( $venue_id <= 0 || ! get_post( $venue_id ) ) {
+            return [];
+        }
+        $state = get_post_meta( $venue_id, '_VenueStateProvince', true );
+        if ( '' === trim( (string) $state ) ) {
+            $state = get_post_meta( $venue_id, '_VenueState', true );
+        }
+        list( $line1, $line2 ) = $this->split_venue_address( (string) get_post_meta( $venue_id, '_VenueAddress', true ) );
+        return [
+            'address1'  => $line1,
+            'address2'  => $line2,
+            'city'      => (string) get_post_meta( $venue_id, '_VenueCity', true ),
+            'state'     => (string) $state,
+            'country'   => (string) get_post_meta( $venue_id, '_VenueCountry', true ),
+            'zip'       => (string) get_post_meta( $venue_id, '_VenueZip', true ),
+            'latitude'  => (string) get_post_meta( $venue_id, '_VenueLat', true ),
+            'longitude' => (string) get_post_meta( $venue_id, '_VenueLng', true ),
+        ];
+    }
+
+    /**
+     * Split a single TEC address line into [line1, line2] when it carries
+     * a trailing unit segment ("9070 Research Blvd., Ste 203"), mirroring
+     * the two-line layout of the address fields. Anything else stays on
+     * line 1.
+     */
+    private function split_venue_address( $address ) {
+        $address = trim( (string) $address );
+        if ( '' === $address || false === strpos( $address, ',' ) ) {
+            return [ $address, '' ];
+        }
+        $last_comma = strrpos( $address, ',' );
+        $line1      = trim( substr( $address, 0, $last_comma ) );
+        $line2      = trim( substr( $address, $last_comma + 1 ) );
+        if ( '' === $line1 || '' === $line2 ) {
+            return [ $address, '' ];
+        }
+        if ( ! preg_match( '/^(ste|suite|unit|apt|bldg|fl|#)\s*\S+/i', $line2 ) ) {
+            return [ $address, '' ];
+        }
+        return [ $line1, $line2 ];
+    }
+
+    /**
+     * Sanitize a taxonomy field value the same way EventKoi's
+     * Taxonomy_Fields::sanitize() does, so importer writes match what
+     * the EventKoi editor would have stored.
+     */
+    private function sanitize_taxonomy_field_value( $type, $value ) {
+        switch ( $type ) {
+            case 'image':
+                return absint( $value );
+            case 'url':
+                return esc_url_raw( (string) $value );
+            case 'textarea':
+                return sanitize_textarea_field( (string) $value );
+            default:
+                return sanitize_text_field( (string) $value );
+        }
+    }
+
+    /**
+     * Copy TEC venue address data onto a location term's builder fields.
+     *
+     * Fill-empty by default: a slot that already holds a value is left
+     * alone (and counted as a conflict when it differs from the TEC
+     * value) unless $overwrite is set. Empty TEC values never clear a
+     * filled slot. Each write is audited as a set_termmeta op so the sync
+     * undo restores the exact prior state.
+     *
+     * @return array{written:int, conflicts:int}
+     */
+    private function sync_location_term_fields( $term_id, $venue_data, $field_map, &$ops, $overwrite = false ) {
+        $term_id   = (int) $term_id;
+        $written   = 0;
+        $conflicts = 0;
+        if ( $term_id <= 0 || empty( $field_map['slots'] ) || ! is_array( $venue_data ) ) {
+            return [ 'written' => $written, 'conflicts' => $conflicts ];
+        }
+        foreach ( $field_map['slots'] as $slot => $field_key ) {
+            if ( ! array_key_exists( $slot, $venue_data ) ) {
+                continue;
+            }
+            $type = isset( $field_map['field_defs'][ $field_key ]['type'] )
+                ? $field_map['field_defs'][ $field_key ]['type']
+                : 'text';
+            $proposed = $this->sanitize_taxonomy_field_value( $type, $venue_data[ $slot ] );
+            if ( '' === $proposed ) {
+                continue; // Never write — or clear — with an empty TEC value.
+            }
+            $meta_key = 'eventkoi_field_' . $field_key;
+            $current  = get_term_meta( $term_id, $meta_key, true );
+            $current  = ( null === $current || ! is_string( $current ) ) ? '' : $current;
+            if ( $current === $proposed ) {
+                continue; // Already in sync.
+            }
+            if ( '' !== $current ) {
+                $conflicts++;
+                if ( ! $overwrite ) {
+                    continue;
+                }
+            }
+            update_term_meta( $term_id, $meta_key, $proposed );
+            $ops[]    = [
+                'type'    => 'set_termmeta',
+                'term_id' => $term_id,
+                'key'     => $meta_key,
+                'old'     => '' === $current ? null : $current,
+            ];
+            $written++;
+        }
+        return [ 'written' => $written, 'conflicts' => $conflicts ];
+    }
+
+    /**
+     * Read-only analysis of the address-field writes a location sync
+     * would make for one source: slots that would be filled (current
+     * empty, TEC value present) and conflicts (both present, values
+     * differ). $term_id 0 analyzes a create-new target.
+     */
+    private function scan_location_term_fields( $term_id, $venue_data, $saved_locations ) {
+        $result = [
+            'term_id'   => (int) $term_id,
+            'pending'   => 0,
+            'conflicts' => 0,
+            'slots'     => [],
+        ];
+        $term_id = (int) $term_id;
+        foreach ( $saved_locations['slots'] as $slot => $field_key ) {
+            if ( ! array_key_exists( $slot, $venue_data ) ) {
+                continue;
+            }
+            $type     = isset( $saved_locations['field_defs'][ $field_key ]['type'] )
+                ? $saved_locations['field_defs'][ $field_key ]['type']
+                : 'text';
+            $label    = isset( $saved_locations['field_defs'][ $field_key ]['label'] )
+                ? $saved_locations['field_defs'][ $field_key ]['label']
+                : $field_key;
+            $proposed = $this->sanitize_taxonomy_field_value( $type, $venue_data[ $slot ] );
+            if ( '' === $proposed ) {
+                continue;
+            }
+            $current = $term_id > 0
+                ? (string) get_term_meta( $term_id, 'eventkoi_field_' . $field_key, true )
+                : '';
+            if ( $current === $proposed ) {
+                continue;
+            }
+            $result['slots'][] = [
+                'slot'     => $slot,
+                'label'    => $label,
+                'current'  => $current,
+                'proposed' => $proposed,
+            ];
+            if ( '' === $current ) {
+                $result['pending']++;
+            } else {
+                $result['conflicts']++;
+            }
+        }
+        return $result;
     }
 
     /**
@@ -3028,9 +3309,12 @@ final class EventKoi_Tickets_Importer {
 
     /**
      * Create a term in the target taxonomy, reusing an existing term when
-     * the normalized name already exists. Audits a create_term op.
+     * the normalized name already exists. Audits a create_term op. When
+     * venue address data is supplied and the taxonomy is the designated
+     * Saved Locations taxonomy, the new term's address fields are
+     * populated from it.
      */
-    private function create_taxonomy_term( $taxonomy, $name, &$ops ) {
+    private function create_taxonomy_term( $taxonomy, $name, &$ops, $venue_data = null ) {
         $name = sanitize_text_field( $name );
         if ( '' === $name ) {
             return new WP_Error( 'ekti_empty_term_name', 'Term name is empty.' );
@@ -3050,13 +3334,32 @@ final class EventKoi_Tickets_Importer {
         if ( $template_id ) {
             $meta = get_term_meta( $template_id );
             foreach ( $meta as $meta_key => $values ) {
+                // Builder field values are term-specific: a new location
+                // term must never inherit another location's address.
+                if ( 0 === strpos( $meta_key, 'eventkoi_field_' ) ) {
+                    continue;
+                }
                 if ( is_array( $values ) && isset( $values[0] ) ) {
                     add_term_meta( $term_id, $meta_key, $values[0] );
                 }
             }
         }
+        // create_term goes in before any set_termmeta ops so the reverse
+        // replay restores the fields before the term is deleted.
         $ops[] = [ 'type' => 'create_term', 'taxonomy' => $taxonomy, 'term_id' => $term_id, 'name' => $name ];
         $this->log( "Taxonomy sync ({$taxonomy}): created term \"{$name}\" (#{$term_id})." );
+        if ( is_array( $venue_data ) && ! empty( $venue_data ) ) {
+            $field_map = $this->get_saved_location_field_map();
+            if ( $field_map['active'] && $field_map['taxonomy'] === $taxonomy ) {
+                $fr = $this->sync_location_term_fields( $term_id, $venue_data, $field_map, $ops, true );
+                if ( $fr['written'] ) {
+                    $this->log( sprintf(
+                        'Taxonomy sync (locations): populated "%s" (#%d) with %d address field(s) from the TEC venue.',
+                        $name, $term_id, $fr['written']
+                    ) );
+                }
+            }
+        }
         return $term_id;
     }
 
@@ -3189,7 +3492,16 @@ final class EventKoi_Tickets_Importer {
     }
 
     private function get_tec_location_sources() {
-        return $this->get_tec_locations();
+        $sources = [];
+        foreach ( $this->get_tec_locations() as $key => $loc ) {
+            $sources[ $key ] = [
+                'name'       => $loc['name'],
+                'source_id'  => $loc['venue_id'],
+                'events'     => $loc['events'],
+                'venue_data' => isset( $loc['venue_data'] ) ? $loc['venue_data'] : [],
+            ];
+        }
+        return $sources;
     }
 
     /**
@@ -3489,25 +3801,63 @@ final class EventKoi_Tickets_Importer {
 
     /**
      * Read-only scan: sources, terms, auto-map suggestions, and pending
-     * assignment counts for a taxonomy sync type.
+     * assignment counts for a taxonomy sync type. The locations type also
+     * reports EventKoi's Saved Locations designation state and, per
+     * source, the address-field writes a run would make.
      */
     private function scan_taxonomy_sync( $type ) {
         $taxonomy = $this->get_taxonomy_for_type( $type );
         if ( ! $taxonomy ) {
+            if ( 'locations' === $type ) {
+                return new WP_Error(
+                    'ekti_no_location_taxonomy',
+                    'No Locations taxonomy is available. Create one in EventKoi (Settings > Taxonomies) or register a "locations" taxonomy first.'
+                );
+            }
             return new WP_Error( 'ekti_invalid_type', 'Invalid taxonomy sync type.' );
         }
         $sources     = $this->get_tec_taxonomy_sources( $type );
         $terms       = $this->get_taxonomy_terms( $taxonomy );
         $suggestions = $this->auto_map_sources_to_terms( $sources, $terms );
         $saved       = $this->get_saved_taxonomy_mapping( $type );
-        $rows        = [];
-        $counts      = [
-            'sources'           => count( $sources ),
-            'mapped_events'     => 0,
-            'pending'           => 0,
-            'new_terms'         => 0,
-            'unmapped_sources'  => 0,
+
+        // Saved Locations designation state (locations sync only).
+        $saved_locations = null;
+        if ( 'locations' === $type ) {
+            $field_map       = $this->get_saved_location_field_map();
+            $saved_locations = [
+                'active'         => $field_map['active'],
+                'taxonomy'       => $field_map['taxonomy'],
+                'slots'          => $field_map['slots'],
+                'field_defs'     => $field_map['field_defs'],
+                'unmapped_slots' => $field_map['unmapped_slots'],
+                'warning'        => '',
+            ];
+            if ( ! $field_map['active'] ) {
+                $saved_locations['warning'] = 'EventKoi\'s Saved Locations designation is not active. Enable "Replace default location fields with a custom taxonomy" in EventKoi Settings > Taxonomies to copy TEC venue addresses onto terms.';
+            } elseif ( empty( $field_map['slots'] ) ) {
+                $saved_locations['warning'] = 'Saved Locations is active, but no taxonomy fields are mapped to address details. Map them in EventKoi Settings > Taxonomies.';
+            }
+            global $wpdb;
+            $saved_locations['legacy_meta_events'] = (int) $wpdb->get_var(
+                "SELECT COUNT(DISTINCT pm.post_id) FROM {$wpdb->postmeta} pm
+                 JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+                 WHERE p.post_type = 'eventkoi_event' AND pm.meta_key = 'location' AND pm.meta_value != ''"
+            );
+        }
+
+        $rows   = [];
+        $counts = [
+            'sources'          => count( $sources ),
+            'mapped_events'    => 0,
+            'pending'          => 0,
+            'new_terms'        => 0,
+            'unmapped_sources' => 0,
         ];
+        if ( $saved_locations ) {
+            $counts['field_updates']   = 0;
+            $counts['field_conflicts'] = 0;
+        }
         foreach ( $sources as $key => $source ) {
             $sugg = isset( $suggestions[ $key ] ) ? $suggestions[ $key ] : [ 'term_id' => null, 'term_name' => null, 'match_source' => 'none' ];
             $selected = isset( $saved[ $key ] ) ? $saved[ $key ] : $sugg['term_id'];
@@ -3539,6 +3889,19 @@ final class EventKoi_Tickets_Importer {
                 $counts['unmapped_sources']++;
             }
             $counts['pending'] += $pending;
+
+            // Address-field analysis for the resolved target term.
+            $fields = null;
+            if ( $saved_locations
+                && $saved_locations['active']
+                && ! empty( $source['venue_data'] )
+                && ( $is_new || $term_id > 0 ) ) {
+                $fields             = $this->scan_location_term_fields( $is_new ? 0 : $term_id, $source['venue_data'], $saved_locations );
+                $fields['is_new']   = $is_new;
+                $counts['field_updates']   += $fields['pending'];
+                $counts['field_conflicts'] += $fields['conflicts'];
+            }
+
             $rows[] = [
                 'key'                 => $key,
                 'name'                => $source['name'],
@@ -3552,28 +3915,39 @@ final class EventKoi_Tickets_Importer {
                 'suggested_term_name' => $sugg['term_name'],
                 'selected'            => ( '' === $selected || null === $selected ) ? '' : (string) $selected,
                 'pending'             => $pending,
+                'fields'              => $fields,
             ];
         }
         return [
-            'sources' => $rows,
-            'terms'   => $terms,
-            'counts'  => $counts,
+            'sources'         => $rows,
+            'terms'           => $terms,
+            'counts'          => $counts,
+            'saved_locations' => $saved_locations,
         ];
     }
 
     /**
-     * Apply a taxonomy mapping: create any "new:" terms, persist the
-     * mapping, then union-append terms to mapped EventKoi events.
+     * Apply a taxonomy mapping: create any "new:" terms (populated with
+     * TEC venue address data for locations), persist the mapping, sync
+     * address fields onto mapped terms (locations, first chunk only),
+     * then union-append terms to mapped EventKoi events.
      */
-    private function run_taxonomy_sync( $type, $mapping, $chunk = 100 ) {
+    private function run_taxonomy_sync( $type, $mapping, $chunk = 100, $overwrite = false, $sync_fields = false ) {
         $taxonomy = $this->get_taxonomy_for_type( $type );
         if ( ! $taxonomy ) {
             return [ 'error' => 'Invalid taxonomy sync type.' ];
         }
+        $sources        = $this->get_tec_taxonomy_sources( $type );
+        $results        = [];
+        $fields_written = 0;
         $ops = [];
         foreach ( $mapping as $key => $target ) {
             if ( is_string( $target ) && 0 === strpos( $target, 'new:' ) ) {
-                $term_id = $this->create_taxonomy_term( $taxonomy, substr( $target, 4 ), $ops );
+                $venue_data = ( 'locations' === $type && isset( $sources[ $key ]['venue_data'] ) )
+                    ? $sources[ $key ]['venue_data']
+                    : null;
+                $ops_before = count( $ops );
+                $term_id = $this->create_taxonomy_term( $taxonomy, substr( $target, 4 ), $ops, $venue_data );
                 if ( is_wp_error( $term_id ) ) {
                     if ( $ops ) {
                         $this->audit_push_tax_sync( $type, $ops );
@@ -3581,13 +3955,64 @@ final class EventKoi_Tickets_Importer {
                     return [ 'error' => $term_id->get_error_message() ];
                 }
                 $mapping[ $key ] = $term_id;
+                // Surface address fields written onto the new term at
+                // creation time (ops added by create_taxonomy_term).
+                $created_fields = 0;
+                for ( $i = $ops_before; $i < count( $ops ); $i++ ) {
+                    if ( isset( $ops[ $i ]['type'] ) && 'set_termmeta' === $ops[ $i ]['type'] ) {
+                        $created_fields++;
+                    }
+                }
+                if ( $created_fields ) {
+                    $fields_written += $created_fields;
+                    $results[] = [ 'action' => 'fields', 'term_id' => (int) $term_id, 'written' => $created_fields ];
+                }
             }
         }
         if ( $ops ) {
             $this->audit_push_tax_sync( $type, $ops );
         }
         $this->save_taxonomy_mapping( $type, $mapping );
-        $sources = $this->get_tec_taxonomy_sources( $type );
+        // Saved Locations term field sync. JS sends sync_fields on the
+        // first chunk only, so overwrite mode never records duplicate
+        // audit ops for the same write.
+        if ( 'locations' === $type && $sync_fields ) {
+            $field_map = $this->get_saved_location_field_map();
+            if ( $field_map['active'] && $field_map['taxonomy'] === $taxonomy && ! empty( $field_map['slots'] ) ) {
+                $field_ops  = [];
+                $done_terms = [];
+                $conflicts  = 0;
+                foreach ( $sources as $key => $source ) {
+                    if ( empty( $source['venue_data'] ) ) {
+                        continue;
+                    }
+                    $term_id = isset( $mapping[ $key ] ) ? (int) $mapping[ $key ] : 0;
+                    if ( $term_id <= 0 || isset( $done_terms[ $term_id ] ) ) {
+                        continue;
+                    }
+                    $done_terms[ $term_id ] = true;
+                    $fr = $this->sync_location_term_fields( $term_id, $source['venue_data'], $field_map, $field_ops, $overwrite );
+                    $fields_written += $fr['written'];
+                    $conflicts      += $fr['conflicts'];
+                    if ( $fr['written'] ) {
+                        $results[] = [ 'action' => 'fields', 'term_id' => $term_id, 'written' => $fr['written'] ];
+                    }
+                }
+                if ( $field_ops ) {
+                    $this->audit_push_tax_sync( $type, $field_ops );
+                }
+                $this->log( sprintf(
+                    'Taxonomy sync (%s): %d term field(s) written, %d conflict(s) %s, across %d term(s).',
+                    $type,
+                    $fields_written,
+                    $conflicts,
+                    $overwrite ? 'overwritten' : 'skipped (fill-empty mode)',
+                    count( $done_terms )
+                ) );
+            } else {
+                $results[] = [ 'action' => 'fields_skipped', 'reason' => 'saved_locations_inactive' ];
+            }
+        }
         $pending = [];
         $seen    = [];
         foreach ( $mapping as $key => $term_id ) {
@@ -3617,7 +4042,6 @@ final class EventKoi_Tickets_Importer {
             }
         }
         $batch     = array_slice( $pending, 0, $chunk );
-        $results   = [];
         $applied   = 0;
         $errors    = 0;
         $batch_ops = [];
@@ -3642,11 +4066,12 @@ final class EventKoi_Tickets_Importer {
             ) );
         }
         return [
-            'processed' => count( $batch ),
-            'applied'   => $applied,
-            'errors'    => $errors,
-            'done'      => count( $pending ) <= count( $batch ),
-            'results'   => $results,
+            'processed'      => count( $batch ),
+            'applied'        => $applied,
+            'errors'         => $errors,
+            'fields_written' => $fields_written,
+            'done'           => count( $pending ) <= count( $batch ),
+            'results'        => $results,
         ];
     }
 
@@ -3955,7 +4380,13 @@ final class EventKoi_Tickets_Importer {
         if ( empty( $clean ) ) {
             wp_send_json_error( 'No taxonomy mapping saved. Scan and save a mapping first.' );
         }
-        $result = $this->run_taxonomy_sync( $type, $clean );
+        $overwrite   = 'locations' === $type
+            && isset( $_POST['overwrite'] )
+            && 'true' === $_POST['overwrite'];
+        $sync_fields = 'locations' === $type
+            && isset( $_POST['sync_fields'] )
+            && 'true' === $_POST['sync_fields'];
+        $result = $this->run_taxonomy_sync( $type, $clean, 100, $overwrite, $sync_fields );
         if ( isset( $result['error'] ) ) {
             wp_send_json_error( $result['error'] );
         }
@@ -4168,14 +4599,16 @@ final class EventKoi_Tickets_Importer {
                 <!-- Locations -->
                 <div class="ekti-tax-section" id="ekti-tax-locations-section" style="margin-top:1.5em;">
                     <h3>Locations</h3>
-                    <p class="description">Map TEC venues to EventKoi Locations taxonomy terms.</p>
+                    <p class="description">Map TEC venues to EventKoi Locations taxonomy terms. With EventKoi's Saved Locations active, each TEC venue's address is copied onto the mapped term, and events resolve their address from the assigned term.</p>
                     <div class="ekti-actions">
                         <button class="button button-primary" id="ekti-tax-locations-scan">Scan Locations</button>
                         <button class="button" id="ekti-tax-locations-save" disabled>Save Mapping</button>
                         <button class="button" id="ekti-tax-locations-run" disabled>Run Location Sync</button>
                         <button class="button button-secondary" id="ekti-tax-locations-undo" style="color:#a00;">Undo Last Location Sync</button>
+                        <label style="margin-left:6px;"><input type="checkbox" id="ekti-tax-locations-overwrite" /> <strong>Overwrite</strong> non-empty address fields with TEC venue data</label>
                     </div>
                     <div id="ekti-tax-locations-status" class="ekti-status"></div>
+                    <div id="ekti-tax-locations-designation" style="display:none;"></div>
                     <div id="ekti-tax-locations-progress-wrap" style="display:none;">
                         <div class="ekti-progress-bar">
                             <div class="ekti-progress-fill" id="ekti-tax-locations-progress-fill" style="width:0%"></div>
@@ -4186,7 +4619,7 @@ final class EventKoi_Tickets_Importer {
                         <h4>TEC Location &rarr; EventKoi Location</h4>
                         <table class="wp-list-table widefat fixed striped">
                             <thead>
-                                <tr><th>TEC Source</th><th>Source</th><th>Mapped Events</th><th>Auto-Match</th><th>EventKoi Location</th><th>Pending</th></tr>
+                                <tr><th>TEC Source</th><th>Source</th><th>Mapped Events</th><th>Auto-Match</th><th>EventKoi Location</th><th>Address Data</th><th>Pending</th></tr>
                             </thead>
                             <tbody id="ekti-tax-locations-tbody"></tbody>
                         </table>
