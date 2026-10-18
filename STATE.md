@@ -8,7 +8,7 @@ top-level document.
 
 - **Branch:** `main`
 - **Plugin version:** 1.6.0
-- **Last updated:** 2026-10-14
+- **Last updated:** 2026-10-18
 - **Overall status:** ✅ **v1.6.0 Saved Locations term field sync deployed and fully QA'd
   on ott-dev (EventKoi v1.4.6.1).** TEC venue addresses now copy onto
   Saved Locations term fields (`eventkoi_field_*` term meta) during the
@@ -68,17 +68,19 @@ Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
 
-**v1.6.0 complete and verified on ott-dev.** Saved Locations term field
-sync shipped: TEC venue addresses copy onto `locations` term builder
-fields during the Locations sync (fill-empty default, overwrite opt-in),
-with designation detection, conflict surfacing, audited `set_termmeta`
-writes, and full undo. QA on ott-dev (2026-10-14) verified scan,
-create-with-fields, fill-empty idempotency, overwrite, and both undo
-branches; dev left byte-identical to its pre-QA synced state (658
-assignments, manually-curated term data intact, importer deactivated to
-match pre-test state). Remaining before wider release:
-update readme/changelog, consider an uninstall cleanup routine, and run
-prod cutover checklist.
+**v1.6.0 complete and verified on ott-dev; release zip current.** Saved
+Locations term field sync shipped: TEC venue addresses copy onto
+`locations` term builder fields during the Locations sync (fill-empty
+default, overwrite opt-in), with designation detection, conflict
+surfacing, audited `set_termmeta` writes, and full undo. QA on ott-dev
+(2026-10-14) verified scan, create-with-fields, fill-empty idempotency,
+overwrite, and both undo branches; dev left byte-identical to its pre-QA
+synced state (658 assignments, manually-curated term data intact,
+importer deactivated to match pre-test state). The install zip
+(`eventkoi-tickets-importer.zip`) was rebuilt 2026-10-17 from the
+committed v1.6.0 tree (verified byte-identical admin.js, plugin header
+1.6.0). Remaining before wider release: update readme/changelog,
+consider an uninstall cleanup routine, and run prod cutover checklist.
 
 - **Verification results:** all 2421 order_ids distinct, 0 rows outside
   the mapping, 0 null ticket_ids, 0 orphan tickets, all `quantity_sold`
