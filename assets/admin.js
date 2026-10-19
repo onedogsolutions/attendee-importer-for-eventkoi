@@ -1568,6 +1568,7 @@
 
         renderSetupCards();
         renderFinish();
+        renderAttendeePanel();
 
         if (!wz.opened) {
             wz.opened = true;
@@ -1976,7 +1977,7 @@
     }
 
     function previewOrders() {
-        var agg = { events: 0, woo_rows: 0, woo_orders: 0, woo_unpaid: 0, by_status: {}, tc_attendees: 0, rsvp_rows: 0, rsvp_merged: 0, not_linked: 0 };
+        var agg = { events: 0, woo_rows: 0, woo_orders: 0, woo_unpaid: 0, by_status: {}, tc_attendees: 0, rsvp_rows: 0, rsvp_merged: 0, not_linked: 0, multi_person_orders: 0, fields: {} };
         var rows = [];
         var extra = {};
         var offset = 0;
@@ -1990,7 +1991,10 @@
                 if (d.offset === 0) {
                     extra = { orphans: d.orphan_attendees, multi: d.multi_event_orders };
                 }
-                $.each(['events', 'woo_rows', 'woo_orders', 'woo_unpaid', 'tc_attendees', 'rsvp_rows', 'rsvp_merged', 'not_linked'], function (i, k) {
+                $.each(d.agg.fields || {}, function (k, label) {
+                    agg.fields[k] = label;
+                });
+                $.each(['events', 'woo_rows', 'woo_orders', 'woo_unpaid', 'tc_attendees', 'rsvp_rows', 'rsvp_merged', 'not_linked', 'multi_person_orders'], function (i, k) {
                     agg[k] += d.agg[k];
                 });
                 $.each(d.agg.by_status, function (s, n) {
@@ -2019,6 +2023,9 @@
                     ['Cannot be linked', agg.not_linked]
                 ]);
                 html += '<p>Order status mapping: ' + (statuses || '—') + '</p>';
+                var fieldLabels = $.map(agg.fields, function (label) { return label; });
+                html += '<p>Attendee details: <strong>' + agg.multi_person_orders + '</strong> order(s) list more than one person; registration answers carried: ' +
+                    escapeHtml(fieldLabels.length ? fieldLabels.join(', ') : 'none') + '.</p>';
                 html += '<p class="description">' + (extra.multi || 0) + ' WooCommerce order(s) span several events (each seat stays on its own event). ' +
                     (extra.orphans || 0) + ' TEC attendee(s) belong to events that no longer exist and are not imported.</p>';
                 var noted = rows.filter(function (r) { return r.notes && r.notes.length; });
@@ -2221,6 +2228,7 @@
         function undoTerms(types) {
             var type = types.shift();
             if (!type) {
+                ajax('ekti_attendee_fields', { op: 'remove' }, function () {});
                 ajax('ekti_undo_taxonomy_provision', {}, function () {
                     appendConsole('=== Entire import undone ===', 'warn');
                     setStatus('#ekti-wz-finish-status', 'The import has been undone.', 'success');
@@ -2237,6 +2245,70 @@
             });
         }
         nextStage();
+    }
+
+
+    /* Step 17: attendee details panel ---------------------------------- */
+
+    function renderAttendeePanel() {
+        if (!wz.summary || !wz.summary.attendees) return;
+        var a = wz.summary.attendees;
+        var parts = [];
+        parts.push(a.installed ? '<span class="ekti-pill ok">Fields plugin installed</span>' : '<span class="ekti-pill">Fields plugin not installed</span>');
+        parts.push(a.fields.length ? 'Fields: ' + escapeHtml(a.fields.join(', ')) : 'No attendee fields recorded yet');
+        if (a.repair > 0) {
+            parts.push('<span class="ekti-pill warn">' + a.repair + ' imported event(s) need updating</span>');
+        }
+        $('#ekti-wz-attendees-status').html('<p>' + parts.join(' &middot; ') + '</p>');
+        $('#ekti-wz-attendees-repair').prop('disabled', wz.running || a.repair === 0);
+        $('#ekti-wz-attendees-install').prop('disabled', wz.running || !a.fields.length).text(a.installed ? 'Reinstall Attendee Fields' : 'Install Attendee Fields');
+        $('#ekti-wz-attendees-remove').prop('disabled', wz.running || !a.installed);
+    }
+
+    function runAttendeeRepair() {
+        var a = wz.summary.attendees;
+        if (!confirm('Update ' + a.repair + ' imported event(s): tag attendee rows with EventKoi\'s event instance (so the storefront counts them as sold) and store seat holders + registration answers on the orders? Audited; "Undo Orders" reverts it.')) {
+            return;
+        }
+        wz.running = true;
+        renderWizard();
+        appendConsole('=== Updating existing attendees ===', 'info');
+        var total = a.repair;
+        loopChunks({
+            action: 'ekti_run_attendee_repair',
+            data: function () { return {}; },
+            onChunk: function (d) {
+                appendConsole('  ' + d.processed + ' event(s), ' + d.rows + ' row(s) re-tagged, ' + d.orders + ' order(s) updated; ' + d.remaining + ' remaining');
+                wzProgress('orders', Math.max(0, total - d.remaining), total);
+                return d.processed > 0;
+            },
+            isDone: function (d) { return d.done; },
+            onError: function (msg) {
+                wz.running = false;
+                appendConsole('Attendee update error: ' + msg, 'error');
+                refreshWizard();
+            },
+            onDone: function () {
+                wz.running = false;
+                appendConsole('Attendee update complete.', 'info');
+                refreshWizard(function () { verifyStage('orders'); });
+            }
+        });
+    }
+
+    function attendeeFields(op) {
+        if (op === 'remove' && !confirm('Remove the attendee fields plugin? The stored values stay on the orders; they just stop showing in EventKoi.')) {
+            return;
+        }
+        ajax('ekti_attendee_fields', { op: op }, function (resp) {
+            if (!resp.success) {
+                appendConsole('Attendee fields: ' + resp.data, 'error');
+                setStatus('#ekti-wz-attendees-status', escapeHtml(resp.data), 'error');
+                return;
+            }
+            appendConsole('Attendee fields plugin ' + (op === 'install' ? 'installed' : 'removed') + '.', 'info');
+            refreshWizard();
+        });
     }
 
     function renderFinish() {
@@ -2291,6 +2363,9 @@
             $('#ekti-wz-' + stage + '-undo').on('click', function () { undoStage(stage); });
         });
         $('#ekti-wz-undo-all').on('click', undoEverything);
+        $('#ekti-wz-attendees-repair').on('click', runAttendeeRepair);
+        $('#ekti-wz-attendees-install').on('click', function () { attendeeFields('install'); });
+        $('#ekti-wz-attendees-remove').on('click', function () { attendeeFields('remove'); });
 
         refreshWizard(function () {
             scanTaxonomySync('locations');

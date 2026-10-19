@@ -3,7 +3,7 @@
  * Plugin Name: EventKoi Tickets Importer
  * Plugin URI:  https://onedog.solutions
  * Description: Migrates tickets and attendees from The Events Calendar (Event Tickets / Event Tickets Plus) to EventKoi.
- * Version:     1.9.0
+ * Version:     1.10.0
  * Author:      One Dog Solutions
  * Author URI:  https://onedog.solutions
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'EKTI_VERSION', '1.9.0' );
+define( 'EKTI_VERSION', '1.10.0' );
 define( 'EKTI_LOG_DIR', WP_CONTENT_DIR . '/uploads' );
 define( 'EKTI_LOG_FILE', EKTI_LOG_DIR . '/eventkoi-import.log' );
 define( 'EKTI_BATCH_SIZE', 30 );
@@ -28,6 +28,9 @@ final class EventKoi_Tickets_Importer {
 
     /** @var self */
     private static $instance;
+
+    /** Attendee writer version (Step 17); events below it need the repair. */
+    const ATTENDEE_VERSION = '17';
 
     /**
      * Location slots EventKoi's Saved Locations feature can map to term
@@ -92,6 +95,8 @@ final class EventKoi_Tickets_Importer {
         add_action( 'wp_ajax_ekti_preview_tickets', [ $this, 'ajax_preview_tickets' ] );
         add_action( 'wp_ajax_ekti_preview_orders', [ $this, 'ajax_preview_orders' ] );
         add_action( 'wp_ajax_ekti_verify_stage', [ $this, 'ajax_verify_stage' ] );
+        add_action( 'wp_ajax_ekti_run_attendee_repair', [ $this, 'ajax_run_attendee_repair' ] );
+        add_action( 'wp_ajax_ekti_attendee_fields', [ $this, 'ajax_attendee_fields' ] );
         add_action( 'wp_ajax_ekti_get_log', [ $this, 'ajax_get_log' ] );
         add_action( 'wp_ajax_ekti_clear_log', [ $this, 'ajax_clear_log' ] );
     }
@@ -1534,6 +1539,15 @@ final class EventKoi_Tickets_Importer {
                     }
                     if ( class_exists( '\\EventKoi\\Core\\Taxonomies' ) ) {
                         \EventKoi\Core\Taxonomies::invalidate_rewrites();
+                    }
+                    break;
+                case 'update_ticket_orders_instance':
+                    $ids = array_map( 'intval', (array) $op['ids'] );
+                    if ( $ids ) {
+                        $wpdb->query( $wpdb->prepare(
+                            "UPDATE {$this->ek_table( 'ticket_orders' )} SET instance_ts = %d WHERE id IN (" . implode( ',', $ids ) . ')',
+                            (int) $op['old']
+                        ) );
                     }
                     break;
                 case 'ticket_qty_add':
@@ -5557,6 +5571,8 @@ final class EventKoi_Tickets_Importer {
         $notes     = [];
         $attendees = $this->import_event_attendees_sync( $tec_id, $ek_id, $et_tickets, $ops, $notes );
         $this->set_event_meta_audited( $ek_id, '_ekti_stage_orders', array_merge( $attendees, [ 'at' => time() ] ), $ops );
+        // Written by the Step 17 writer — nothing for the attendee repair to do.
+        $this->set_event_meta_audited( $ek_id, '_ekti_attendee_v', self::ATTENDEE_VERSION, $ops );
         return array_merge( $attendees, [ 'notes' => $notes ] );
     }
 
@@ -6058,8 +6074,16 @@ final class EventKoi_Tickets_Importer {
             'by_status'           => [],
             'notes'               => [],
             'results'             => [],
+            'multi_person_orders' => 0,
+            'registration_fields' => [],
         ];
         $ever_paid  = [ 'complete', 'partially_refunded', 'refunded' ];
+        // Step 17: tag rows with the instance EventKoi's checkout resolves
+        // for this event, so per-instance inventory counts imported sales.
+        $instance_ts = $this->ek_instance_ts_for_event( $ek_event_id );
+        // A dry run (orders preview) must not persist the field registry.
+        $frozen_before         = $this->registry_frozen;
+        $this->registry_frozen = (bool) $dry_run;
         $counted    = [ 'complete', 'completed', 'succeeded', 'paid', 'partially_refunded' ];
         $no_ticket  = 0;
         $no_order   = 0;
@@ -6097,6 +6121,25 @@ final class EventKoi_Tickets_Importer {
             $created_at = $date ? gmdate( 'Y-m-d H:i:s', $date->getTimestamp() ) : gmdate( 'Y-m-d H:i:s' );
             $bill_name  = trim( $wc_order->get_billing_first_name() . ' ' . $wc_order->get_billing_last_name() );
             $bill_email = (string) $wc_order->get_billing_email();
+
+            // Seat holders + registration answers (Event Tickets Plus
+            // attendee meta). Rows keep the purchaser (EventKoi parity);
+            // seat data goes to EventKoi checkout fields on the WC order.
+            $seats = [];
+            foreach ( $group as $att ) {
+                $seats[ (int) $att['ID'] ] = $this->seat_registration( $att, $bill_name, $bill_email );
+            }
+            $seat_names = array_unique( array_filter( array_map( function ( $seat ) {
+                return strtolower( $seat['name'] );
+            }, $seats ) ) );
+            if ( count( $seat_names ) > 1 ) {
+                ++$summary['multi_person_orders'];
+            }
+            foreach ( $seats as $seat ) {
+                foreach ( $seat['labels'] as $fk => $label ) {
+                    $summary['registration_fields'][ $fk ] = $label;
+                }
+            }
 
             $items     = []; // ticket_id|unit_amount => meta ticket item (with codes).
             $new_rows  = []; // ticket_id => row ids inserted for this order.
@@ -6180,7 +6223,7 @@ final class EventKoi_Tickets_Importer {
                 // Column set of Ticket_Order_Sync::sync_order_to_local() (codes path).
                 $inserted = $wpdb->insert( $table, [
                     'event_id'          => (int) $ek_event_id,
-                    'instance_ts'       => 0,
+                    'instance_ts'       => $instance_ts,
                     'ticket_id'         => $ticket_id,
                     'order_id'          => $key,
                     'customer_name'     => sanitize_text_field( $name ),
@@ -6236,7 +6279,7 @@ final class EventKoi_Tickets_Importer {
             if ( $order_new > 0 ) {
                 ++$summary['orders'];
                 if ( ! $dry_run ) {
-                    $this->link_wc_order_meta( $wc_order, $ek_event_id, array_values( $items ), $ops );
+                    $this->link_wc_order_meta( $wc_order, $ek_event_id, array_values( $items ), $ops, $instance_ts, $seats );
                 }
             }
         }
@@ -6264,7 +6307,213 @@ final class EventKoi_Tickets_Importer {
             $summary['notes'][] = $summary['unpaid'] . ' WooCommerce attendee(s) imported with a non-sold status (refunded/failed/pending/cancelled) — not counted as sold.';
         }
 
+        $this->registry_frozen = $frozen_before;
         return $summary;
+    }
+
+
+    /* ------------------------------------------------------------------
+     * STEP 17 — ATTENDEE FIDELITY
+     *
+     * Imported ticket_orders rows are EventKoi's attendees. They carry the
+     * WooCommerce purchaser (EventKoi's own checkout does the same), the
+     * instance EventKoi's checkout resolves for the event (so per-instance
+     * storefront inventory counts imported sales), and the Event Tickets
+     * Plus seat holders + registration answers as EventKoi checkout field
+     * values on the WC order (`_eventkoi_checkout_fields`).
+     * ------------------------------------------------------------------ */
+
+    /**
+     * The instance timestamp EventKoi's checkout resolves for an event
+     * (Tickets::resolve_checkout_instance_ts): a standard "selected" event
+     * uses its first event day; continuous events and anything else use 0.
+     * Recurring events need a per-occurrence match TEC does not give us
+     * (none on the target data) and keep 0.
+     */
+    private function ek_instance_ts_for_event( $ek_id ) {
+        if ( 'standard' !== (string) get_post_meta( $ek_id, 'date_type', true )
+            || 'selected' !== (string) get_post_meta( $ek_id, 'standard_type', true ) ) {
+            return 0;
+        }
+        $days = get_post_meta( $ek_id, 'event_days', true );
+        if ( ! is_array( $days ) || empty( $days ) ) {
+            return 0;
+        }
+        $first = reset( $days );
+        $ts    = is_array( $first ) && ! empty( $first['start_date'] ) ? strtotime( (string) $first['start_date'] ) : 0;
+        return $ts ? (int) $ts : 0;
+    }
+
+    /**
+     * EventKoi checkout-field key for a TEC attendee-meta key. ET+ stores a
+     * slug-less field (the consent checkbox) under "_" + md5.
+     */
+    private function tec_registration_field_key( $tec_key ) {
+        $tec_key = (string) $tec_key;
+        if ( preg_match( '/^_[0-9a-f]{32}$/', $tec_key ) ) {
+            return 'tec_consent';
+        }
+        return substr( 'tec_' . str_replace( '-', '_', sanitize_key( $tec_key ) ), 0, 48 );
+    }
+
+    /**
+     * ET+ field definitions for a ticket product: slug => [label, type].
+     */
+    private function tec_registration_field_defs( $product_id ) {
+        static $cache = [];
+        $product_id = (int) $product_id;
+        if ( isset( $cache[ $product_id ] ) ) {
+            return $cache[ $product_id ];
+        }
+        $defs = [];
+        foreach ( (array) get_post_meta( $product_id, '_tribe_tickets_meta', true ) as $def ) {
+            if ( ! is_array( $def ) ) {
+                continue;
+            }
+            $slug  = (string) ( $def['slug'] ?? '' );
+            $label = html_entity_decode( (string) ( $def['label'] ?? '' ), ENT_QUOTES, 'UTF-8' );
+            if ( '' === $slug && 'checkbox' === ( $def['type'] ?? '' ) ) {
+                $slug  = '__consent';
+                $label = '' !== $label ? $label : 'Consent';
+            }
+            if ( '' !== $slug ) {
+                $defs[ $slug ] = [ 'label' => '' !== $label ? $label : $slug, 'type' => (string) ( $def['type'] ?? 'text' ) ];
+            }
+        }
+        return $cache[ $product_id ] = $defs;
+    }
+
+    /**
+     * One seat's holder + registration answers from the TEC attendee row.
+     * Name/email: ET+ attendee meta, else the TEC purchaser fields, else the
+     * WC billing details.
+     *
+     * @return array{name:string, email:string, fields:array<string,string>}
+     */
+    private function seat_registration( $att, $bill_name, $bill_email ) {
+        $meta = maybe_unserialize( (string) ( $att['ticket_meta'] ?? '' ) );
+        $meta = is_array( $meta ) ? $meta : [];
+        $decode = function ( $v ) {
+            if ( is_array( $v ) ) {
+                $v = implode( ', ', array_map( 'strval', $v ) );
+            }
+            return trim( html_entity_decode( wp_strip_all_tags( (string) $v ), ENT_QUOTES, 'UTF-8' ) );
+        };
+
+        $name  = trim( $decode( $meta['first-name'] ?? '' ) . ' ' . $decode( $meta['last-name'] ?? '' ) );
+        $email = $decode( $meta['email'] ?? '' );
+        if ( '' === $name ) {
+            $name = '' !== trim( (string) $att['full_name'] ) ? trim( (string) $att['full_name'] ) : $bill_name;
+        }
+        if ( '' === $email ) {
+            $email = '' !== trim( (string) $att['email'] ) ? trim( (string) $att['email'] ) : $bill_email;
+        }
+
+        $defs   = $this->tec_registration_field_defs( (int) $att['product_id'] );
+        $fields = [];
+        $labels = [];
+        foreach ( $meta as $k => $v ) {
+            if ( in_array( (string) $k, [ 'first-name', 'last-name', 'email' ], true ) || is_int( $k ) ) {
+                continue;
+            }
+            $value = $decode( $v );
+            if ( '' === $value ) {
+                continue;
+            }
+            $key            = $this->tec_registration_field_key( $k );
+            $fields[ $key ] = $value;
+            $def_key        = preg_match( '/^_[0-9a-f]{32}$/', (string) $k ) ? '__consent' : (string) $k;
+            $labels[ $key ] = $defs[ $def_key ]['label'] ?? ucwords( str_replace( [ '-', '_' ], ' ', (string) $k ) );
+            if ( ! $this->registry_frozen ) {
+                $this->register_checkout_field( $key, $labels[ $key ], $defs[ $def_key ]['type'] ?? 'text' );
+            }
+        }
+        return [ 'name' => $name, 'email' => $email, 'fields' => $fields, 'labels' => $labels ];
+    }
+
+    /**
+     * Remember a checkout field (persisted once per request at shutdown).
+     */
+    private function register_checkout_field( $key, $label, $tec_type ) {
+        if ( null === $this->field_registry ) {
+            $this->field_registry = (array) get_option( 'ekti_checkout_fields', [] );
+            add_action( 'shutdown', [ $this, 'persist_checkout_field_registry' ] );
+        }
+        foreach ( $this->field_registry as $f ) {
+            if ( ( $f['key'] ?? '' ) === $key ) {
+                return;
+            }
+        }
+        $type = in_array( $tec_type, [ 'email' ], true ) ? 'email' : ( 'telephone' === $tec_type ? 'tel' : ( 'textarea' === $tec_type || 'tec_comments' === $key ? 'textarea' : 'text' ) );
+        $this->field_registry[] = [ 'key' => $key, 'label' => sanitize_text_field( $label ), 'type' => $type ];
+        $this->field_registry_dirty = true;
+    }
+
+    /** @var array|null */
+    private $field_registry = null;
+    private $registry_frozen = false;
+    private $field_registry_dirty = false;
+
+    public function persist_checkout_field_registry() {
+        if ( ! $this->field_registry_dirty ) {
+            return;
+        }
+        // "Attendees" first, then fields in discovery order.
+        $list = array_values( array_filter( $this->field_registry, function ( $f ) {
+            return 'ekti_attendees' !== ( $f['key'] ?? '' );
+        } ) );
+        array_unshift( $list, [ 'key' => 'ekti_attendees', 'label' => 'Attendees', 'type' => 'textarea' ] );
+        update_option( 'ekti_checkout_fields', $list, false );
+        $this->field_registry_dirty = false;
+    }
+
+    /**
+     * Merge seats into the WC order's seat registry and rebuild EventKoi's
+     * checkout-field values from every seat on the order (multi-event orders
+     * accumulate across events). Caller saves the order.
+     */
+    private function apply_seat_registrations( $wc_order, $seats, $ours ) {
+        $all = $ours ? $wc_order->get_meta( '_ekti_seat_registrations' ) : [];
+        $all = is_array( $all ) ? $all : [];
+        foreach ( $seats as $attendee_id => $seat ) {
+            unset( $seat['labels'] );
+            $all[ (int) $attendee_id ] = $seat;
+        }
+        ksort( $all );
+        $wc_order->update_meta_data( '_ekti_seat_registrations', $all );
+        $wc_order->update_meta_data( '_eventkoi_checkout_fields', $this->checkout_values_from_seats( $all ) );
+    }
+
+    /**
+     * EventKoi checkout-field values for an order: "Attendees" lists every
+     * seat holder; other fields collapse to one value when all seats agree,
+     * else "Name: value; Name: value".
+     */
+    private function checkout_values_from_seats( $seats ) {
+        $values = [];
+        $people = [];
+        foreach ( $seats as $seat ) {
+            $people[] = '' !== $seat['email'] ? $seat['name'] . ' <' . $seat['email'] . '>' : $seat['name'];
+        }
+        $values['ekti_attendees'] = implode( '; ', array_values( array_unique( array_filter( $people ) ) ) );
+
+        $by_key = [];
+        foreach ( $seats as $seat ) {
+            foreach ( $seat['fields'] as $k => $v ) {
+                $by_key[ $k ][] = [ $seat['name'], $v ];
+            }
+        }
+        foreach ( $by_key as $k => $pairs ) {
+            $distinct = array_unique( array_map( function ( $p ) {
+                return $p[1];
+            }, $pairs ) );
+            $values[ $k ] = 1 === count( $distinct )
+                ? reset( $distinct )
+                : implode( '; ', array_map( function ( $p ) {
+                    return $p[0] . ': ' . $p[1];
+                }, $pairs ) );
+        }
+        return $values;
     }
 
     /**
@@ -6276,7 +6525,7 @@ final class EventKoi_Tickets_Importer {
      * events (one row group per event) append their ticket items; orders
      * EventKoi itself synced (no _ekti_wc_linked marker) are left alone.
      */
-    private function link_wc_order_meta( $wc_order, $ek_event_id, $items, &$ops ) {
+    private function link_wc_order_meta( $wc_order, $ek_event_id, $items, &$ops, $instance_ts = 0, $seats = [] ) {
         $keys = [
             '_eventkoi_event_id',
             '_eventkoi_instance_ts',
@@ -6285,6 +6534,8 @@ final class EventKoi_Tickets_Importer {
             '_eventkoi_master_checkin_code',
             '_eventkoi_synced',
             '_ekti_wc_linked',
+            '_eventkoi_checkout_fields',
+            '_ekti_seat_registrations',
         ];
 
         $ours = '1' === (string) $wc_order->get_meta( '_ekti_wc_linked' );
@@ -6331,8 +6582,11 @@ final class EventKoi_Tickets_Importer {
         // event per order); every row keeps its own event_id.
         if ( ! $ours ) {
             $wc_order->update_meta_data( '_eventkoi_event_id', (int) $ek_event_id );
-            $wc_order->update_meta_data( '_eventkoi_instance_ts', 0 );
+            $wc_order->update_meta_data( '_eventkoi_instance_ts', (int) $instance_ts );
             $wc_order->update_meta_data( '_eventkoi_event_title', get_the_title( $ek_event_id ) );
+        }
+        if ( $seats ) {
+            $this->apply_seat_registrations( $wc_order, $seats, $ours );
         }
         $wc_order->update_meta_data( '_eventkoi_ticket_items', $merged );
         $wc_order->update_meta_data( '_eventkoi_master_checkin_code', $master );
@@ -6447,7 +6701,7 @@ final class EventKoi_Tickets_Importer {
 
         $name = '' !== trim( (string) $name ) ? $name : 'Imported attendee';
 
-        $result = \EventKoi\Core\Ticket_Order_Sync::create_manual_order( (int) $event_id, (int) $ticket_id, $name, (string) $email, 1, $currency, 0 );
+        $result = \EventKoi\Core\Ticket_Order_Sync::create_manual_order( (int) $event_id, (int) $ticket_id, $name, (string) $email, 1, $currency, $this->ek_instance_ts_for_event( $event_id ) );
         if ( empty( $result['rows'] ) ) {
             return false;
         }
@@ -7267,6 +7521,8 @@ final class EventKoi_Tickets_Importer {
             'rsvp_rows'    => 0,
             'rsvp_merged'  => 0,
             'not_linked'   => 0,
+            'multi_person_orders' => 0,
+            'fields'       => [],
         ];
         $rows = [];
         foreach ( $slice as $ek_id ) {
@@ -7334,6 +7590,10 @@ final class EventKoi_Tickets_Importer {
                 $agg['woo_orders'] += $dry['orders'];
                 $agg['woo_unpaid'] += $dry['unpaid'];
                 $agg['not_linked'] += count( $attendees ) - $dry['created'] - $dry['existing'];
+                $agg['multi_person_orders'] += $dry['multi_person_orders'];
+                foreach ( $dry['registration_fields'] as $fk => $label ) {
+                    $agg['fields'][ $fk ] = $label;
+                }
                 foreach ( $dry['by_status'] as $s => $n ) {
                     $agg['by_status'][ $s ] = ( $agg['by_status'][ $s ] ?? 0 ) + $n;
                 }
@@ -7551,12 +7811,304 @@ final class EventKoi_Tickets_Importer {
         $out['checks'][]  = [ 'label' => 'Duplicate order IDs', 'value' => $dup_orders ];
         $out['checks'][]  = [ 'label' => 'Duplicate check-in tokens', 'value' => $dup_tokens ];
         $out['checks'][]  = [ 'label' => 'eventkoi_charges rows for WooCommerce', 'value' => $wc_charges ];
-        $out['ok'] = empty( $out['mismatches'] ) && 0 === $dup_orders && 0 === $dup_tokens && 0 === $wc_charges;
+        $attendees_ok = $this->verify_attendees( $done, $out );
+        $out['ok']    = empty( $out['mismatches'] ) && $attendees_ok && 0 === $dup_orders && 0 === $dup_tokens && 0 === $wc_charges;
 
         $state                   = $this->get_wizard_state();
         $state['verified'][ $stage ] = [ 'ok' => $out['ok'], 'at' => time() ];
         update_option( 'ekti_wizard_state', $state, false );
         return $out;
+    }
+
+
+    /* Step 17 — repair, field plugin, checks ---------------------------- */
+
+    /**
+     * Imported events whose attendee rows predate the Step 17 writer.
+     */
+    private function get_attendee_repair_queue() {
+        global $wpdb;
+        return array_map( 'intval', $wpdb->get_col( $wpdb->prepare(
+            "SELECT DISTINCT o.event_id FROM {$this->ek_table( 'ticket_orders' )} o
+             INNER JOIN {$wpdb->postmeta} m ON m.post_id = o.event_id AND m.meta_key = '_tec_import_source_id'
+             LEFT JOIN {$wpdb->postmeta} v ON v.post_id = o.event_id AND v.meta_key = '_ekti_attendee_v' AND v.meta_value = %s
+             WHERE v.meta_id IS NULL
+             ORDER BY o.event_id ASC",
+            self::ATTENDEE_VERSION
+        ) ) );
+    }
+
+    /**
+     * Bring one imported event's attendees up to the Step 17 writer:
+     * re-tag rows with EventKoi's instance and rebuild the WC orders' seat
+     * registrations / checkout-field values. Audited (orders stage).
+     */
+    private function repair_event_attendees( $ek_id, &$ops ) {
+        global $wpdb;
+        $table    = $this->ek_table( 'ticket_orders' );
+        $instance = $this->ek_instance_ts_for_event( $ek_id );
+        $out      = [ 'rows' => 0, 'orders' => 0 ];
+
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT id, instance_ts FROM {$table} WHERE event_id = %d AND instance_ts != %d",
+            $ek_id,
+            $instance
+        ), ARRAY_A );
+        $by_old = [];
+        foreach ( $rows as $r ) {
+            $by_old[ (int) $r['instance_ts'] ][] = (int) $r['id'];
+        }
+        foreach ( $by_old as $old => $ids ) {
+            $wpdb->query( $wpdb->prepare(
+                "UPDATE {$table} SET instance_ts = %d WHERE id IN (" . implode( ',', $ids ) . ')',
+                $instance
+            ) );
+            $ops[]       = [ 'type' => 'update_ticket_orders_instance', 'ids' => $ids, 'old' => $old ];
+            $out['rows'] += count( $ids );
+        }
+
+        $tec_id = (int) get_post_meta( $ek_id, '_tec_import_source_id', true );
+        $groups = [];
+        foreach ( $this->get_tec_attendees_for_event( $tec_id ) as $att ) {
+            $groups[ (int) $att['wc_order_id'] ][] = $att;
+        }
+        foreach ( $groups as $wc_order_id => $group ) {
+            $wc_order = $wc_order_id ? $this->get_wc_order( $wc_order_id ) : null;
+            if ( ! $wc_order || '1' !== (string) $wc_order->get_meta( '_ekti_wc_linked' ) ) {
+                continue; // Not linked by this importer — never touch it.
+            }
+            $keys = [ '_eventkoi_instance_ts', '_eventkoi_checkout_fields', '_ekti_seat_registrations' ];
+            $old  = [];
+            foreach ( $keys as $k ) {
+                $old[ $k ] = $wc_order->meta_exists( $k ) ? $wc_order->get_meta( $k ) : null;
+            }
+            $bill_name  = trim( $wc_order->get_billing_first_name() . ' ' . $wc_order->get_billing_last_name() );
+            $bill_email = (string) $wc_order->get_billing_email();
+            $seats      = [];
+            foreach ( $group as $att ) {
+                $seats[ (int) $att['ID'] ] = $this->seat_registration( $att, $bill_name, $bill_email );
+            }
+            if ( (int) $wc_order->get_meta( '_eventkoi_event_id' ) === (int) $ek_id ) {
+                $wc_order->update_meta_data( '_eventkoi_instance_ts', $instance );
+            }
+            $this->apply_seat_registrations( $wc_order, $seats, true );
+            $wc_order->save();
+            $ops[] = [ 'type' => 'wc_order_meta', 'order' => (int) $wc_order_id, 'old' => $old ];
+            ++$out['orders'];
+        }
+
+        $this->set_event_meta_audited( $ek_id, '_ekti_attendee_v', self::ATTENDEE_VERSION, $ops );
+        return $out;
+    }
+
+    /**
+     * One time-budgeted chunk of the attendee repair.
+     */
+    private function run_attendee_repair( $budget = 18 ) {
+        $queue   = $this->get_attendee_repair_queue();
+        $total   = count( $queue );
+        $done    = 0;
+        $rows    = 0;
+        $orders  = 0;
+        $started = microtime( true );
+        foreach ( $queue as $ek_id ) {
+            if ( microtime( true ) - $started > $budget ) {
+                break;
+            }
+            $ops = [];
+            try {
+                $r = $this->repair_event_attendees( $ek_id, $ops );
+            } catch ( Throwable $e ) {
+                if ( $ops ) {
+                    $this->replay_audit_ops( $ops );
+                }
+                $this->log( "Attendee repair: event {$ek_id} failed and was rolled back: " . $e->getMessage(), 'ERROR' );
+                return [ 'error' => 'Event #' . $ek_id . ': ' . $e->getMessage() ];
+            }
+            $this->audit_push_event_sync( $this->tag_ops( $ops, 'orders' ) );
+            ++$done;
+            $rows   += $r['rows'];
+            $orders += $r['orders'];
+        }
+        $remaining = count( $this->get_attendee_repair_queue() );
+        $this->log( "Attendee repair: {$done} event(s), {$rows} row(s) re-tagged, {$orders} order(s) updated — {$remaining} remaining." );
+        return [ 'processed' => $done, 'rows' => $rows, 'orders' => $orders, 'remaining' => $remaining, 'total' => $total, 'done' => 0 === $remaining ];
+    }
+
+    private function attendee_fields_plugin_path() {
+        return WPMU_PLUGIN_DIR . '/ekti-attendee-fields.php';
+    }
+
+    /**
+     * Install the tiny must-use plugin that registers the imported attendee
+     * fields with EventKoi (`eventkoi_checkout_fields`). Registration must
+     * outlive this importer, and must never reach the storefront checkout,
+     * so the filter only answers for imported events, in wp-admin page loads
+     * and EventKoi's attendee-export / order-detail REST routes.
+     */
+    private function install_attendee_fields_plugin() {
+        $fields = get_option( 'ekti_checkout_fields', [] );
+        if ( empty( $fields ) ) {
+            return new WP_Error( 'ekti_no_fields', 'No attendee fields recorded yet. Run the order matching step (or the attendee repair) first.' );
+        }
+        if ( ! is_dir( WPMU_PLUGIN_DIR ) && ! wp_mkdir_p( WPMU_PLUGIN_DIR ) ) {
+            return new WP_Error( 'ekti_no_mu_dir', 'Could not create ' . WPMU_PLUGIN_DIR . '.' );
+        }
+        $code = <<<'PHP'
+<?php
+/**
+ * Plugin Name: EventKoi — Imported TEC Attendee Fields
+ * Description: Shows the attendee details imported from The Events Calendar (seat holders, phone, ZIP, …) as EventKoi checkout fields in the admin attendee views and CSV export. Installed by EventKoi Tickets Importer; safe to delete (the stored values stay on the orders).
+ * Version: 1.0.0
+ */
+
+defined( 'ABSPATH' ) || exit;
+
+add_filter(
+	'eventkoi_checkout_fields',
+	static function ( $fields, $event_id ) {
+		$event_id = absint( $event_id );
+		if ( ! $event_id || '' === (string) get_post_meta( $event_id, '_tec_import_source_id', true ) ) {
+			return $fields;
+		}
+		// Never on the storefront checkout: admin screens and EventKoi's
+		// attendee export / order detail routes only.
+		$route   = isset( $GLOBALS['wp']->query_vars['rest_route'] ) ? untrailingslashit( (string) $GLOBALS['wp']->query_vars['rest_route'] ) : '';
+		$allowed = in_array( $route, array( '/eventkoi/v1/tickets/attendees/export', '/eventkoi/v1/tickets/orders/get' ), true );
+		if ( ! $allowed && ! ( is_admin() && ! wp_doing_ajax() ) ) {
+			return $fields;
+		}
+		foreach ( (array) get_option( 'ekti_checkout_fields', array() ) as $field ) {
+			if ( empty( $field['key'] ) ) {
+				continue;
+			}
+			$fields[] = array(
+				'key'      => (string) $field['key'],
+				'label'    => (string) ( $field['label'] ?? $field['key'] ),
+				'type'     => (string) ( $field['type'] ?? 'text' ),
+				'required' => false,
+			);
+		}
+		return $fields;
+	},
+	10,
+	2
+);
+PHP;
+        if ( false === file_put_contents( $this->attendee_fields_plugin_path(), $code, LOCK_EX ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
+            return new WP_Error( 'ekti_write_failed', 'Could not write ' . $this->attendee_fields_plugin_path() . '.' );
+        }
+        $this->log( 'Attendee fields plugin installed (' . count( $fields ) . ' field(s)).' );
+        return [ 'installed' => true, 'fields' => count( $fields ) ];
+    }
+
+    private function remove_attendee_fields_plugin() {
+        $path = $this->attendee_fields_plugin_path();
+        if ( file_exists( $path ) && false !== strpos( (string) file_get_contents( $path ), 'Installed by EventKoi Tickets Importer' ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents
+            wp_delete_file( $path );
+            $this->log( 'Attendee fields plugin removed.' );
+            return [ 'removed' => true ];
+        }
+        return [ 'removed' => false ];
+    }
+
+    private function attendee_fields_status() {
+        $fields = (array) get_option( 'ekti_checkout_fields', [] );
+        return [
+            'installed' => file_exists( $this->attendee_fields_plugin_path() ),
+            'fields'    => array_map( function ( $f ) {
+                return (string) ( $f['label'] ?? $f['key'] );
+            }, $fields ),
+            'repair'    => count( $this->get_attendee_repair_queue() ),
+        ];
+    }
+
+    /**
+     * Storefront + attendee checks for the orders verification: rows carry
+     * EventKoi's instance, EventKoi's public ticket payload counts imported
+     * sales on upcoming events, and linked orders carry seat registrations.
+     */
+    private function verify_attendees( $done, &$out ) {
+        global $wpdb;
+        $table      = $this->ek_table( 'ticket_orders' );
+        $counted    = "'complete','completed','succeeded','paid','partially_refunded'";
+        $bad_rows   = 0;
+        $upcoming   = 0;
+        $store_bad  = 0;
+        $now        = time();
+        foreach ( $done as $ek_id ) {
+            $instance = $this->ek_instance_ts_for_event( $ek_id );
+            $bad      = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE event_id = %d AND instance_ts != %d", $ek_id, $instance ) );
+            $bad_rows += $bad;
+            if ( $bad && count( $out['mismatches'] ) < 100 ) {
+                $out['mismatches'][] = [ 'id' => $ek_id, 'title' => $this->plain_title( $ek_id ), 'detail' => "{$bad} attendee row(s) not tagged with EventKoi's instance {$instance}" ];
+            }
+
+            if ( (int) get_post_meta( $ek_id, 'start_timestamp', true ) <= $now || ! class_exists( '\\EventKoi\\API\\Tickets' ) ) {
+                continue;
+            }
+            $sold = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE event_id = %d AND payment_status IN ({$counted})", $ek_id ) );
+            if ( ! $sold ) {
+                continue;
+            }
+            ++$upcoming;
+            $req = new WP_REST_Request( 'GET', '/eventkoi/v1/events/' . $ek_id . '/tickets/public' );
+            $req->set_param( 'event_id', $ek_id );
+            $res = \EventKoi\API\Tickets::get_public_tickets( $req );
+            if ( is_wp_error( $res ) ) {
+                continue;
+            }
+            $data     = $res->get_data();
+            $cap      = (int) get_post_meta( $ek_id, 'tickets_event_capacity', true );
+            $problems = [];
+            foreach ( (array) ( $data['tickets'] ?? [] ) as $t ) {
+                $rows_sold = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$table} WHERE ticket_id = %d AND payment_status IN ({$counted})", (int) $t['id'] ) );
+                if ( (int) $t['quantity_sold'] !== $rows_sold ) {
+                    $problems[] = "storefront sold {$t['quantity_sold']} ≠ {$rows_sold} for ticket #{$t['id']}";
+                }
+                if ( null !== $t['quantity_available'] ) {
+                    $expected = max( (int) $t['quantity_available'] - $rows_sold, 0 );
+                    if ( $cap > 0 ) {
+                        $expected = min( $expected, max( $cap - $sold, 0 ) );
+                    }
+                    if ( null !== $t['remaining'] && (int) $t['remaining'] !== $expected ) {
+                        $problems[] = "storefront remaining {$t['remaining']} ≠ {$expected} for ticket #{$t['id']}";
+                    }
+                }
+            }
+            if ( $problems ) {
+                ++$store_bad;
+                if ( count( $out['mismatches'] ) < 100 ) {
+                    $out['mismatches'][] = [ 'id' => $ek_id, 'title' => $this->plain_title( $ek_id ), 'detail' => implode( '; ', $problems ) ];
+                }
+            }
+        }
+        $in       = $done ? implode( ',', array_map( 'intval', $done ) ) : '0';
+        $linked   = $wpdb->get_col( "SELECT DISTINCT CAST(SUBSTRING(SUBSTRING_INDEX(order_id, ':', 1), 4) AS UNSIGNED) FROM {$table} WHERE order_id LIKE 'wc\\_%' AND event_id IN ({$in})" );
+        $missing  = 0;
+        $ids      = array_filter( array_map( 'intval', $linked ) );
+        if ( $ids ) {
+            // HPOS stores order meta in wc_orders_meta; legacy in postmeta.
+            $hpos = (bool) $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $wpdb->prefix . 'wc_orders_meta' ) )
+                && class_exists( '\\Automattic\\WooCommerce\\Utilities\\OrderUtil' )
+                && \Automattic\WooCommerce\Utilities\OrderUtil::custom_orders_table_usage_is_enabled();
+            $mt   = $hpos ? $wpdb->prefix . 'wc_orders_meta' : $wpdb->postmeta;
+            $col  = $hpos ? 'order_id' : 'post_id';
+            $pk   = $hpos ? 'id' : 'meta_id';
+            $list = implode( ',', $ids );
+            $missing = (int) $wpdb->get_var(
+                "SELECT COUNT(DISTINCT l.{$col}) FROM {$mt} l
+                 LEFT JOIN {$mt} r ON r.{$col} = l.{$col} AND r.meta_key = '_ekti_seat_registrations'
+                 WHERE l.meta_key = '_ekti_wc_linked' AND l.meta_value = '1'
+                   AND l.{$col} IN ({$list}) AND r.{$pk} IS NULL"
+            );
+        }
+        $out['checks'][] = [ 'label' => 'Attendee rows not on EventKoi\'s instance', 'value' => $bad_rows ];
+        $out['checks'][] = [ 'label' => 'Upcoming events checked on the storefront', 'value' => $upcoming . ( $store_bad ? " ({$store_bad} wrong)" : '' ) ];
+        $out['checks'][] = [ 'label' => 'Linked orders missing attendee details', 'value' => $missing ];
+        $fs = $this->attendee_fields_status();
+        $out['checks'][] = [ 'label' => 'Attendee fields plugin', 'value' => ( $fs['installed'] ? 'installed' : 'not installed' ) . ' — ' . implode( ', ', $fs['fields'] ) ];
+        return 0 === $bad_rows && 0 === $store_bad && 0 === $missing;
     }
 
     /**
@@ -7693,6 +8245,7 @@ final class EventKoi_Tickets_Importer {
             'verified'     => $state['verified'],
             'stages'       => $stages,
             'untagged_ops' => $ledger['untagged'],
+            'attendees'    => $this->attendee_fields_status(),
             'taxonomies'   => [
                 'locations'   => $this->get_taxonomy_setup_state( 'locations' ),
                 'instructors' => $this->get_taxonomy_setup_state( 'instructors' ),
@@ -8198,6 +8751,29 @@ final class EventKoi_Tickets_Importer {
         wp_send_json_success( $this->verify_stage( $stage ) );
     }
 
+    public function ajax_run_attendee_repair() {
+        $this->check_ajax();
+        $result = $this->run_attendee_repair();
+        if ( isset( $result['error'] ) ) {
+            wp_send_json_error( $result['error'] );
+        }
+        wp_send_json_success( $result );
+    }
+
+    public function ajax_attendee_fields() {
+        $this->check_ajax();
+        $op = isset( $_POST['op'] ) ? sanitize_key( $_POST['op'] ) : 'status';
+        if ( 'install' === $op ) {
+            $result = $this->install_attendee_fields_plugin();
+            if ( is_wp_error( $result ) ) {
+                wp_send_json_error( $result->get_error_message() );
+            }
+        } elseif ( 'remove' === $op ) {
+            $this->remove_attendee_fields_plugin();
+        }
+        wp_send_json_success( $this->attendee_fields_status() );
+    }
+
     public function ajax_get_log() {
         $this->check_ajax();
         $lines = 50;
@@ -8409,6 +8985,16 @@ final class EventKoi_Tickets_Importer {
                         <div class="ekti-wz-progress" id="ekti-wz-orders-progress" style="display:none;"><div class="ekti-progress-bar"><div class="ekti-progress-fill" style="width:0%"></div></div><div class="ekti-progress-text">0%</div></div>
                         <div class="ekti-wz-preview" id="ekti-wz-orders-preview-out"></div>
                         <div class="ekti-wz-verify" id="ekti-wz-orders-verify"></div>
+                        <div class="ekti-setup-card" id="ekti-wz-attendees" style="margin:10px 0;">
+                            <h5>Attendee details</h5>
+                            <p class="description">Each seat keeps the WooCommerce purchaser (as EventKoi's own checkout does). The people on each order and their registration answers from TEC (phone, ZIP, &hellip;) are stored on the order as EventKoi checkout fields. They appear in the attendee CSV export and the order details once the attendee fields plugin is installed. The plugin never adds fields to the storefront checkout.</p>
+                            <div id="ekti-wz-attendees-status" class="ekti-status"></div>
+                            <div class="ekti-actions">
+                                <button class="button" id="ekti-wz-attendees-repair">Update Existing Attendees</button>
+                                <button class="button" id="ekti-wz-attendees-install">Install Attendee Fields</button>
+                                <button class="button button-secondary" id="ekti-wz-attendees-remove" style="color:#a00;">Remove Attendee Fields</button>
+                            </div>
+                        </div>
                         <div class="ekti-actions ekti-review-actions">
                             <button class="button" id="ekti-wz-orders-check">Check Results</button>
                             <button class="button button-primary" id="ekti-wz-orders-approve" disabled>Approve Orders</button>

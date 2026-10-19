@@ -7,10 +7,13 @@ condensed version of each build step so progress and plan travel together in one
 top-level document.
 
 - **Branch:** `main`
-- **Plugin version:** 1.9.0
+- **Plugin version:** 1.10.0
 - **Last updated:** 2026-10-19
-- **Overall status:** ✅ **v1.9.0 Import Wizard shipped and QA-passed on
-  ott-dev (2026-10-19), backend and click-through UI.** The Tools page now leads with a 6-step wizard (Preflight →
+- **Overall status:** ✅ **v1.10.0 attendee fidelity shipped and QA-passed
+  on ott-dev (2026-10-19).** Imported attendees now carry EventKoi's event
+  instance, so the storefront counts imported sales. Seat holders and
+  TEC registration answers appear as EventKoi checkout fields in the
+  attendee export. Builds on the v1.9.0 Import Wizard. The Tools page now leads with a 6-step wizard (Preflight →
   Locations & Instructors → Events → Tickets → Order matching → Finish)
   with review stops after events, tickets and orders. The importer can
   now create EventKoi's Locations (Saved Locations) and Instructors
@@ -65,10 +68,17 @@ top-level document.
 | 14 | Event Sync (TEC events → EventKoi events — native-importer port, Critical-Error fix, chunked runner, adoption + undo) | ✅ Done | — |
 | 15 | Ticket data parity rewrite (native ticket/capacity model, inline WC-linked attendee import, status-aware rows, shared writer for Run Migration) | ✅ Done | — |
 | 16 | One-shot Import Wizard (staged events → tickets → orders with 3 review stops) + taxonomy provisioning from the UI | ✅ Done | — |
+| 17 | Attendee fidelity: instance-tagged rows (storefront inventory), per-seat attendee identity, TEC registration fields | ✅ Done | — |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
+
+**Step 17 done (2026-10-19, v1.10.0, option B2):** dev is fully
+imported with the v1.10 writer: orders stage re-run, all checks pass,
+and the attendee fields mu-plugin is installed. For production, run the
+wizard as-is; for a site imported with v1.8–v1.9, use "Update Existing
+Attendees" in the Order matching step, then "Install Attendee Fields".
 
 **Step 16 (2026-10-19):** dev is left in the fully imported state from
 the UI wizard run (all 5 steps approved): 658 events, 688 tickets, 2,306
@@ -1341,6 +1351,195 @@ Run end to end from a clean baseline by clicking the wizard. Native
   /locations/austin/" notice after an undo deletes a location term.
   Notice only, no redirect created.
 
+### Step 17 — Attendee fidelity (v1.10.0) ✅
+
+**Why:** EventKoi has no separate attendee table. Its attendees are the
+per-seat `wp_eventkoi_ticket_orders` rows our orders stage writes. The
+investigation on ott-dev (2026-10-19, against the v1.9.0 import) found
+that the admin Attendees tab works, but three things are wrong or
+missing.
+
+**What works (verified):**
+- `/tickets/orders` (admin Attendees tab, Sales history, CSV export)
+  returns the imported orders with per-seat check-in codes and
+  check-in-eligible quantities. Example: event 54634 → 4 orders.
+- The admin tab only passes `instance_ts` for **recurring** events, and
+  dev has 0 recurring events, so nothing is hidden today.
+- QR check-in reads a row's `customer_name` / `customer_email` /
+  `checkin_token`. Imported tokens are unique, and rows with ineligible
+  statuses (refunded, failed) are not check-in eligible.
+- The only TEC check-in is on a deleted event (orphan, correctly
+  skipped).
+
+**Finding 1 — storefront inventory ignores imported sales (bug,
+oversell risk).**
+- Imported rows have `instance_ts = 0`.
+- For `date_type = standard`, `standard_type = selected` (644 of 658
+  imported events), EventKoi's `resolve_checkout_instance_ts()` resolves
+  the event day's start timestamp. `get_public_tickets()` then counts
+  only rows tagged with that instance (`get_remote_ticket_sales()`,
+  `get_event_committed_quantity()`), so our sold seats count as 0.
+- Measured on event 54634 (Spooky Bookstore Cookies): the public payload
+  shows `quantity_sold: 0` (actually 4). Remaining stayed at 11 only
+  because the shared event cap clamped it. The event cap itself also
+  reads 0 committed, so it allows 11 instead of TEC's 7.
+- Exposure on dev: **41 upcoming events / 126 sold seats**, 543 events
+  with a shared event cap.
+- EventKoi's own WC checkout stamps the resolved instance on every row
+  and on `_eventkoi_instance_ts`. RSVP rows already use
+  `start_timestamp`, and `start_timestamp` == `event_days[0].start_date`
+  on all 658 events.
+
+**Finding 2 — per-seat attendee identity is lost.**
+- `_tribe_tickets_full_name` / `_tribe_tickets_email` hold the
+  **purchaser** for WooCommerce tickets. The actual attendee is in
+  Event Tickets Plus' `_tribe_tickets_meta` (`first-name`, `last-name`,
+  `email`).
+- 2,240 of 2,306 imported attendees have meta names, and 1,163 differ
+  from the purchaser. **454 multi-seat orders** list different people per
+  seat in TEC, but every EventKoi row carries the purchaser's name.
+- EventKoi's own checkout also writes the buyer on every seat, so it has
+  no native per-seat identity. QR check-in shows the row's name.
+
+**Finding 3 — TEC registration answers are not carried.**
+- `_tribe_tickets_meta` also holds phone, ZIP / postcode, "Have you
+  taken a class with us before?", consent, and comments (687).
+- EventKoi only surfaces extra data as **checkout fields**: defined in
+  code through the `eventkoi_checkout_fields` filter, with values in WC
+  order meta `_eventkoi_checkout_fields` (order-level). The CSV export
+  adds one column per field.
+- No such field is registered on dev; `eventkoi_fields` only holds our
+  "Event website" event field.
+
+**Plan:**
+
+- **A. Instance tagging (required, fixes Finding 1).**
+  - New `ek_instance_ts_for_event( $ek_id )` mirrors EventKoi's
+    resolution for import-time data:
+    - recurring → the occurrence matching the TEC attendee's event start
+      (none on dev; review item if unmatched);
+    - standard + `selected` → that day's `start_date` timestamp. With
+      several selected days, match the TEC occurrence date, and fall
+      back to the first day plus a review item;
+    - `continuous` and anything else → 0.
+  - Use it in `link_woo_attendees()` (row `instance_ts` and
+    `_eventkoi_instance_ts` WC meta), TC `create_manual_order( …,
+    $instance_ts )`, and RSVP (same value).
+  - **Repair for existing imports:** a "Re-tag attendee instances" action
+    (Advanced tools + an automatic check in the orders verify). It
+    updates `instance_ts` on importer-written rows (`wc_` keys flagged
+    `_ekti_wc_linked`, plus our manual orders), with a new audited op
+    `update_ticket_orders_instance` (ids + old value). It also updates
+    `_eventkoi_instance_ts` through the existing `wc_order_meta` op.
+  - Orders verify gains a **storefront check**: per upcoming ticket,
+    `get_public_tickets()` `quantity_sold` / `remaining` == expected,
+    and the event cap remaining == TEC global level − paid.
+- **B. Per-seat attendee identity (Finding 2) — decided: B2 (user,
+  2026-10-19).**
+  - **B1 (recommended):** each seat row gets its own attendee name and
+    email from `_tribe_tickets_meta` (fallback: purchaser → billing).
+    Staff see the right person at QR check-in.
+    Trade-off: EventKoi labels an order with whichever seat row comes
+    first, so a multi-seat order may show a seat holder rather than the
+    buyer. Mitigation: write the purchaser seat first and keep the
+    buyer on the WC order and in the export.
+  - **B2:** keep the purchaser on every row (EventKoi parity) and list
+    the seat holders in an "Attendees" checkout field (see C). The
+    order list stays buyer-centric; the door list shows the buyer.
+- **C. Registration answers (Finding 3).**
+  - Register EventKoi checkout fields for the TEC attendee-meta keys
+    actually present (discovered dynamically: phone, ZIP, "taken a class
+    before", comments; consent kept as a checkbox), plus "Attendees"
+    under B2.
+  - Write `_eventkoi_checkout_fields` on each linked WC order
+    (multi-seat values joined per seat), audited via `wc_order_meta`.
+  - Field registration must outlive the importer, so the wizard
+    installs a tiny **mu-plugin** (`ekti-checkout-fields.php`, field
+    list stored in an option). The install is audited and undo removes
+    it.
+  - Report-only: the count of attendees whose meta email differs from
+    the purchaser (reminder/confirmation emails go to the row email).
+- **D. Wizard / UI.**
+  - The orders preview shows per-seat names and which registration
+    fields will be carried.
+  - The orders verify adds the storefront and instance checks.
+  - The Finish step offers "Install attendee fields".
+- **E. QA on ott-dev.**
+  - Run the repair on the current import, then confirm event 54634's
+    public payload shows sold 4 / remaining 11 / event cap 7, and all
+    41 upcoming events match TEC.
+  - Run the orders undo + re-run to prove the new writer tags instances
+    at import time.
+  - Check 3 multi-seat orders: per-seat names (B1) or the Attendees field
+    (B2) in the admin tab and the CSV export.
+  - Do a QR check-in on a test token, then undo it.
+  - Confirm idempotency.
+
+
+#### As built (v1.10.0)
+
+- `ek_instance_ts_for_event()`: standard + selected → `event_days[0]`
+  start; everything else → 0 (recurring: none on the data). Used by
+  `link_woo_attendees()` (rows and `_eventkoi_instance_ts`) and TC
+  `create_manual_order()`. RSVP already used `start_timestamp`, which
+  is equal.
+- B2: rows keep the purchaser. `seat_registration()` reads ET+
+  `_tribe_tickets_meta` (name/email → "Attendees"; other answers
+  → `tec_*` keys, labelled from the product's ET+ field definitions;
+  the md5-keyed consent checkbox → `tec_consent`).
+  `apply_seat_registrations()` keeps a per-order seat registry
+  (`_ekti_seat_registrations`) and rebuilds `_eventkoi_checkout_fields`:
+  values shared by every seat collapse to one value, otherwise
+  "Name: value; …". Multi-event orders accumulate. Both keys are audited
+  in `wc_order_meta`.
+- Field registry option `ekti_checkout_fields` (Attendees first),
+  persisted at shutdown, frozen during dry runs.
+- Repair: `run_attendee_repair()` / `repair_event_attendees()` for events
+  without `_ekti_attendee_v = 17`. It re-tags `instance_ts` (new op
+  `update_ticket_orders_instance`) and rebuilds seat registrations on
+  `_ekti_wc_linked` orders. Ops are tagged `orders`, so "Undo Orders"
+  reverts it. New orders-stage runs set the marker themselves.
+- mu-plugin `ekti-attendee-fields.php` (install / remove from the wizard;
+  "Undo Entire Import" removes it). Its `eventkoi_checkout_fields` filter
+  answers only for events with `_tec_import_source_id`, and only in
+  wp-admin page loads or on the `/tickets/attendees/export` and
+  `/tickets/orders/get` routes, so the storefront checkout never shows
+  these fields.
+- Orders verify adds: rows off EventKoi's instance; per upcoming event,
+  EventKoi's own `get_public_tickets()` sold/remaining vs imported rows
+  and the event cap; linked orders without seat registrations (HPOS-aware
+  SQL); plugin status. The orders preview shows multi-person orders and
+  the fields that will be carried.
+
+#### Dev QA results (2026-10-19, importer v1.10.0)
+
+- **Before (v1.9 import, new checks):** 2,273 rows off-instance, 41/41
+  upcoming events wrong on the storefront, 1,594 orders missing details.
+  Repair queue: 421 events.
+- **Repair through the UI** ("Update Existing Attendees", about 4 min,
+  0 errors): 0 off-instance, 41 storefront events correct, 0 missing;
+  fields recorded: Attendees, Phone, Zip/Post Code, "Have you taken a
+  class with us before?", Consent, Comments. Fields plugin installed
+  through the UI.
+- **Storefront:** event 54634 public payload is now sold 4 / remaining 7
+  (TEC: 11 global level − 4 sold); before it was sold 0.
+- **Export / checkout:** EventKoi's attendee CSV gained the 6 columns.
+  Example order 46808 (2 seats, purchaser Daniela Daniel on both rows):
+  Attendees "Daniela Daniel …; Jason Daniel …", Phone per person,
+  shared ZIP/answers collapsed. `get_checkout_fields()` outside the
+  allowed contexts (storefront) returns []. 458 orders list more than
+  one person.
+- **Import-time writer:** orders undo (9,507 ops incl. the repair)
+  → exact post-tickets state (9,230 available, 0 rows / seat meta /
+  markers / flags). The orders re-run then produced 2,306 rows / 2,088
+  sold / 1,594 orders, every attendee check passing with an empty repair
+  queue. Orders re-approved.
+- **Check-in:** EventKoi `update_ticket_checkin` (`checked_in` = check in
+  all; `check_in` = reset) checked in 2/2 seats on wc_46808; a fully
+  refunded order (wc_44872) had 0 eligible; reverted to 0 check-ins.
+- **Dry run:** the preview for event 54059 reported 7 multi-person orders
+  and 5 labelled fields, with 0 writes and an untouched registry.
+
 ---
 
 ## Admin UI ✅
@@ -1638,6 +1837,17 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
   35 unusable events). Location/instructor term assignments from
   v1.5.0 went with the pre-cleanup event population (0 assignments
   today) — re-run Taxonomy Sync after Event Sync to repopulate.
+
+- 2026-10-19: **Step 17 — B2 chosen (user).** Rows keep the WooCommerce
+  purchaser because EventKoi's own checkout does, and its order list and
+  emails key off the row name. Seat holders and registration answers go
+  to EventKoi's only extensibility point for buyer data, the
+  `eventkoi_checkout_fields` filter + `_eventkoi_checkout_fields` order
+  meta. The filter must outlive the importer and must not alter the
+  storefront checkout, hence a context-gated mu-plugin. The instance
+  value is computed from event meta rather than EventKoi's private
+  `resolve_checkout_instance_ts()`; the storefront check verifies the
+  two agree on every upcoming event.
 
 - 2026-10-19: **Step 16 — wizard + taxonomy provisioning.** Provisioning
   goes through EventKoi's public statics (`Taxonomies::save()`,
