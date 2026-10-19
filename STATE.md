@@ -1997,6 +1997,14 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
   uses GPL-3.0-or-later; this project deliberately chose GPL-2.0-or-later for
   broader compatibility with The Events Calendar's own GPL-2.0 licensing.
 
+- 2026-10-19: **Repo cleanup.** Removed the single-pass Event Sync QA
+  loop (`run-sync-chunk.py`, `run-sync-loop.sh`, local
+  `qa-sync-run.log`), the August screenshots of the pre-wizard panels and
+  a committed `__pycache__` file; `.gitignore` now covers `__pycache__/`,
+  `*.pyc` and `.DS_Store`. `ott-dev.py` and `fetch_ek_source.py` stay as
+  the dev QA tools (note: `ott-dev.py`'s stored app password returned 401
+  on 2026-10-19; QA used the Novamira MCP connection instead).
+
 ---
 
 ## Open questions / blockers
