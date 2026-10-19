@@ -7,10 +7,15 @@ condensed version of each build step so progress and plan travel together in one
 top-level document.
 
 - **Branch:** `main`
-- **Plugin version:** 1.10.0
+- **Plugin version:** 1.11.0
 - **Last updated:** 2026-10-19
-- **Overall status:** ✅ **v1.10.0 attendee fidelity shipped and QA-passed
-  on ott-dev (2026-10-19).** Imported attendees now carry EventKoi's event
+- **Overall status:** ✅ **v1.11.0 EventKoi setup shipped and QA-passed on
+  ott-dev (2026-10-19).** Preflight now detects TEC's WooCommerce ticket
+  sales and sets EventKoi's ticket checkout method to WooCommerce, and it
+  saves the calendar defaults from EventKoi's onboarding wizard (without
+  its demo event). This fixes EventKoi's events list showing "0 tickets"
+  for imported sales. See Step 18. Before that: **v1.10.0 attendee fidelity
+  (2026-10-19).** Imported attendees now carry EventKoi's event
   instance, so the storefront counts imported sales. Seat holders and
   TEC registration answers appear as EventKoi checkout fields in the
   attendee export. Builds on the v1.9.0 Import Wizard. The Tools page now leads with a 6-step wizard (Preflight →
@@ -69,10 +74,21 @@ top-level document.
 | 15 | Ticket data parity rewrite (native ticket/capacity model, inline WC-linked attendee import, status-aware rows, shared writer for Run Migration) | ✅ Done | — |
 | 16 | One-shot Import Wizard (staged events → tickets → orders with 3 review stops) + taxonomy provisioning from the UI | ✅ Done | — |
 | 17 | Attendee fidelity: instance-tagged rows (storefront inventory), per-seat attendee identity, TEC registration fields | ✅ Done | — |
+| 18 | EventKoi setup in Preflight: WooCommerce checkout method from TEC sales, onboarding calendar defaults (no demo data), stage guard, events-list count check | ✅ Done | — |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
+
+**Step 18 done (2026-10-19, v1.11.0):** ott-dev's EventKoi checkout
+method is now WooCommerce and the events list shows imported sales
+(event 54644: 1 sold; 328/328 events match). Open items:
+
+1. **UI click-through of step 1 not done.** The built-in browser needed a
+   WordPress sign-in. Run Checks, review the EventKoi setup form, click
+   Save Setup and Undo EventKoi Setup once from the Tools page.
+2. **Production:** run Preflight first; approving step 1 saves the setup
+   before any tickets or orders are imported.
 
 **Step 17 done (2026-10-19, v1.10.0, option B2):** dev is fully
 imported with the v1.10 writer: orders stage re-run, all checks pass,
@@ -1540,6 +1556,90 @@ oversell risk).**
 - **Dry run:** the preview for event 54059 reported 7 multi-person orders
   and 5 labelled fields, with 0 writes and an untouched registry.
 
+### Step 18 — EventKoi setup in Preflight (v1.11.0) ✅
+
+**Problem (reported 2026-10-19).** EventKoi's events list showed
+"0 tickets" for every imported event (e.g. 54644 "Vintage Halloween
+Cookies", 1 sold). The import was correct: the row is a `wc_` order,
+USD, `complete`.
+
+- `Events::get_events()` (class-events.php ~2060) counts sold seats only
+  for the current checkout gateway and currency:
+  `ticket_checkout_method = woocommerce` → `order_id LIKE 'wc\_%'`,
+  anything else (default `stripe`) → `NOT LIKE 'wc\_%'`.
+- `ticket_checkout_method` was never set on ott-dev, so all 2,088 sold
+  WC rows in 328 events were excluded. EventKoi's WooCommerce checkout
+  was also off (`WooCommerce_Checkout::is_active()` false).
+- Earlier suspicion that attendees went into RSVP was wrong: the 6 RSVP
+  events are TEC RSVP-only (free) events, and RSVP mode is correct for
+  them (user decision).
+
+**EventKoi onboarding wizard** (`#/dashboard/onboarding`, React): license
+key → calendar defaults (`week_starts_on` 0 = Monday … 6 = Sunday,
+`working_days`, `time_format` `12`/`24`, plus a timezone / date format
+reminder) → Elementor templates (only when Elementor is active) → demo
+event "Classical Concert in the Park" + plugin tour. Completion sets
+`eventkoi_quick_start_completed = yes` and deletes
+`eventkoi_show_quick_start_prompt`.
+
+#### As built (v1.11.0)
+
+- **Preflight** (step 1 is now "Preflight & EventKoi setup") adds rows:
+  TEC ticket sales (Woo attendees / orders / products, TC attendees),
+  EventKoi checkout method, checkout currency, non-WooCommerce imported
+  sales (warn), EventKoi license (status only, the key is never read),
+  EventKoi demo event (warn if `eventkoi_demo_event_id` exists).
+  `preflight()` also returns `setup` (`ek_setup_proposal()`).
+- **Setup form** (JS `renderEkSetupForm`): checkout method (WooCommerce
+  pre-selected when TEC has Woo sales, "Leave as …" otherwise offered),
+  week start (pre-filled from WP `start_of_week`, converted), working
+  days (Mon–Fri), time format (from WP `time_format`), timezone / date
+  format read-only with a General Settings link, Elementor note (link to
+  EventKoi settings) only when Elementor is active.
+- **Saving:** "Approve & Continue" posts the form with the approval;
+  "Save Setup" saves it at any time. `apply_ek_setup()` validates, writes
+  the 4 keys through `Settings::set()`, marks the quick start done, and
+  records each key's prior value (or absence) in `ekti_ek_setup_audit`
+  (first write only). `undo_ek_setup()` restores per key, deletes
+  `eventkoi_settings` if it did not exist before, and restores the
+  quick-start options. "Undo Entire Import" also undoes the setup.
+- **Cache flush:** EventKoi clears its events-list cache only on
+  `update_option_eventkoi_settings`. Creating or deleting the option does
+  not fire it, so the list kept showing 0 after the first save.
+  `flush_ek_event_caches()` calls `Hooks::clear_event_query_cache()` and
+  `bump_events_cache_version()` after every save and undo.
+- **Guard:** `checkout_method_guard()` blocks approving step 1, running
+  or approving the tickets / orders stages while TEC has WooCommerce
+  sales and EventKoi's method is not WooCommerce. The UI disables those
+  buttons and shows the reason.
+- **Verify:** Order matching gains "Events list sold counts" —
+  `verify_dashboard_counts()` reruns EventKoi's gateway + currency rule
+  per event and compares it with all sold rows imported; mismatches fail
+  the check.
+- **Not included:** demo event, plugin tour, license entry, writing
+  EventKoi's Elementor template choice.
+
+#### QA (ott-dev, 2026-10-19, EventKoi v1.4.7.0)
+
+- **Deploy:** zip via `novamira/create-upload-link` + `wp plugin install
+  --force --activate`, opcache invalidated, server md5 == local build,
+  upload removed.
+- **Before:** Preflight warns "checkout method not set"; guard active;
+  Order matching fails with "0 / 328 events match"; EventKoi
+  `get_events()` page 8 (start date desc, 10 per page) = the user's
+  screenshot, all 0 sold.
+- **Save:** method `woocommerce`, week start Monday, Mon–Fri, 12-hour.
+  `WooCommerce_Checkout::is_active()` true; `get_events()` page 8 now
+  2 / 0 / 1 / 0 / 3 / 1 / 4 / 4 / 2 / 1 sold (54644 = 1); guard clear.
+- **Undo:** `eventkoi_settings` deleted again (it did not exist before),
+  audit removed, list back to 0, guard active. **Save again:** list
+  correct with no manual cache clear. **Third save:** no changes.
+- **Validation:** empty working days, time format 13 and method
+  "paypal" are refused with no writes.
+- **Order matching:** passes — 328 / 328 events match, plus the Step 17
+  checks (0 off-instance, 41 storefront events correct, 0 missing).
+- **UI:** not clicked through (browser sign-in needed).
+
 ---
 
 ## Admin UI ✅
@@ -1897,6 +1997,10 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
 ---
 
 ## Open questions / blockers
+
+- **Elementor template choice** (Step 18): EventKoi's onboarding writes
+  it through `api/class-elementor-templates.php`; the importer only links
+  to EventKoi settings. Implement if a target site runs Elementor.
 
 - **Uninstall cleanup:** no `uninstall.php` exists. The plugin creates several
   options (`ekti_event_mapping`, `ekti_migration_state`, `_ekti_tec_product_*`)

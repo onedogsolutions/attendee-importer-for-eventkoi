@@ -3,7 +3,7 @@
  * Plugin Name: EventKoi Tickets Importer
  * Plugin URI:  https://onedog.solutions
  * Description: Migrates tickets and attendees from The Events Calendar (Event Tickets / Event Tickets Plus) to EventKoi.
- * Version:     1.10.0
+ * Version:     1.11.0
  * Author:      One Dog Solutions
  * Author URI:  https://onedog.solutions
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'EKTI_VERSION', '1.10.0' );
+define( 'EKTI_VERSION', '1.11.0' );
 define( 'EKTI_LOG_DIR', WP_CONTENT_DIR . '/uploads' );
 define( 'EKTI_LOG_FILE', EKTI_LOG_DIR . '/eventkoi-import.log' );
 define( 'EKTI_BATCH_SIZE', 30 );
@@ -88,6 +88,7 @@ final class EventKoi_Tickets_Importer {
         add_action( 'wp_ajax_ekti_wizard_state', [ $this, 'ajax_wizard_state' ] );
         add_action( 'wp_ajax_ekti_wizard_approve', [ $this, 'ajax_wizard_approve' ] );
         add_action( 'wp_ajax_ekti_preflight', [ $this, 'ajax_preflight' ] );
+        add_action( 'wp_ajax_ekti_ek_setup', [ $this, 'ajax_ek_setup' ] );
         add_action( 'wp_ajax_ekti_provision_taxonomy', [ $this, 'ajax_provision_taxonomy' ] );
         add_action( 'wp_ajax_ekti_undo_taxonomy_provision', [ $this, 'ajax_undo_taxonomy_provision' ] );
         add_action( 'wp_ajax_ekti_run_event_stage', [ $this, 'ajax_run_event_stage' ] );
@@ -7811,8 +7812,9 @@ final class EventKoi_Tickets_Importer {
         $out['checks'][]  = [ 'label' => 'Duplicate order IDs', 'value' => $dup_orders ];
         $out['checks'][]  = [ 'label' => 'Duplicate check-in tokens', 'value' => $dup_tokens ];
         $out['checks'][]  = [ 'label' => 'eventkoi_charges rows for WooCommerce', 'value' => $wc_charges ];
+        $dashboard_ok = $this->verify_dashboard_counts( $done, $out );
         $attendees_ok = $this->verify_attendees( $done, $out );
-        $out['ok']    = empty( $out['mismatches'] ) && $attendees_ok && 0 === $dup_orders && 0 === $dup_tokens && 0 === $wc_charges;
+        $out['ok']    = empty( $out['mismatches'] ) && $dashboard_ok && $attendees_ok && 0 === $dup_orders && 0 === $dup_tokens && 0 === $wc_charges;
 
         $state                   = $this->get_wizard_state();
         $state['verified'][ $stage ] = [ 'ok' => $out['ok'], 'at' => time() ];
@@ -7820,6 +7822,59 @@ final class EventKoi_Tickets_Importer {
         return $out;
     }
 
+
+    /**
+     * Step 18: EventKoi's events list counts sold seats only for the
+     * current checkout gateway and currency (Events::get_events(),
+     * "RSVPs/Tickets" column). Re-run that rule per imported event and
+     * compare it with every sold row imported, so a checkout-method
+     * mismatch shows up here instead of as "0 tickets" in the dashboard.
+     */
+    private function verify_dashboard_counts( $done, &$out ) {
+        global $wpdb;
+        if ( empty( $done ) || ! class_exists( '\\EventKoi\\Core\\Settings' ) ) {
+            return true;
+        }
+        $settings = \EventKoi\Core\Settings::get();
+        $method   = $settings['ticket_checkout_method'] ?? 'stripe';
+        $currency = ( 'woocommerce' === $method && function_exists( 'get_woocommerce_currency' ) )
+            ? strtoupper( get_woocommerce_currency() )
+            : strtoupper( (string) ( $settings['currency'] ?? '' ) );
+        $gateway  = 'woocommerce' === $method ? "order_id LIKE 'wc\\_%'" : "order_id NOT LIKE 'wc\\_%'";
+        $cur_sql  = '' !== $currency ? $wpdb->prepare( ' AND UPPER(currency) = %s', $currency ) : '';
+        $counted  = "payment_status IN ('complete','completed','succeeded','paid','partially_refunded')";
+        $in       = implode( ',', array_map( 'intval', $done ) );
+
+        $shown = [];
+        foreach ( $wpdb->get_results( "SELECT event_id, SUM(quantity) AS n FROM {$this->ek_table( 'ticket_orders' )} WHERE event_id IN ({$in}) AND {$counted} AND {$gateway}{$cur_sql} GROUP BY event_id", ARRAY_A ) as $r ) {
+            $shown[ (int) $r['event_id'] ] = (int) $r['n'];
+        }
+        $sold = [];
+        foreach ( $wpdb->get_results( "SELECT event_id, SUM(quantity) AS n FROM {$this->ek_table( 'ticket_orders' )} WHERE event_id IN ({$in}) AND {$counted} GROUP BY event_id", ARRAY_A ) as $r ) {
+            $sold[ (int) $r['event_id'] ] = (int) $r['n'];
+        }
+
+        $bad = 0;
+        foreach ( $sold as $ek_id => $n ) {
+            $listed = $shown[ $ek_id ] ?? 0;
+            if ( $listed === $n ) {
+                continue;
+            }
+            ++$bad;
+            if ( count( $out['mismatches'] ) < 100 ) {
+                $out['mismatches'][] = [
+                    'id'     => $ek_id,
+                    'title'  => $this->plain_title( $ek_id ),
+                    'detail' => "EventKoi's events list shows {$listed} sold; {$n} sold seat(s) imported",
+                ];
+            }
+        }
+        $out['checks'][] = [
+            'label' => 'Events list sold counts (checkout: ' . ( $settings['ticket_checkout_method'] ?? 'not set' ) . ')',
+            'value' => ( count( $sold ) - $bad ) . ' / ' . count( $sold ) . ' events match',
+        ];
+        return 0 === $bad;
+    }
 
     /* Step 17 — repair, field plugin, checks ---------------------------- */
 
@@ -8181,10 +8236,364 @@ PHP;
         $log_dir = dirname( EKTI_LOG_FILE );
         $add( 'Import log', is_writable( $log_dir ) ? 'ok' : 'warn', is_writable( $log_dir ) ? EKTI_LOG_FILE : 'Upload directory is not writable — the log file will not be written.' );
 
+        // Step 18: ticket sales source, checkout method and EventKoi setup.
+        $setup = $ek_active ? $this->ek_setup_proposal() : null;
+        if ( $setup ) {
+            foreach ( $this->ek_setup_checks( $setup ) as $c ) {
+                $add( $c['label'], $c['status'], $c['detail'] );
+            }
+        }
+
         $fail = count( array_filter( $checks, function ( $c ) {
             return 'fail' === $c['status'];
         } ) );
-        return [ 'checks' => $checks, 'ok' => 0 === $fail ];
+        return [ 'checks' => $checks, 'ok' => 0 === $fail, 'setup' => $setup ];
+    }
+
+    /* Step 18 — EventKoi setup ------------------------------------------
+     *
+     * EventKoi's onboarding wizard minus its sample data: the ticket
+     * checkout method (set to WooCommerce when TEC sold through
+     * WooCommerce), calendar defaults (week start, working days, time
+     * format) and the quick-start flag. The demo event and plugin tour are
+     * skipped; the license is reported, never read or written. Every
+     * setting written is recorded per key in ekti_ek_setup_audit so
+     * "Undo EventKoi Setup" restores exactly what was there.
+     * ------------------------------------------------------------------ */
+
+    /** EventKoi settings keys the setup step writes. */
+    private $ek_setup_keys = [ 'ticket_checkout_method', 'week_starts_on', 'working_days', 'time_format' ];
+
+    /**
+     * Where TEC's ticket sales came from (published attendee posts).
+     */
+    private function tec_sales_profile() {
+        static $profile = null;
+        if ( null !== $profile ) {
+            return $profile;
+        }
+        global $wpdb;
+        $profile = [
+            'woo_products'  => (int) $wpdb->get_var( "SELECT COUNT(DISTINCT post_id) FROM {$wpdb->postmeta} WHERE meta_key = '_tribe_wooticket_for_event'" ),
+            'woo_attendees' => (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM {$wpdb->posts} p
+                 INNER JOIN {$wpdb->postmeta} o ON o.post_id = p.ID AND o.meta_key = '_tribe_wooticket_order' AND o.meta_value != ''
+                 WHERE p.post_type = 'tribe_wooticket' AND p.post_status = 'publish'"
+            ),
+            'woo_orders'    => (int) $wpdb->get_var(
+                "SELECT COUNT(DISTINCT o.meta_value) FROM {$wpdb->posts} p
+                 INNER JOIN {$wpdb->postmeta} o ON o.post_id = p.ID AND o.meta_key = '_tribe_wooticket_order' AND o.meta_value != ''
+                 WHERE p.post_type = 'tribe_wooticket' AND p.post_status = 'publish'"
+            ),
+            'tc_attendees'  => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'tec_tc_attendee' AND post_status = 'publish'" ),
+        ];
+        $profile['woo_detected'] = $profile['woo_attendees'] > 0 && $this->wc_is_available();
+        return $profile;
+    }
+
+    /** EventKoi's stored ticket checkout method ('' when never chosen). */
+    private function ek_checkout_method() {
+        $settings = class_exists( '\\EventKoi\\Core\\Settings' ) ? \EventKoi\Core\Settings::get() : [];
+        return (string) ( $settings['ticket_checkout_method'] ?? '' );
+    }
+
+    /**
+     * Blocks the tickets / orders stages while TEC sold through
+     * WooCommerce but EventKoi's checkout is something else: EventKoi's
+     * event list and checkout would then ignore the imported orders.
+     */
+    private function checkout_method_guard() {
+        if ( $this->tec_sales_profile()['woo_detected'] && 'woocommerce' !== $this->ek_checkout_method() ) {
+            return 'EventKoi\'s ticket checkout method is not WooCommerce, but TEC sold its tickets through WooCommerce. Save the EventKoi setup in step 1 first.';
+        }
+        return '';
+    }
+
+    /**
+     * Current values plus what the setup form proposes. Unset calendar
+     * defaults are pre-filled from the WordPress settings TEC also uses.
+     */
+    private function ek_setup_proposal() {
+        $raw      = get_option( 'eventkoi_settings', [] );
+        $raw      = is_array( $raw ) ? $raw : [];
+        $profile  = $this->tec_sales_profile();
+        $current  = $this->ek_checkout_method();
+
+        // WordPress: 0 = Sunday … 6 = Saturday. EventKoi: 0 = Monday … 6 = Sunday.
+        $wp_week = ( (int) get_option( 'start_of_week', 1 ) + 6 ) % 7;
+        $wp_time = preg_match( '/[aAgh]/', (string) get_option( 'time_format', 'g:i a' ) ) ? '12' : '24';
+
+        $demo_id   = (int) get_option( 'eventkoi_demo_event_id', 0 );
+        $demo_post = $demo_id ? get_post( $demo_id ) : null;
+
+        return [
+            'sales'          => $profile,
+            'method'         => [
+                'current'  => $current,
+                'proposed' => $profile['woo_detected'] ? 'woocommerce' : $current,
+            ],
+            'week_starts_on' => [
+                'current'  => isset( $raw['week_starts_on'] ) ? (int) $raw['week_starts_on'] : null,
+                'proposed' => isset( $raw['week_starts_on'] ) ? (int) $raw['week_starts_on'] : $wp_week,
+            ],
+            'working_days'   => [
+                'current'  => isset( $raw['working_days'] ) && is_array( $raw['working_days'] ) ? array_map( 'intval', $raw['working_days'] ) : null,
+                'proposed' => isset( $raw['working_days'] ) && is_array( $raw['working_days'] ) ? array_map( 'intval', $raw['working_days'] ) : [ 0, 1, 2, 3, 4 ],
+            ],
+            'time_format'    => [
+                'current'  => isset( $raw['time_format'] ) ? (string) $raw['time_format'] : null,
+                'proposed' => isset( $raw['time_format'] ) && in_array( (string) $raw['time_format'], [ '12', '24' ], true ) ? (string) $raw['time_format'] : $wp_time,
+            ],
+            'timezone'       => wp_timezone_string(),
+            'date_format'    => (string) get_option( 'date_format' ),
+            'general_url'    => admin_url( 'options-general.php' ),
+            'ek_settings_url' => admin_url( 'admin.php?page=eventkoi#/settings' ),
+            'elementor'      => defined( 'ELEMENTOR_VERSION' ),
+            'currency'       => [
+                'eventkoi' => strtoupper( (string) ( \EventKoi\Core\Settings::get()['currency'] ?? '' ) ),
+                'woo'      => $this->es_woo_currency_code(),
+            ],
+            'license'        => [
+                'status'  => (string) get_option( 'eventkoi_license_status', '' ),
+                'expires' => (string) get_option( 'eventkoi_license_expires', '' ),
+            ],
+            'demo_event'     => $demo_post && 'eventkoi_event' === $demo_post->post_type && 'trash' !== $demo_post->post_status
+                ? [ 'id' => $demo_id, 'title' => $this->plain_title( $demo_id ), 'status' => $demo_post->post_status ]
+                : null,
+            'quick_start_done' => 'yes' === get_option( 'eventkoi_quick_start_completed', '' ),
+            'applied'        => ! empty( get_option( 'ekti_ek_setup_audit', [] ) ),
+        ];
+    }
+
+    /**
+     * Preflight rows for the setup proposal.
+     */
+    private function ek_setup_checks( $setup ) {
+        global $wpdb;
+        $rows   = [];
+        $s      = $setup['sales'];
+        $labels = [ 'woocommerce' => 'WooCommerce', 'stripe' => 'Stripe', 'surecart' => 'SureCart', '' => 'not set' ];
+        $name   = function ( $m ) use ( $labels ) {
+            return $labels[ $m ] ?? $m;
+        };
+
+        $rows[] = [
+            'label'  => 'TEC ticket sales',
+            'status' => 'ok',
+            'detail' => sprintf(
+                'WooCommerce: %s attendee(s) in %s order(s) across %s ticket product(s). Tickets Commerce: %s attendee(s).',
+                number_format_i18n( $s['woo_attendees'] ),
+                number_format_i18n( $s['woo_orders'] ),
+                number_format_i18n( $s['woo_products'] ),
+                number_format_i18n( $s['tc_attendees'] )
+            ),
+        ];
+
+        $current = $setup['method']['current'];
+        if ( ! $s['woo_detected'] ) {
+            $rows[] = [ 'label' => 'EventKoi checkout method', 'status' => 'ok', 'detail' => ucfirst( $name( $current ) ) . ' — no WooCommerce ticket sales found in TEC, so it is left as is.' ];
+        } elseif ( 'woocommerce' === $current ) {
+            $rows[] = [ 'label' => 'EventKoi checkout method', 'status' => 'ok', 'detail' => 'WooCommerce (matches TEC)' ];
+        } else {
+            $rows[] = [
+                'label'  => 'EventKoi checkout method',
+                'status' => 'warn',
+                'detail' => 'Currently ' . $name( $current ) . '. TEC sold its tickets through WooCommerce, so approving this step sets it to WooCommerce. Until then EventKoi\'s event list shows 0 sold for imported orders.',
+            ];
+        }
+
+        if ( $s['woo_detected'] ) {
+            $ek_cur  = $setup['currency']['eventkoi'];
+            $woo_cur = $setup['currency']['woo'];
+            $rows[]  = [
+                'label'  => 'Checkout currency',
+                'status' => '' === $woo_cur ? 'warn' : 'ok',
+                'detail' => '' === $woo_cur
+                    ? 'WooCommerce has no valid currency set.'
+                    : $woo_cur . ( $ek_cur && $ek_cur !== $woo_cur ? ' (EventKoi currently shows ' . $ek_cur . '; it follows WooCommerce once checkout is WooCommerce)' : '' ),
+            ];
+
+            $non_wc = (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM {$this->ek_table( 'ticket_orders' )} t
+                 INNER JOIN {$wpdb->postmeta} m ON m.post_id = t.event_id AND m.meta_key = '_tec_import_source_id'
+                 WHERE t.order_id NOT LIKE 'wc\\_%'
+                   AND t.payment_status IN ('complete','completed','succeeded','paid','partially_refunded')"
+            );
+            if ( $non_wc > 0 ) {
+                $rows[] = [
+                    'label'  => 'Non-WooCommerce sales',
+                    'status' => 'warn',
+                    'detail' => $non_wc . ' imported sold row(s) are not WooCommerce orders (Tickets Commerce / manual). EventKoi\'s event list does not count them while checkout is WooCommerce.',
+                ];
+            }
+        }
+
+        $lic    = $setup['license'];
+        $rows[] = [
+            'label'  => 'EventKoi license',
+            'status' => 'valid' === $lic['status'] ? 'ok' : 'warn',
+            'detail' => 'valid' === $lic['status']
+                ? 'Active' . ( $lic['expires'] ? ' (' . $lic['expires'] . ')' : '' )
+                : 'Not active. Add the license key in EventKoi → Settings (the importer does not handle it).',
+        ];
+
+        $rows[] = [
+            'label'  => 'EventKoi demo event',
+            'status' => $setup['demo_event'] ? 'warn' : 'ok',
+            'detail' => $setup['demo_event']
+                ? 'EventKoi\'s onboarding demo event "' . $setup['demo_event']['title'] . '" (#' . $setup['demo_event']['id'] . ') exists. Trash it in EventKoi if it is not wanted.'
+                : 'None (the importer never creates it)',
+        ];
+
+        return $rows;
+    }
+
+    /**
+     * Validate the setup form and write it into EventKoi's settings,
+     * recording each key's prior value (or absence) for undo.
+     *
+     * @return array|WP_Error
+     */
+    private function apply_ek_setup( $input ) {
+        if ( ! class_exists( '\\EventKoi\\Core\\Settings' ) ) {
+            return new WP_Error( 'no_eventkoi', 'EventKoi is not active.' );
+        }
+
+        $values = [];
+
+        $method = isset( $input['ticket_checkout_method'] ) ? sanitize_key( (string) $input['ticket_checkout_method'] ) : '';
+        if ( 'woocommerce' === $method ) {
+            if ( ! $this->wc_is_available() ) {
+                return new WP_Error( 'no_wc', 'WooCommerce is not active, so it cannot be EventKoi\'s checkout.' );
+            }
+            $values['ticket_checkout_method'] = 'woocommerce';
+        } elseif ( '' !== $method && 'keep' !== $method ) {
+            return new WP_Error( 'bad_method', 'Unsupported checkout method.' );
+        }
+
+        if ( isset( $input['week_starts_on'] ) ) {
+            $week = (int) $input['week_starts_on'];
+            if ( $week < 0 || $week > 6 ) {
+                return new WP_Error( 'bad_week', 'Week start must be a day of the week.' );
+            }
+            $values['week_starts_on'] = $week;
+        }
+
+        if ( isset( $input['working_days'] ) ) {
+            $days = array_values( array_unique( array_filter( array_map( 'intval', (array) $input['working_days'] ), function ( $d ) {
+                return $d >= 0 && $d <= 6;
+            } ) ) );
+            sort( $days );
+            if ( empty( $days ) ) {
+                return new WP_Error( 'bad_days', 'Pick at least one working day.' );
+            }
+            $values['working_days'] = $days;
+        }
+
+        if ( isset( $input['time_format'] ) ) {
+            $tf = (string) $input['time_format'];
+            if ( ! in_array( $tf, [ '12', '24' ], true ) ) {
+                return new WP_Error( 'bad_time', 'Time format must be 12 or 24.' );
+            }
+            $values['time_format'] = $tf;
+        }
+
+        $raw     = get_option( 'eventkoi_settings', null );
+        $existed = is_array( $raw );
+        $raw     = $existed ? $raw : [];
+
+        $audit = get_option( 'ekti_ek_setup_audit', [] );
+        $audit = is_array( $audit ) ? $audit : [];
+        if ( ! isset( $audit['option_existed'] ) ) {
+            $audit['option_existed'] = $existed;
+        }
+        $audit['keys'] = is_array( $audit['keys'] ?? null ) ? $audit['keys'] : [];
+
+        $changed = [];
+        foreach ( $values as $key => $value ) {
+            // Only the first write of a key records the original value.
+            if ( ! array_key_exists( $key, $audit['keys'] ) ) {
+                $audit['keys'][ $key ] = array_key_exists( $key, $raw ) ? [ 'had' => true, 'old' => $raw[ $key ] ] : [ 'had' => false ];
+            }
+            // Loose: EventKoi's sanitizer stores numbers as strings.
+            if ( ! array_key_exists( $key, $raw ) || $raw[ $key ] != $value ) { // phpcs:ignore Universal.Operators.StrictComparisons
+                $changed[] = $key;
+            }
+            $raw[ $key ] = $value;
+        }
+
+        // Mark EventKoi's quick start done so it stops offering the demo event.
+        foreach ( [ 'eventkoi_quick_start_completed', 'eventkoi_show_quick_start_prompt' ] as $opt ) {
+            if ( ! isset( $audit['options'][ $opt ] ) ) {
+                $old                       = get_option( $opt, null );
+                $audit['options'][ $opt ] = null === $old ? [ 'had' => false ] : [ 'had' => true, 'old' => $old ];
+            }
+        }
+
+        update_option( 'ekti_ek_setup_audit', $audit, false );
+        // Settings::set() runs EventKoi's own sanitizer and filter; the
+        // update_option_eventkoi_settings hooks clear its display caches.
+        \EventKoi\Core\Settings::set( $raw );
+        update_option( 'eventkoi_quick_start_completed', 'yes' );
+        delete_option( 'eventkoi_show_quick_start_prompt' );
+        $this->flush_ek_event_caches();
+
+        $this->log( 'EventKoi setup saved: ' . wp_json_encode( $values ) . ( $changed ? ' (changed: ' . implode( ', ', $changed ) . ')' : ' (no changes)' ) );
+        return [ 'saved' => $values, 'changed' => $changed ];
+    }
+
+    /**
+     * Clear EventKoi's event-list caches. Its own clear only hooks
+     * update_option_eventkoi_settings, which does not fire when the option
+     * is first created (add_option) or deleted, so the events list would
+     * keep serving sold counts computed under the old checkout method.
+     */
+    private function flush_ek_event_caches() {
+        foreach ( [ 'clear_event_query_cache', 'bump_events_cache_version' ] as $method ) {
+            if ( is_callable( [ '\\EventKoi\\Core\\Hooks', $method ] ) ) {
+                call_user_func( [ '\\EventKoi\\Core\\Hooks', $method ] );
+            }
+        }
+    }
+
+    /**
+     * Restore every EventKoi setting the setup step wrote.
+     */
+    private function undo_ek_setup() {
+        $audit = get_option( 'ekti_ek_setup_audit', [] );
+        if ( empty( $audit ) || ! is_array( $audit ) ) {
+            return [ 'error' => 'Nothing to undo.' ];
+        }
+
+        $raw = get_option( 'eventkoi_settings', [] );
+        $raw = is_array( $raw ) ? $raw : [];
+        foreach ( (array) ( $audit['keys'] ?? [] ) as $key => $prior ) {
+            if ( ! empty( $prior['had'] ) ) {
+                $raw[ $key ] = $prior['old'];
+            } else {
+                unset( $raw[ $key ] );
+            }
+        }
+        if ( empty( $audit['option_existed'] ) && empty( $raw ) ) {
+            delete_option( 'eventkoi_settings' );
+        } elseif ( class_exists( '\\EventKoi\\Core\\Settings' ) ) {
+            \EventKoi\Core\Settings::set( $raw );
+        } else {
+            update_option( 'eventkoi_settings', $raw );
+        }
+
+        foreach ( (array) ( $audit['options'] ?? [] ) as $opt => $prior ) {
+            if ( ! empty( $prior['had'] ) ) {
+                update_option( $opt, $prior['old'] );
+            } else {
+                delete_option( $opt );
+            }
+        }
+
+        $this->flush_ek_event_caches();
+        delete_option( 'ekti_ek_setup_audit' );
+        $this->log( 'EventKoi setup undone: restored ' . implode( ', ', array_keys( (array) ( $audit['keys'] ?? [] ) ) ) . '.' );
+        return [ 'restored' => array_keys( (array) ( $audit['keys'] ?? [] ) ) ];
     }
 
     /* Wizard state ----------------------------------------------------- */
@@ -8255,6 +8664,11 @@ PHP;
                 ],
                 'provisioned' => ! empty( get_option( 'ekti_tax_provision_audit', [] ) ),
             ],
+            'ek_setup'     => [
+                'applied' => ! empty( get_option( 'ekti_ek_setup_audit', [] ) ),
+                'method'  => class_exists( '\\EventKoi\\Core\\Settings' ) ? $this->ek_checkout_method() : '',
+                'guard'   => class_exists( '\\EventKoi\\Core\\Settings' ) ? $this->checkout_method_guard() : '',
+            ],
         ];
     }
 
@@ -8267,6 +8681,12 @@ PHP;
         foreach ( array_slice( $this->wizard_steps, 0, $pos ) as $prev ) {
             if ( empty( $state['approved'][ $prev ] ) ) {
                 return [ 'error' => 'Approve the ' . $prev . ' step first.' ];
+            }
+        }
+        if ( in_array( $step, [ 'preflight', 'tickets', 'orders' ], true ) ) {
+            $guard = $this->checkout_method_guard();
+            if ( $guard ) {
+                return [ 'error' => $guard ];
             }
         }
         if ( in_array( $step, $this->stages, true ) ) {
@@ -8662,7 +9082,15 @@ PHP;
 
     public function ajax_wizard_approve() {
         $this->check_ajax();
-        $step   = isset( $_POST['step'] ) ? sanitize_key( $_POST['step'] ) : '';
+        $step = isset( $_POST['step'] ) ? sanitize_key( $_POST['step'] ) : '';
+        // Approving preflight saves the EventKoi setup form first.
+        if ( 'preflight' === $step && isset( $_POST['setup'] ) ) {
+            $input = json_decode( wp_unslash( $_POST['setup'] ), true );
+            $saved = $this->apply_ek_setup( is_array( $input ) ? $input : [] );
+            if ( is_wp_error( $saved ) ) {
+                wp_send_json_error( $saved->get_error_message() );
+            }
+        }
         $result = $this->wizard_approve( $step );
         if ( isset( $result['error'] ) ) {
             wp_send_json_error( $result['error'] );
@@ -8673,6 +9101,24 @@ PHP;
     public function ajax_preflight() {
         $this->check_ajax();
         wp_send_json_success( $this->preflight() );
+    }
+
+    public function ajax_ek_setup() {
+        $this->check_ajax();
+        $op = isset( $_POST['op'] ) ? sanitize_key( $_POST['op'] ) : 'save';
+        if ( 'undo' === $op ) {
+            $result = $this->undo_ek_setup();
+            if ( isset( $result['error'] ) ) {
+                wp_send_json_error( $result['error'] );
+            }
+            wp_send_json_success( $result );
+        }
+        $input = isset( $_POST['setup'] ) ? json_decode( wp_unslash( $_POST['setup'] ), true ) : [];
+        $saved = $this->apply_ek_setup( is_array( $input ) ? $input : [] );
+        if ( is_wp_error( $saved ) ) {
+            wp_send_json_error( $saved->get_error_message() );
+        }
+        wp_send_json_success( $saved );
     }
 
     public function ajax_provision_taxonomy() {
@@ -8706,6 +9152,12 @@ PHP;
         $prev  = $this->wizard_steps[ array_search( $stage, $this->wizard_steps, true ) - 1 ];
         if ( empty( $state['approved'][ $prev ] ) ) {
             wp_send_json_error( 'Approve the ' . $prev . ' step first.' );
+        }
+        if ( 'events' !== $stage ) {
+            $guard = $this->checkout_method_guard();
+            if ( $guard ) {
+                wp_send_json_error( $guard );
+            }
         }
         if ( ! empty( $_POST['reset'] ) && 'true' === $_POST['reset'] ) {
             $this->reset_stage_failures( $stage );
@@ -8815,7 +9267,7 @@ PHP;
                 <h2>Import Wizard</h2>
                 <p>Runs the whole migration in order and stops for your review after events, tickets and order matching. Every step is audited and can be undone, latest step first.</p>
                 <ol class="ekti-stepper" id="ekti-stepper">
-                    <li data-step="preflight"><span class="ekti-step-num">1</span> Preflight</li>
+                    <li data-step="preflight"><span class="ekti-step-num">1</span> Preflight &amp; setup</li>
                     <li data-step="taxonomies"><span class="ekti-step-num">2</span> Locations &amp; Instructors</li>
                     <li data-step="events"><span class="ekti-step-num">3</span> Events</li>
                     <li data-step="tickets"><span class="ekti-step-num">4</span> Tickets</li>
@@ -8825,9 +9277,9 @@ PHP;
 
                 <!-- Step 1: Preflight -->
                 <section class="ekti-step" data-step="preflight">
-                    <h3 class="ekti-step-title">1. Preflight <span class="ekti-step-badge"></span></h3>
+                    <h3 class="ekti-step-title">1. Preflight &amp; EventKoi setup <span class="ekti-step-badge"></span></h3>
                     <div class="ekti-step-body">
-                        <p class="description">Checks the plugins, TEC's event cleaner and any earlier imports before anything is written.</p>
+                        <p class="description">Checks the plugins, TEC's event cleaner, any earlier imports and where TEC's ticket sales came from. Approving saves the EventKoi setup below (checkout method and calendar defaults), the parts of EventKoi's onboarding wizard an import needs. Its demo event and plugin tour are skipped.</p>
                         <div class="ekti-actions">
                             <button class="button button-primary" id="ekti-wz-preflight-run">Run Checks</button>
                             <button class="button" id="ekti-wz-preflight-approve" disabled>Approve &amp; Continue</button>
@@ -8837,6 +9289,16 @@ PHP;
                             <thead><tr><th style="width:28%;">Check</th><th style="width:10%;">Result</th><th>Detail</th></tr></thead>
                             <tbody></tbody>
                         </table>
+
+                        <div id="ekti-wz-setup" class="ekti-wz-setup" style="display:none;">
+                            <h4>EventKoi setup</h4>
+                            <table class="form-table" role="presentation"><tbody id="ekti-wz-setup-rows"></tbody></table>
+                            <div class="ekti-actions">
+                                <button class="button" id="ekti-wz-setup-save">Save Setup</button>
+                                <button class="button button-secondary" id="ekti-wz-setup-undo" style="color:#a00;" disabled>Undo EventKoi Setup</button>
+                            </div>
+                            <div id="ekti-wz-setup-status" class="ekti-status"></div>
+                        </div>
                     </div>
                 </section>
 

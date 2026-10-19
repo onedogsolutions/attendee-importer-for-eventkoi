@@ -1564,6 +1564,18 @@
             $('#ekti-wz-' + stage + '-undo').prop('disabled', wz.running || st.ledger === 0);
         });
         $('#ekti-wz-taxonomies-approve').prop('disabled', wz.running || wzApproved('taxonomies') || !wzApproved('preflight'));
+        var setup = wz.summary && wz.summary.ek_setup;
+        if (setup) {
+            $('#ekti-wz-setup-undo').prop('disabled', wz.running || !setup.applied);
+            $.each(['tickets', 'orders'], function (i, stage) {
+                if (setup.guard) {
+                    $('#ekti-wz-' + stage + '-run, #ekti-wz-' + stage + '-approve').prop('disabled', true);
+                    if (wzApproved(wzPrev(stage)) && !wzApproved(stage)) {
+                        setStatus('#ekti-wz-' + stage + '-status', escapeHtml(setup.guard), 'warning');
+                    }
+                }
+            });
+        }
         $('#ekti-wz-undo-all').prop('disabled', wz.running);
 
         renderSetupCards();
@@ -1594,7 +1606,14 @@
     }
 
     function approveStep(step, after) {
-        ajax('ekti_wizard_approve', { step: step }, function (resp) {
+        var data = { step: step };
+        if (step === 'preflight') {
+            var payload = ekSetupPayload();
+            if (payload) {
+                data.setup = JSON.stringify(payload);
+            }
+        }
+        ajax('ekti_wizard_approve', data, function (resp) {
             if (!resp.success) {
                 appendConsole('Approve "' + step + '": ' + resp.data, 'error');
                 setStatus('#ekti-wz-' + step + '-status', escapeHtml(resp.data), 'error');
@@ -1629,11 +1648,123 @@
                 $tb.append('<tr><td>' + escapeHtml(c.label) + '</td><td><span class="ekti-pill ' + c.status + '">' + labels[c.status] + '</span></td><td>' + escapeHtml(c.detail) + '</td></tr>');
             });
             $('#ekti-wz-preflight-table').show();
+            renderEkSetupForm(d.setup);
             var warns = d.checks.filter(function (c) { return c.status === 'warn'; }).length;
             setStatus('#ekti-wz-preflight-status',
                 d.ok ? ('All required checks passed' + (warns ? ' — ' + warns + ' item(s) to look at before continuing.' : '.')) : 'Fix the blocked items, then run the checks again.',
                 d.ok ? (warns ? 'warning' : 'success') : 'error');
             $('#ekti-wz-preflight-approve').prop('disabled', !d.ok || wzApproved('preflight'));
+        });
+    }
+
+    /* Step 1b: EventKoi setup (v1.11.0) -------------------------------- */
+
+    var EK_DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+    var EK_METHODS = { woocommerce: 'WooCommerce', stripe: 'Stripe', surecart: 'SureCart', '': 'not set' };
+
+    function renderEkSetupForm(setup) {
+        if (!setup) {
+            $('#ekti-wz-setup').hide();
+            return;
+        }
+        var rows = [];
+        var cur = setup.method.current || '';
+        var methodHtml;
+        if (setup.sales.woo_detected) {
+            methodHtml = '<select id="ekti-setup-method">' +
+                '<option value="woocommerce"' + (setup.method.proposed === 'woocommerce' ? ' selected' : '') + '>WooCommerce (matches TEC)</option>' +
+                (cur !== 'woocommerce' ? '<option value="keep">Leave as ' + escapeHtml(EK_METHODS[cur] || cur) + '</option>' : '') +
+                '</select><p class="description">TEC sold ' + setup.sales.woo_attendees + ' ticket(s) through WooCommerce. ' +
+                'EventKoi\'s event list and checkout only use WooCommerce orders when this is WooCommerce; the Tickets and Order matching steps stay locked otherwise.</p>';
+        } else {
+            methodHtml = escapeHtml(EK_METHODS[cur] || cur) + '<input type="hidden" id="ekti-setup-method" value="keep" />' +
+                '<p class="description">No WooCommerce ticket sales in TEC, so the checkout method is left as is.</p>';
+        }
+        rows.push(['Ticket checkout', methodHtml]);
+
+        var week = '<select id="ekti-setup-week">';
+        $.each(EK_DAYS, function (i, day) {
+            week += '<option value="' + i + '"' + (setup.week_starts_on.proposed === i ? ' selected' : '') + '>' + day + '</option>';
+        });
+        week += '</select>' + (setup.week_starts_on.current === null ? '<p class="description">Not set in EventKoi yet — taken from WordPress\'s "Week Starts On".</p>' : '');
+        rows.push(['Week starts on', week]);
+
+        var days = '<fieldset id="ekti-setup-days">';
+        $.each(EK_DAYS, function (i, day) {
+            var on = setup.working_days.proposed.indexOf(i) !== -1;
+            days += '<label style="margin-right:12px;"><input type="checkbox" value="' + i + '"' + (on ? ' checked' : '') + ' /> ' + day.substr(0, 3) + '</label>';
+        });
+        days += '</fieldset><p class="description">Used by EventKoi\'s "working days" recurrence rules.</p>';
+        rows.push(['Working days', days]);
+
+        var tf = setup.time_format.proposed;
+        rows.push(['Time format',
+            '<label style="margin-right:16px;"><input type="radio" name="ekti-setup-time" value="12"' + (tf === '12' ? ' checked' : '') + ' /> 12-hour (2:00 PM)</label>' +
+            '<label><input type="radio" name="ekti-setup-time" value="24"' + (tf === '24' ? ' checked' : '') + ' /> 24-hour (14:00)</label>']);
+
+        rows.push(['Timezone &amp; date format',
+            escapeHtml(setup.timezone) + ' · ' + escapeHtml(setup.date_format) +
+            ' <a href="' + escapeHtml(setup.general_url) + '" target="_blank" rel="noopener">Change in General Settings</a>']);
+
+        if (setup.elementor) {
+            rows.push(['Event templates', 'Elementor is active. Choose whether events use Elementor templates in <a href="' + escapeHtml(setup.ek_settings_url) + '" target="_blank" rel="noopener">EventKoi settings</a>.']);
+        }
+
+        rows.push(['Skipped', '<p class="description">EventKoi\'s demo event, plugin tour and license step. Saving marks EventKoi\'s quick start as done.</p>']);
+
+        var $tb = $('#ekti-wz-setup-rows').empty();
+        $.each(rows, function (i, r) {
+            $tb.append('<tr><th scope="row">' + r[0] + '</th><td>' + r[1] + '</td></tr>');
+        });
+        $('#ekti-wz-setup-undo').prop('disabled', !setup.applied);
+        $('#ekti-wz-setup').show();
+    }
+
+    function ekSetupPayload() {
+        if (!$('#ekti-wz-setup').is(':visible')) {
+            return null;
+        }
+        var days = $('#ekti-setup-days input:checked').map(function () { return parseInt(this.value, 10); }).get();
+        return {
+            ticket_checkout_method: $('#ekti-setup-method').val(),
+            week_starts_on: parseInt($('#ekti-setup-week').val(), 10),
+            working_days: days,
+            time_format: $('input[name="ekti-setup-time"]:checked').val()
+        };
+    }
+
+    function saveEkSetup() {
+        var payload = ekSetupPayload();
+        if (!payload) return;
+        setStatus('#ekti-wz-setup-status', '<span class="ekti-spinner"></span> Saving...', 'info');
+        ajax('ekti_ek_setup', { op: 'save', setup: JSON.stringify(payload) }, function (resp) {
+            if (!resp.success) {
+                setStatus('#ekti-wz-setup-status', escapeHtml(resp.data), 'error');
+                return;
+            }
+            appendConsole('EventKoi setup saved' + (resp.data.changed.length ? ': ' + resp.data.changed.join(', ') : ' (no changes)') + '.', 'info');
+            setStatus('#ekti-wz-setup-status', 'EventKoi setup saved.', 'success');
+            runPreflight();
+            refreshWizard();
+        });
+    }
+
+    function undoEkSetup(silent, after) {
+        if (!silent && !confirm('Restore the EventKoi settings this importer changed (checkout method, calendar defaults, quick-start flag)?')) {
+            return;
+        }
+        ajax('ekti_ek_setup', { op: 'undo' }, function (resp) {
+            if (!silent) {
+                if (!resp.success) {
+                    setStatus('#ekti-wz-setup-status', escapeHtml(resp.data), 'error');
+                    return;
+                }
+                appendConsole('EventKoi setup undone.', 'warn');
+                setStatus('#ekti-wz-setup-status', 'EventKoi settings restored.', 'info');
+                runPreflight();
+                refreshWizard();
+            }
+            if (after) after();
         });
     }
 
@@ -2229,6 +2360,7 @@
             var type = types.shift();
             if (!type) {
                 ajax('ekti_attendee_fields', { op: 'remove' }, function () {});
+                undoEkSetup(true);
                 ajax('ekti_undo_taxonomy_provision', {}, function () {
                     appendConsole('=== Entire import undone ===', 'warn');
                     setStatus('#ekti-wz-finish-status', 'The import has been undone.', 'success');
@@ -2336,6 +2468,8 @@
         });
         $('#ekti-wz-preflight-run').on('click', runPreflight);
         $('#ekti-wz-preflight-approve').on('click', function () { approveStep('preflight'); });
+        $('#ekti-wz-setup-save').on('click', saveEkSetup);
+        $('#ekti-wz-setup-undo').on('click', function () { undoEkSetup(false); });
         $(document).on('click', '.ekti-setup-edit', function () { openSetupForm($(this).data('type')); });
         $(document).on('click', '.ekti-setup-cancel', function () {
             $('#ekti-setup-' + $(this).data('type')).data('editing', false);
