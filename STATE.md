@@ -97,9 +97,11 @@ WooCommerce. (The backup has 691 TEC events and 2,299 Woo attendees,
 against 693 and 2,306 before, so Steps 16–18 figures are slightly
 higher.)
 
-1. **Attendee Fields plugin is not installed** on ott-dev after the
-   restore (Order matching → "Install Attendee Fields"). Install it if
-   the attendee export should show seat names and registration answers.
+1. **Attendee Fields plugin installed** (Order matching → Install
+   Attendee Fields, 2026-10-19): `mu-plugins/ekti-attendee-fields.php`
+   with 6 fields (Attendees, Phone, Zip/Post Code, class-before,
+   Consent, Comments), 0 rows needing repair. The re-run results check
+   shows "installed" and "Checks passed".
 2. TEC event cleaner on ott-dev is back at 12 months (Preflight warns).
 3. The v1.7.0 plugin folder is backed up at
    `wp-content/ekti-backup-1.7.0` on ott-dev; delete it once 1.11.1 is
