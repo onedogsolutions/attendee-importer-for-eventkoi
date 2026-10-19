@@ -9,10 +9,11 @@ top-level document.
 - **Branch:** `main`
 - **Plugin version:** 1.11.1
 - **Last updated:** 2026-10-19
-- **Overall status:** 🟡 **v1.11.1 legacy Advanced tools removed
-  (2026-10-19), deployed to ott-dev; page and Preflight QA passed, events
-  stage not yet run on 1.11.1.** ott-dev was restored to a pre-import
-  backup (importer 1.7.0, no EventKoi events) before this deploy. Run Migration,
+- **Overall status:** ✅ **v1.11.1 legacy Advanced tools removed and
+  QA-passed on ott-dev (2026-10-19).** The wizard is the only import
+  path. A full wizard run on 1.11.1 from a restored pre-import backup
+  passed every results check (656 events, 686 tickets, 2,299 WC-linked
+  rows, 2,081 sold). See Step 19. Run Migration,
   Event Mapping, Pre-Import Cleanup, Ticket Details Sync, legacy Calendar
   Sync and the single-pass Event Sync runner are gone; the wizard is the
   only import path. See Step 19. Before that: ✅ **v1.11.0 EventKoi setup shipped and QA-passed on
@@ -81,25 +82,29 @@ top-level document.
 | 16 | One-shot Import Wizard (staged events → tickets → orders with 3 review stops) + taxonomy provisioning from the UI | ✅ Done | — |
 | 17 | Attendee fidelity: instance-tagged rows (storefront inventory), per-seat attendee identity, TEC registration fields | ✅ Done | — |
 | 18 | EventKoi setup in Preflight: WooCommerce checkout method from TEC sales, onboarding calendar defaults (no demo data), stage guard, events-list count check | ✅ Done | — |
-| 19 | Remove pre-wizard import paths from Advanced tools (v1.11.1) | 🟡 Deployed + UI QA passed; wizard import run pending | 30d7cd1 |
+| 19 | Remove pre-wizard import paths from Advanced tools (v1.11.1) | ✅ Done | 30d7cd1 |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
 
-**Step 19 deployed to ott-dev (2026-10-19, v1.11.1).** ott-dev is now
-at a pre-import backup (the user restored it): 691 TEC events, 0
-EventKoi events, no importer ledgers, wizard not started. The figures
-under Steps 16–18 (658 events, 2,306 WC rows) describe the state before
-the restore.
+**Step 19 done (2026-10-19, v1.11.1).** The user restored ott-dev to a
+pre-import backup, then v1.11.1 was deployed and the full wizard was run
+through the UI. ott-dev is now fully imported again with all 5 steps
+approved: 656 events, 686 tickets, 2,299 WC-linked rows, 2,081 sold,
+1,590 linked orders, 3 location and 32 instructor terms, checkout method
+WooCommerce. (The backup has 691 TEC events and 2,299 Woo attendees,
+against 693 and 2,306 before, so Steps 16–18 figures are slightly
+higher.)
 
-1. **Run the wizard end to end on 1.11.1** (with the user's OK). The
-   events stage now goes through the trimmed `run_event_sync()` and has
-   not been run since the change.
+1. **Attendee Fields plugin is not installed** on ott-dev after the
+   restore (Order matching → "Install Attendee Fields"). Install it if
+   the attendee export should show seat names and registration answers.
 2. TEC event cleaner on ott-dev is back at 12 months (Preflight warns).
 3. The v1.7.0 plugin folder is backed up at
    `wp-content/ekti-backup-1.7.0` on ott-dev; delete it once 1.11.1 is
    accepted.
+4. Branch `claude/intelligent-hertz-8fb9b8` is not merged to `main` yet.
 
 **Step 18 done (2026-10-19, v1.11.0):** ott-dev's EventKoi checkout
 method is now WooCommerce and the events list shows imported sales
@@ -1666,7 +1671,7 @@ event "Classical Concert in the Park" + plugin tour. Completion sets
 
 ---
 
-### Step 19 — Remove pre-wizard import paths (v1.11.1) 🟡
+### Step 19 — Remove pre-wizard import paths (v1.11.1) ✅
 
 The wizard is the supported import path, so the Advanced tools panels
 that predate it were removed (user-approved audit, 2026-10-19).
@@ -1732,8 +1737,35 @@ state unchanged" check no longer applied.
   checkout method not set), "Previous Event Sync runs: None". Load Log
   works. No undo or adopt button was clicked and no wizard step was
   approved.
-- **Not covered:** the events/tickets/orders stages (the site has no
-  import yet), Adopt and Undo Last Event Sync on real ledger data.
+- **Full wizard run (UI, built-in browser; confirm dialogs auto-accepted
+  in the page; no undo used):**
+  - Preflight → Approve: checkout method saved as WooCommerce.
+  - 2a: Locations (8/8 slots prefilled) and Instructors created. 2b:
+    Create Terms & Apply → 3 location terms (23 address fields), 32
+    instructor terms → approve.
+  - Events: preview 656 to import + 35 without a start date → run (about
+    6 min) → 656 done, 35 rolled back; 617 publish / 39 draft; 654 with a
+    location term, 593 with an instructor term, 656 indexed → approve.
+    Server: 2,579 ledger ops, all tagged `events`; 0 ticket and 0 order
+    rows written (the trimmed `import_one_event()` stops after the
+    event); failure memory holds the 35; `ekti_event_mapping` has 656.
+  - Tickets: preview 686 types (38 multi-type events, 6 RSVP-only, 6
+    unlimited, 4 with no tickets) → run (about 3.5 min) → 686 / 686 rows,
+    686 bindings → approve.
+  - Orders: preview 2,299 Woo attendees (2,042 complete / 39 partially
+    refunded / 215 refunded / 3 failed), 9 RSVP rows, 0 unlinkable →
+    run (about 7 min) → 2,299 rows, 2,081 sold, 1,590 linked orders, 0
+    duplicate order IDs or tokens, 0 charges rows, events list 327 / 327
+    match, 0 rows off-instance, 41 storefront events checked, 0 orders
+    missing attendee details → approve. Finish shows Complete.
+  - Ledger after the run: events 2,579 / tickets 3,893 / orders 7,670
+    ops, 0 untagged. 2,299 attendees flagged imported.
+  - The admin session (Novamira admin access link) was renewed once
+    before the orders run. Console: only a 403 from an earlier wrong-slug
+    URL and a browser "Transition was skipped" from the login redirect;
+    none from admin.js.
+- **Not covered:** Adopt Native Imports and Undo Last Event Sync on real
+  ledger data (no native imports or untagged ops on this site).
 
 ---
 
