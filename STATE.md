@@ -10,7 +10,9 @@ top-level document.
 - **Plugin version:** 1.11.1
 - **Last updated:** 2026-10-19
 - **Overall status:** 🟡 **v1.11.1 legacy Advanced tools removed
-  (2026-10-19), not yet deployed or QA'd on ott-dev.** Run Migration,
+  (2026-10-19), deployed to ott-dev; page and Preflight QA passed, events
+  stage not yet run on 1.11.1.** ott-dev was restored to a pre-import
+  backup (importer 1.7.0, no EventKoi events) before this deploy. Run Migration,
   Event Mapping, Pre-Import Cleanup, Ticket Details Sync, legacy Calendar
   Sync and the single-pass Event Sync runner are gone; the wizard is the
   only import path. See Step 19. Before that: ✅ **v1.11.0 EventKoi setup shipped and QA-passed on
@@ -79,15 +81,25 @@ top-level document.
 | 16 | One-shot Import Wizard (staged events → tickets → orders with 3 review stops) + taxonomy provisioning from the UI | ✅ Done | — |
 | 17 | Attendee fidelity: instance-tagged rows (storefront inventory), per-seat attendee identity, TEC registration fields | ✅ Done | — |
 | 18 | EventKoi setup in Preflight: WooCommerce checkout method from TEC sales, onboarding calendar defaults (no demo data), stage guard, events-list count check | ✅ Done | — |
-| 19 | Remove pre-wizard import paths from Advanced tools (v1.11.1) | 🟡 Code done, ott-dev QA pending | — |
+| 19 | Remove pre-wizard import paths from Advanced tools (v1.11.1) | 🟡 Deployed + UI QA passed; wizard import run pending | 30d7cd1 |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
 
-**Step 19 code done (2026-10-19, v1.11.1), not deployed.** Next: with
-the user's OK, deploy to ott-dev and QA (see Step 19 "QA to run"). Do
-not click "Undo Last Event Sync" on ott-dev without approval.
+**Step 19 deployed to ott-dev (2026-10-19, v1.11.1).** ott-dev is now
+at a pre-import backup (the user restored it): 691 TEC events, 0
+EventKoi events, no importer ledgers, wizard not started. The figures
+under Steps 16–18 (658 events, 2,306 WC rows) describe the state before
+the restore.
+
+1. **Run the wizard end to end on 1.11.1** (with the user's OK). The
+   events stage now goes through the trimmed `run_event_sync()` and has
+   not been run since the change.
+2. TEC event cleaner on ott-dev is back at 12 months (Preflight warns).
+3. The v1.7.0 plugin folder is backed up at
+   `wp-content/ekti-backup-1.7.0` on ott-dev; delete it once 1.11.1 is
+   accepted.
 
 **Step 18 done (2026-10-19, v1.11.0):** ott-dev's EventKoi checkout
 method is now WooCommerce and the events list shows imported sales
@@ -1700,11 +1712,28 @@ memory).
 caller and every JS action has a hook. No method is left without a
 caller.
 
-**QA to run on ott-dev (needs the user's OK):** the page loads with no
-JS errors; wizard state is unchanged (all 5 steps approved, 658 events,
-2,306 WC-linked rows); events/tickets/orders Preview and Check Results
-still work; Adopt reports nothing to adopt; check whether any of the
-orphaned legacy ledgers are non-empty (see Open questions).
+**ott-dev QA (2026-10-19, Novamira + built-in browser).** The user
+restored ott-dev to a pre-import backup first, so the planned "imported
+state unchanged" check no longer applied.
+- **Legacy ledgers:** `ekti_migration_audit`, `ekti_cleanup_audit`,
+  `ekti_sync_audit`, `ekti_cal_sync_audit`, `ekti_event_sync_audit` and
+  the other importer options are all absent. Nothing is orphaned.
+- **Deploy:** zip (sha256 df3bd93d…) uploaded and unpacked over
+  1.7.0; 1.7.0 kept at `wp-content/ekti-backup-1.7.0`. Plugin still
+  active, `EKTI_VERSION` 1.11.1.
+- **Backend (read-only):** 23 `wp_ajax_ekti_*` hooks, none of the
+  removed ones. `scan_event_sync()`: 691 TEC events (623 publish / 68
+  draft), 695 Woo tickets, 2,299 Woo attendees, 6 RSVP events, 42 review
+  items. `scan_native_adoption()`: 0 candidates.
+- **UI:** page loads with admin.js 1.11.1 and no JS errors. Wizard shows
+  6 steps; Advanced tools holds only "Native Imports & Event Sync Ledger"
+  and "Import Log File"; no removed panel IDs in the DOM. Run Checks:
+  all required checks pass, 2 warnings (TEC cleaner at 12 months,
+  checkout method not set), "Previous Event Sync runs: None". Load Log
+  works. No undo or adopt button was clicked and no wizard step was
+  approved.
+- **Not covered:** the events/tickets/orders stages (the site has no
+  import yet), Adopt and Undo Last Event Sync on real ledger data.
 
 ---
 
@@ -2085,10 +2114,9 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
 
 - **Orphaned legacy ledgers (v1.11.1):** `ekti_migration_audit`,
   `ekti_cleanup_audit`, `ekti_sync_audit` and `ekti_cal_sync_audit` can
-  no longer be undone from the UI. Check ott-dev before deploying (the
-  Novamira MCP connection failed with DEPTH_ZERO_SELF_SIGNED_CERT on
-  2026-10-19). If any are non-empty, either undo them with v1.11.0 first
-  or accept them as permanent. `ekti_event_mapping` is still written by
+  no longer be undone from the UI. All absent on ott-dev after its
+  restore (checked 2026-10-19); check any other site before upgrading
+  it, and undo with v1.11.0 first if any are non-empty. `ekti_event_mapping` is still written by
   the events stage; `ekti_migration_state` and `ekti_location_mapping`
   are now inert.
 
