@@ -7,18 +7,19 @@ condensed version of each build step so progress and plan travel together in one
 top-level document.
 
 - **Branch:** `main`
-- **Plugin version:** 1.6.0
+- **Plugin version:** 1.7.0
 - **Last updated:** 2026-10-18
-- **Overall status:** ✅ **v1.6.0 Saved Locations term field sync deployed and fully QA'd
-  on ott-dev (EventKoi v1.4.6.1).** TEC venue addresses now copy onto
-  Saved Locations term fields (`eventkoi_field_*` term meta) during the
-  Locations sync — fill-empty by default, overwrite opt-in, every write
-  audited as a `set_termmeta` op and undoable. Scan surfaces the
-  designation state, per-term address status (fields to fill / conflicts
-  to review), and a report-only legacy-meta count. Create-with-fields,
-  fill-empty idempotency, overwrite, and both undo branches (delete +
-  restore) verified live; dev left byte-identical to its pre-QA synced
-  state.
+- **Overall status:** ✅ **v1.7.0 Event Sync shipped and QA-passed on
+  ott-dev (2026-10-18).** New "Event Sync (TEC → EventKoi)" panel imports
+  TEC events through a hardened port of EventKoi's native importer
+  (v1.4.7.0): duplicate-RSVP-email dedupe (the Critical-Error fix), early
+  dedup marker, per-event try/catch with op-replay rollback, chunked
+  resumable runner (25/chunk, 18s budget), audited undo with hard-delete
+  + residual table sweep, native-import adoption, and Run Migration
+  interop via `_ekti_tec_product_*` bindings. QA: full run (626 events
+  incl. the native-fatal one), undo to exact baseline, idempotent
+  re-run, migration interop, adoption, and a rollback-scoping fix found
+  and re-verified during QA. See Step 14 below.
 
 ## Shared project facts (true for every step)
 
@@ -63,24 +64,33 @@ top-level document.
 | 11 | Taxonomy Sync — Instructors (TEC organizers → EventKoi `instructors` taxonomy) | ✅ Done | — |
 | 12 | Organizer custom field cleanup (backup + remove native-import Organizer field group) | ✅ Done | — |
 | 13 | Saved Locations term field sync (TEC venue addresses → builder term fields, overwrite + undo) | ✅ Done | — |
+| 14 | Event Sync (TEC events → EventKoi events — native-importer port, Critical-Error fix, chunked runner, adoption + undo) | ✅ Done | — |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
 
-**v1.6.0 complete and verified on ott-dev; release zip current.** Saved
-Locations term field sync shipped: TEC venue addresses copy onto
-`locations` term builder fields during the Locations sync (fill-empty
-default, overwrite opt-in), with designation detection, conflict
-surfacing, audited `set_termmeta` writes, and full undo. QA on ott-dev
-(2026-10-14) verified scan, create-with-fields, fill-empty idempotency,
-overwrite, and both undo branches; dev left byte-identical to its pre-QA
-synced state (658 assignments, manually-curated term data intact,
-importer deactivated to match pre-test state). The install zip
-(`eventkoi-tickets-importer.zip`) was rebuilt 2026-10-17 from the
-committed v1.6.0 tree (verified byte-identical admin.js, plugin header
-1.6.0). Remaining before wider release: update readme/changelog,
-consider an uninstall cleanup routine, and run prod cutover checklist.
+**Step 14 QA complete (2026-10-18) — results under Step 14 below.**
+`eventkoi-tickets-importer.zip` has been rebuilt from the 1.7.0 tree and
+is per-file identical to the QA-passed build deployed on ott-dev.
+
+1. **Send the upstream bug report to EventKoi** — draft in the Step 14
+   section (uncaught DatabaseQueryException on duplicate RSVP emails;
+   recommend marker-before-attendees, per-event isolation, chunking).
+2. **Production cutover prep** — update readme/changelog, add the
+   uninstall cleanup routine, then run the prod cutover checklist. On
+   prod, BEFORE any import verify TEC cleaner settings
+   (`trash-past-events` ≥ 24 or off; `delete-past-events` absent) and
+   run the panels in pipeline order: Event Sync → Adopt Native Imports
+   (if native imports exist) → Auto-Match → Taxonomy Syncs (Locations,
+   Instructors, Saved Locations fields) → Run Migration. On dev the
+   v1.5.0 location/instructor term assignments went with the earlier
+   event population (0 assignments after the Step 14 re-run) — a
+   Taxonomy Sync re-run repopulates them.
+3. **Prod-watch items from dev QA** — events without `_EventStartDate`
+   are reported as errors and skipped (35 on dev; data issue, not an
+   importer bug); recurrence-rule conversion is ported but untested
+   (0 recurring events on dev); custom fields are report-only.
 
 - **Verification results:** all 2421 order_ids distinct, 0 rows outside
   the mapping, 0 null ticket_ids, 0 orphan tickets, all `quantity_sold`
@@ -90,14 +100,30 @@ consider an uninstall cleanup routine, and run prod cutover checklist.
   snapshot (45355, 45306, 47077, 49647, 49187) are the restored-from-
   trash events carrying 22 attendees — reconciling 2399 + 22 + 856
   orphans = 3277 total.
-- **Dev server state:** EventKoi v1.4.6.1, importer v1.6.0 installed
-  but INACTIVE (pre-test state restored after QA); `ekti_event_mapping`
-  419 entries; `trash-past-events` 24 months; 333 native-importer clone
-  events trashed (2026-08-29, reversible ledger `ekti_event_dedupe_audit`)
-  — zero published duplicate sources remain. Saved Locations designation
-  active on the `locations` builder taxonomy (8/8 slots mapped); 658
-  events carry location terms; 3 terms carry manually-curated address
-  data with 11 review-only TEC divergences.
+- **Dev server state (post Step 14 QA, 2026-10-18):** EventKoi v1.4.7.0;
+  importer v1.7.0 ACTIVE (deployed QA build = rebuilt zip). Event Sync
+  applied: 662 EventKoi events (626 ours + 36 native; 623 publish /
+  39 draft), 662 `_tec_import_source_id` markers, 692 tickets (652 ours
+  + 40 native), 9 rsvps rows (2 duplicate emails merged), 652
+  `_ekti_tec_product_*` bindings, `ekti_event_mapping` 626 entries (ours
+  only — the 36 native imports are marker-mapped but not in the option),
+  48 adopted native attendee flags, 2,620-op `ekti_event_sync_audit`
+  ledger, 19 calendars (7 created by sync), upcoming_index 662 rows.
+  Run Migration left at its baseline (48 manual ticket_orders / 102
+  manual orders / 204 notes / 0 charges) — its QA artifacts were rolled
+  back after each interop test. 0 events carry location/instructor
+  terms (the v1.5.0 assignments went with the pre-cleanup event
+  population — re-run Taxonomy Sync to repopulate). TEC side unchanged:
+  744 posts, 3522 published wooticket attendees, 281 orphan TC
+  attendees (all TC source events were permanently deleted by the old
+  cleanup crons — report-only), 35 events without `_EventStartDate`
+  (sync errors, retried on each full run via the UI reset flag).
+  EventKoi's native TEC importer remains broken on dev data
+  (Critical Error, see Step 14) — our Event Sync is the working
+  replacement. `trash-past-events` 24 months; 333 native-importer clone
+  events trashed (2026-08-29, reversible ledger
+  `ekti_event_dedupe_audit`); Saved Locations designation active on the
+  `locations` builder taxonomy (8/8 slots mapped).
 - **5 of 419 mapping targets are DRAFT events** (Buche De Noel, Kids
   Class: Holiday Poptarts, Family Day Daddy Daughter Valentines, 2× Pan
   Dulce Workshop Series II) — the EventKoi counterparts of the 5
@@ -123,8 +149,10 @@ consider an uninstall cleanup routine, and run prod cutover checklist.
 - **Pre-existing orphans** (predating this cleanup, from the earlier
   manual pre-delete approach): 38 ticket rows + 2 `hold` test orders
   reference events that were hard-deleted long ago (no post exists to
-  untrash). Ticket 980 is guard-protected because the 2 hold rows point at
-  it. Decide whether to purge these manually before/after import.
+  untrash). ~~Decide whether to purge these manually before/after
+  import.~~ RESOLVED: the 2026-10-18 pre-Step-14 cleanup removed them;
+  verified post-QA — 0 orphan tickets, 0 hold orders, and the 40 native
+  tickets all attach to live native events.
 
 Remaining before wider release:
 
@@ -581,32 +609,206 @@ assignments with 0 field writes / 11 conflicts skipped; term meta,
 ledger, and scan output verified identical to the pre-QA baseline; QA
 terms removed; importer deactivated (pre-test state).
 
+### Step 14 — Event Sync (TEC events → EventKoi events, v1.7.0) 🟡
+
+Imports TEC events into EventKoi — a port of EventKoi's native
+`TEC_Importer` pipeline (v1.4.7.0) that fixes the Critical Error blocking
+the native importer on this dataset. **Root cause:**
+`import_native_rsvp_attendees()` inserts one `wp_eventkoi_rsvps` row per
+TEC RSVP attendee; events with duplicate attendee emails violate the
+`event_instance_email_uniq (event_id, instance_ts, email)` key, and
+EventKoi's StellarWP wrapper throws `DatabaseQueryException` on any SQL
+error (native's `$duplicate++` false-return branch is unreachable) —
+`run_import()` has no try/catch → uncaught fatal → REST 500. Compounding
+native bugs: the `_tec_import_source_id` marker is written AFTER attendee
+import (each failed run strands an unmarked duplicate draft), no
+per-event isolation (one bad event kills the whole run), and one
+synchronous unchunked request for all ~661 events (max_execution_time=30).
+
+**Implementation** (single-file plugin + admin.js, ~+1000 lines):
+
+- **Ported pipeline** (`es_*`-prefixed helpers + `*_sync` writers, each
+  with a provenance comment): dates/times/timezones/all-day (inclusive
+  last day pinned to 23:59:59), multi-day spans → `continuous`/
+  `selected` standard_type + event_days rows, occurrence-days fallback
+  (`wp_tec_occurrences`), recurrence-rule conversion (TEC Pro), venue →
+  locations array (address3 composite, gmap_link, `_EventShowMap` →
+  embed_gmap), Virtual Events URL → virtual location, attendance-mode
+  inference, wpautop description + organizer/cost tail, categories →
+  `event_cal` terms with color backfill + default-calendar fallback,
+  featured-image reuse (attachment ID, no sideload), event-website URL
+  custom field, `Upcoming_Index::rebuild_event()`, `ekti_event_mapping`
+  update so Auto-Match/Taxonomy Sync/Run Migration work unchanged.
+- **Deliberate divergences from native** (each tied to an existing step):
+  `quantity_available` = FULL TEC capacity and `quantity_sold` pre-set
+  from TEC `total_sales` (Step 7 model — native stores capacity-minus-
+  sold and gives seats back after attendee import); no `organizer_*`
+  postmeta (Step 12 removed them; Step 11 Instructors taxonomy owns
+  organizers); no custom-field conversion (scan reports the count only);
+  WooCommerce attendees NOT imported here — Run Migration owns them via
+  the `_ekti_tec_product_{tec}_{product}` bindings this sync writes.
+  Tickets Commerce attendees ARE imported as zero-value manual orders
+  via the public static `Ticket_Order_Sync::create_manual_order()`
+  (native parity; TC has no Woo order to link).
+- **Critical-Error hardening:** RSVP rows deduped by email per
+  event+instance BEFORE insert (duplicates counted + reported, never
+  inserted twice; inserts use `$wpdb`, which cannot throw); dedup marker
+  written immediately after `wp_insert_post` (never strands an unmarked
+  duplicate draft); per-event try/catch with op-replay rollback (one bad
+  event becomes a review item, run continues); chunked resumable runner
+  — 25 events/chunk with an 18s time budget, pending queue re-derived
+  per call (`run_event_sync()`); optional explicit-ID targeted runs
+  (native `event_ids` parity, used by QA for TEC 52802).
+- **Audit/undo:** separate `ekti_event_sync_audit` ledger (same rationale
+  as Steps 7/8); `replay_audit_ops()` gained 5 op types — `insert_post`
+  (hard `wp_delete_post` + residual sweep of tickets / ticket_orders /
+  rsvps / upcoming_index rows, parent orders + order_notes keyed by
+  checkout_id derived from the seat-scoped order_id prefix),
+  `insert_rsvp`, `insert_ticket_order` (per-seat rows + parent order +
+  notes, with EventKoi-semantics quantity_sold recount), `insert_field`,
+  `insert_field_group`.
+- **Native-import adoption:** pre-existing natively-imported events (36
+  on dev) whose EventKoi copies already carry ticket-order rows are
+  surfaced by the scan; the audited Adopt action flags their TEC
+  attendee posts `_eventkoi_imported_from_tec` so Run Migration won't
+  double-import attendees EventKoi already brought over. Off by
+  default, shares the event-sync ledger so undo reverts it too.
+- **Scan (`scan_event_sync()`)**: total/imported/unimported + by-status
+  counts, per-provider ticket + attendee counts (Woo/TC/RSVP with
+  unique-email math), currency mismatch flags, recurring/all-day/
+  virtual/image/custom-field profile, and review items (duplicate-email
+  RSVP events — the native-fatal set, no-start-date events, orphan /
+  trashed RSVP attendee sources — report only).
+- **Admin panel "Event Sync (TEC → EventKoi)"** rendered directly after
+  Overview (pipeline step 1): scan stat tiles + review-items table,
+  Import images checkbox (default on, native parity), optional targeted
+  "TEC IDs" input, Run Sync with chunked progress + per-event console
+  lines (created events / tickets / TC attendees / RSVP rows / merged
+  dupes / errors), Adopt Native Imports (confirm + counts), Undo Last
+  Event Sync. `admin.js` gained `scanEventSync()` / `loopEventSync()` /
+  `runEventSync()` / `adoptNativeImports()` / `undoEventSync()` with a
+  3-chunk no-progress stall guard. CSS unchanged (existing grid/panel
+  classes absorb the panel).
+
+**Status:** ✅ shipped; `php -l` + `node --check` clean; full QA passed
+on ott-dev 2026-10-18 (results below). `eventkoi-tickets-importer.zip`
+rebuilt from the 1.7.0 tree — per-file identical to the QA build.
+
+**Dev QA results (2026-10-18, importer v1.7.0 / EventKoi v1.4.7.0):**
+
+- **Deploy:** the zip must contain the top-level
+  `eventkoi-tickets-importer/` directory — a first attempt with files at
+  the archive root installed as a SEPARATE plugin (class-redeclare
+  fatal on activation; site stayed healthy because the fatal preceded
+  the `active_plugins` write). `opcache_invalidate($file, true)` is
+  required after every `wp plugin install --force --activate`.
+- **Scan (pre-run):** 661 unimported / 36 native; RSVP 11 rows → 9
+  unique emails across 4 importable events with 2 duplicate-email
+  review items (52802: 3→2, 52812: 4→3; 52766/52806 clean); 3 orphan
+  RSVP sources; all TC data orphaned — the 104 "TC events" are deleted
+  post IDs referenced by 281 orphan `tec_tc_attendee` rows (old
+  cleanup-cron deletions; report-only, hence tc_attendees=0 in runs);
+  68 drafts included; 0 currency mismatch; 0 recurring/virtual.
+- **Targeted run TEC 52802** (the deterministic native-fatal event):
+  imported cleanly — 2 RSVP rows, 1 merged duplicate. The Critical
+  Error is resolved on our side.
+- **Full run:** 27 chunks, 626 imported, 35 errors (all "no start date"
+  → failure memory, retried on the next full run via the UI's reset
+  flag), 9 RSVP rows + 2 merged, done. Totals: 662 events (623 publish
+  / 39 draft), 692 tickets, 652 bindings, 626 mapping entries, 7 new
+  calendars (19 total), upcoming_index 662. EventKoi SPA verified via
+  REST (`/eventkoi/v1/events` returns all 662 well-formed; counts match
+  DB); field-by-field spot-checks vs native imports passed (locations
+  array w/ gmap + lat/lng, UTC dates, timezone, attendance mode, ticket
+  rows with sale windows, description tail); `event_days: []` on
+  occurrence-less events confirmed native-parity (line-identical port).
+- **Run Migration interop:** batch at attendee 47044 (TEC 43148 → EK
+  54078): 30 attendees created / 21 orders + charges, **tickets_created
+  0** — every attendee bound to Event Sync tickets via
+  `_ekti_tec_product_*`; recount landed quantity_sold on TEC
+  total_sales (ticket 721: 1).
+- **Undo:** all 2,572 ledger ops replayed in reverse in ~80 s → exact
+  baseline restored (36 events / 36 markers / 0 mapping / 40 tickets /
+  48 manual orders / 0 rsvps / 102 orders / 204 notes / 36
+  upcoming_index / 12 terms).
+- **Idempotency:** full re-run on the fixed build reproduced identical
+  tallies (626/35/9+2); a subsequent run processed 0 with every tally 0
+  and state unchanged (662/662/692/9/652).
+- **rollback_import scoping fix (bug found during QA, fixed in-build):**
+  the original blanket rollback deleted every `_ekti_tec_product_%`-
+  bound ticket — all 652 Event Sync tickets — and wiped every
+  `_eventkoi_imported_from_tec` flag plus all WC `_eventkoi_*` meta.
+  Fixed with two tracking options (`ekti_migration_created_tickets`,
+  `ekti_migration_flagged_posts`) and `_eventkoi_synced`-only WC-meta
+  cleanup; also fixed `ek_ticket_order_id` result reporting (stale
+  `$wpdb->insert_id`). Re-tested: rollback of the interop batch deleted
+  exactly 30 ticket_orders / 21 orders / 21 charges / 21 notes / **0
+  tickets** — 692 tickets, 652 bindings, and all Event Sync state
+  untouched.
+- **Adopt Native Imports:** scan found 14 native events with 48
+  unflagged woo attendees; Adopt flagged all 48 (48 audited
+  `update_postmeta` ops appended to the event-sync ledger — 2,620 ops
+  total; re-scan 0). A migration batch over an adopted attendee (with
+  the event mapped) skipped it: "Already imported (attendee-level
+  flag)"; adopted flags survive rollback_import (only migration-tracked
+  flags are cleared). Natively-imported events are not in
+  `ekti_event_mapping`, so unmapped their attendees skip at the mapping
+  check instead — either guard prevents double-import.
+
+**Upstream bug report to EventKoi (draft — send via EventKoi support):**
+
+EventKoi v1.4.7.0, `includes/importers/class-tec-importer.php`:
+
+1. **Uncaught `DatabaseQueryException` on duplicate RSVP attendee
+   emails (fatal).** `import_native_rsvp_attendees()` (~line 1561)
+   inserts one `wp_eventkoi_rsvps` row per TEC RSVP attendee; a
+   duplicate email (double submission) violates
+   `event_instance_email_uniq (event_id, instance_ts, email)`, and the
+   StellarWP wrapper (`runQueryWithErrorChecking`, DB.php:289) throws —
+   the `$duplicate++` false-return branch is unreachable.
+   `run_import()` has no try/catch → REST 500 "There has been a
+   critical error on this website." Repro: any event with two RSVP rows
+   sharing an email; the run's first such event kills every attempt.
+   Fix: dedupe by email per event+instance before insert (count
+   duplicates) or catch the exception and treat it as a duplicate.
+2. **`_tec_import_source_id` written after attendee import** (~line
+   518) — any mid-event failure strands an unmarked duplicate draft
+   event post plus partial ticket/RSVP rows; every retry duplicates.
+   Fix: write the marker immediately after `wp_insert_post()`.
+3. **No per-event isolation** — one bad event aborts the whole run.
+4. **Single synchronous request for all events** (~661 × 0.2–0.5 s ≫
+   `max_execution_time`) — chunked/resumable batches recommended.
+
 ---
 
 ## Admin UI ✅
 
-Server-rendered PHP page (`render_admin_page()`) with seven panels:
+Server-rendered PHP page (`render_admin_page()`) with eight panels:
 1. **Overview** — stats grid (TEC events, attendees, EventKoi events, mapped/
    unmapped events, attendees to import, WC orders to link, already imported)
    loaded via AJAX. Dismissible warning notice when WooCommerce is inactive.
-2. **Event Mapping** — Auto-Match button, Load/Save Mapping buttons, a
+2. **Event Sync (TEC → EventKoi)** (v1.7.0) — Scan Events / Run Event Sync /
+   Adopt Native Imports / Undo Last Event Sync buttons, Import images
+   checkbox, optional targeted TEC-IDs input, progress bar reuse, scan stat
+   tiles, review-items table, and native-import adoption status.
+3. **Event Mapping** — Auto-Match button, Load/Save Mapping buttons, a
    `wp-list-table` with TEC event ID/title/attendee count and an EventKoi
    event `<select>` per row. Status badges show match source.
-3. **Run Migration** — Dry Run checkbox, Start Import / Resume / Rollback
+4. **Run Migration** — Dry Run checkbox, Start Import / Resume / Rollback
    buttons, progress bar, live console output with color-coded log entries
    (green=success, red=error, yellow=warn, blue=info). Console shows
    composite keys and WC order IDs per attendee.
-4. **Import Log File** — Load/Clear buttons, `<pre>` viewer.
-5. **Pre-Import Cleanup** (v1.1.0) — Scan / Run Ticket Dedupe / Run Event
+5. **Import Log File** — Load/Clear buttons, `<pre>` viewer.
+6. **Pre-Import Cleanup** (v1.1.0) — Scan / Run Ticket Dedupe / Run Event
    Merge / Undo Last Cleanup buttons, progress bar reuse, three review
    tables (stale ticket pairs with keep-vs-delete + TEC current price,
    review items, duplicate event groups with canonical badge and member
    stats).
-6. **Ticket Details Sync** (v1.2.0) — Scan / Run Sync / Undo Last Sync
+7. **Ticket Details Sync** (v1.2.0) — Scan / Run Sync / Undo Last Sync
    buttons, progress bar reuse, three tables (ticket types to create or
    convert with price/capacity/site-local sale window, field updates with
    current → proposed values, review items).
-7. **Calendar Sync (Locations)** (v1.3.0) — Scan Locations / Save Mapping /
+8. **Calendar Sync (Locations)** (v1.3.0) — Scan Locations / Save Mapping /
    Run Calendar Sync / Undo Last Calendar Sync buttons, progress bar reuse,
    one row per TEC location with source, mapped-event count, auto-match
    badge, and a calendar dropdown (existing calendars + create-new with
@@ -814,6 +1016,58 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
   (ledger semantics — undo replays everything); the final restore run
   re-applied all 658 assignments and rebuilt an equivalent ledger,
   leaving dev verified-identical to pre-QA.
+
+- 2026-10-18: **Step 14 — Event Sync design decisions.** Porting the
+  private native-importer logic into our plugin (with provenance
+  comments) rather than patching EventKoi — it's a vendor plugin, so the
+  bug gets reported upstream instead (class-tec-importer.php ~line 1561:
+  uncaught DatabaseQueryException on duplicate RSVP emails; recommend
+  marker-before-attendees + per-event isolation). The runner recomputes
+  the pending queue per chunk instead of persisting a queue option, so
+  the run is resumable even after a mid-run PHP death — the early marker
+  guarantees a retry can never create a duplicate event (the native
+  importer's failure mode; a partial event is repairable by deleting its
+  EventKoi copy and re-running). Undo hard-deletes created events
+  (unlike the merge panel's trash) because a trashed EventKoi copy would
+  still carry `_tec_import_source_id` and block re-imports after undo.
+  `create_manual_order()`'s quantity_sold overwrite is consistent with
+  the Step 7 capacity model because a TEC ticket is either Woo (no
+  manual orders created here — Run Migration owns those attendees) or
+  TC (total_sales == the manual orders we create); the undo op re-runs
+  EventKoi's own recount SQL. Adoption shares the event-sync ledger so a
+  single Undo reverses adoption + sync together (both are Step 14
+  lifecycle writes).
+
+- 2026-10-18: **Step 14 QA — zip structure lesson.** A plugin zip with
+  files at the archive ROOT installs as a separate plugin directory
+  (named after the zip) → class-redeclare fatal on activation. Builds
+  must wrap everything in the top-level `eventkoi-tickets-importer/`
+  directory (including LICENSE, README.md, and assets/) — verified
+  against the original distribution zip listing.
+
+- 2026-10-18: **rollback_import scoped to migration-created artifacts.**
+  QA exposed that Run Migration's rollback blanket-deleted every ticket
+  referenced by a `_ekti_tec_product_%` option — after Step 14 most of
+  those bindings belong to Event Sync's own tickets, so a migration
+  rollback would have destroyed the entire Event Sync ticket set (652
+  tickets on dev) plus every `_eventkoi_imported_from_tec` flag
+  (including Adopt's) and all WC `_eventkoi_*` meta (including Event
+  Dedupe's repoints). Rollback now deletes only migration-created
+  tickets (`ekti_migration_created_tickets`), clears flags only on
+  migration-flagged posts (`ekti_migration_flagged_posts`), and cleans
+  WC meta only on orders the migration itself synced
+  (`_eventkoi_synced`). Stale bindings (ticket no longer exists) are
+  still removed either way.
+
+- 2026-10-18: **QA expectation corrections vs the plan.** All TC data
+  on dev is orphaned (the 104 "TC events" are permanently deleted posts
+  referenced by 281 `tec_tc_attendee` rows — report-only, runs show
+  tc_attendees=0); only 2 events have duplicate RSVP emails (plan
+  guessed 4); the full run is 626 imported + 35 no-start-date errors,
+  not 661/697 (661 was the scan's unimported count, which includes the
+  35 unusable events). Location/instructor term assignments from
+  v1.5.0 went with the pre-cleanup event population (0 assignments
+  today) — re-run Taxonomy Sync after Event Sync to repopulate.
 
 - **No REST API:** the plugin uses `admin-ajax.php` rather than WP REST. This
   is deliberate for a migration tool — all operations are admin-initiated,

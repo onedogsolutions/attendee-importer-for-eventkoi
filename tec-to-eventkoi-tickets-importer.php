@@ -3,7 +3,7 @@
  * Plugin Name: EventKoi Tickets Importer
  * Plugin URI:  https://onedog.solutions
  * Description: Migrates tickets and attendees from The Events Calendar (Event Tickets / Event Tickets Plus) to EventKoi.
- * Version:     1.6.0
+ * Version:     1.7.0
  * Author:      One Dog Solutions
  * Author URI:  https://onedog.solutions
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'EKTI_VERSION', '1.6.0' );
+define( 'EKTI_VERSION', '1.7.0' );
 define( 'EKTI_LOG_DIR', WP_CONTENT_DIR . '/uploads' );
 define( 'EKTI_LOG_FILE', EKTI_LOG_DIR . '/eventkoi-import.log' );
 define( 'EKTI_BATCH_SIZE', 30 );
@@ -78,6 +78,10 @@ final class EventKoi_Tickets_Importer {
         add_action( 'wp_ajax_ekti_run_taxonomy_sync', [ $this, 'ajax_run_taxonomy_sync' ] );
         add_action( 'wp_ajax_ekti_undo_taxonomy_sync', [ $this, 'ajax_undo_taxonomy_sync' ] );
         add_action( 'wp_ajax_ekti_remove_organizer_fields', [ $this, 'ajax_remove_organizer_fields' ] );
+        add_action( 'wp_ajax_ekti_scan_event_sync', [ $this, 'ajax_scan_event_sync' ] );
+        add_action( 'wp_ajax_ekti_run_event_sync', [ $this, 'ajax_run_event_sync' ] );
+        add_action( 'wp_ajax_ekti_adopt_native_imports', [ $this, 'ajax_adopt_native_imports' ] );
+        add_action( 'wp_ajax_ekti_undo_event_sync', [ $this, 'ajax_undo_event_sync' ] );
         add_action( 'wp_ajax_ekti_get_log', [ $this, 'ajax_get_log' ] );
         add_action( 'wp_ajax_ekti_clear_log', [ $this, 'ajax_clear_log' ] );
     }
@@ -513,6 +517,7 @@ final class EventKoi_Tickets_Importer {
         $ticket_cache     = []; // tec_event_id_product_id => eventkoi_ticket_id
         $parent_order_ids = []; // wc_order_id => eventkoi_orders.id
         $wc_order_totals  = []; // wc_order_id => { total, qty, event_id, title, attendees, ticket_id }
+        $flagged_ids      = []; // Attendee posts this batch flagged as imported.
 
         // --- Phase 1: resolve tickets and group by WC order ----------------
         $resolved = []; // attendees that passed mapping + ticket resolution
@@ -758,6 +763,7 @@ final class EventKoi_Tickets_Importer {
                 ] );
 
                 if ( $inserted ) {
+                    $ticket_order_id  = (int) $wpdb->insert_id;
                     $state['attendees_created']++;
 
                     // Update ticket quantity_sold via recount (accurate).
@@ -777,15 +783,19 @@ final class EventKoi_Tickets_Importer {
                         );
                     }
 
-                    // Mark source attendee as imported.
+                    // Mark source attendee as imported, remembering it so the
+                    // migration rollback clears only flags the migration set —
+                    // Adopt Native Imports (Step 14) writes the same flag for
+                    // attendees that must keep it.
                     update_post_meta( $att['ID'], '_eventkoi_imported_from_tec', true );
+                    $flagged_ids[] = (int) $att['ID'];
 
                     $results[] = [
                         'attendee_id'        => $att['ID'],
                         'action'             => 'created',
                         'name'               => $att['full_name'],
                         'composite_key'      => $composite_order_id,
-                        'ek_ticket_order_id' => $wpdb->insert_id,
+                        'ek_ticket_order_id' => $ticket_order_id,
                     ];
                 } else {
                     $state['errors']++;
@@ -803,6 +813,14 @@ final class EventKoi_Tickets_Importer {
 
         $state['offset'] += count( $attendees );
         $this->update_migration_state( $state );
+
+        if ( $flagged_ids && ! $dry_run ) {
+            $flagged = get_option( 'ekti_migration_flagged_posts', [] );
+            if ( ! is_array( $flagged ) ) {
+                $flagged = [];
+            }
+            update_option( 'ekti_migration_flagged_posts', array_values( array_unique( array_merge( $flagged, $flagged_ids ) ) ), false );
+        }
 
         return [
             'done'    => count( $attendees ) < EKTI_BATCH_SIZE,
@@ -888,6 +906,15 @@ final class EventKoi_Tickets_Importer {
         if ( $inserted ) {
             $ticket_id = $wpdb->insert_id;
             update_option( $meta_key, $ticket_id );
+            // Remember tickets the migration created so its rollback deletes
+            // only those — Event Sync (Step 14) writes the same binding
+            // options for tickets that must survive a migration rollback.
+            $created = get_option( 'ekti_migration_created_tickets', [] );
+            if ( ! is_array( $created ) ) {
+                $created = [];
+            }
+            $created[] = (int) $ticket_id;
+            update_option( 'ekti_migration_created_tickets', array_values( array_unique( $created ) ), false );
             $this->log( "Created ticket type: {$ticket_name} (ID: {$ticket_id}) for EventKoi event {$ek_event_id}" );
             return $ticket_id;
         }
@@ -1164,23 +1191,55 @@ final class EventKoi_Tickets_Importer {
             "DELETE FROM {$ticket_orders_table} WHERE order_id LIKE 'wc_%' OR order_id LIKE 'tec_import_%'"
         );
 
-        // Delete tickets created by the importer (tracked via options).
+        // Delete tickets created by THIS importer only. The _ekti_tec_product_*
+        // bindings are also written by Event Sync (Step 14) for tickets Event
+        // Sync itself created; those tickets and bindings survive a migration
+        // rollback. A binding is removed when its ticket was migration-created
+        // or no longer exists (stale).
+        $migration_tickets = get_option( 'ekti_migration_created_tickets', [] );
+        if ( ! is_array( $migration_tickets ) ) {
+            $migration_tickets = [];
+        }
+        $migration_tickets = array_map( 'intval', $migration_tickets );
         $all_options = $wpdb->get_results(
             "SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE '_ekti_tec_product_%'"
         );
         $deleted_tickets = 0;
         foreach ( $all_options as $opt ) {
-            $wpdb->delete( $tickets_table, [ 'id' => intval( $opt->option_value ) ], [ '%d' ] );
-            delete_option( $opt->option_name );
-            $deleted_tickets++;
+            $ticket_id           = intval( $opt->option_value );
+            $is_migration_ticket = in_array( $ticket_id, $migration_tickets, true );
+            if ( $is_migration_ticket ) {
+                $wpdb->delete( $tickets_table, [ 'id' => $ticket_id ], [ '%d' ] );
+                $deleted_tickets++;
+            }
+            $ticket_exists = (bool) $wpdb->get_var( $wpdb->prepare(
+                "SELECT id FROM {$tickets_table} WHERE id = %d",
+                $ticket_id
+            ) );
+            if ( $is_migration_ticket || ! $ticket_exists ) {
+                delete_option( $opt->option_name );
+            }
         }
+        delete_option( 'ekti_migration_created_tickets' );
 
-        // Clean up meta on source posts.
-        $wpdb->query(
-            "DELETE FROM {$wpdb->postmeta} WHERE meta_key = '_eventkoi_imported_from_tec'"
-        );
+        // Clear only the import flags the migration itself set — Adopt Native
+        // Imports (Step 14) writes the same flag on other attendee posts and
+        // those must not be reset by a migration rollback.
+        $flagged_posts = get_option( 'ekti_migration_flagged_posts', [] );
+        if ( ! is_array( $flagged_posts ) ) {
+            $flagged_posts = [];
+        }
+        if ( $flagged_posts ) {
+            $flagged_in = implode( ',', array_map( 'intval', $flagged_posts ) );
+            $wpdb->query(
+                "DELETE FROM {$wpdb->postmeta} WHERE meta_key = '_eventkoi_imported_from_tec' AND post_id IN ({$flagged_in})"
+            );
+        }
+        delete_option( 'ekti_migration_flagged_posts' );
 
-        // Clean EventKoi meta from WooCommerce orders.
+        // Clean EventKoi meta from WooCommerce orders the migration stamped
+        // (_eventkoi_synced). Event Dedupe repoints _eventkoi_event_id on
+        // other orders; those writes must survive a migration rollback.
         if ( $this->wc_is_available() ) {
             $ek_meta_keys = [
                 '_eventkoi_event_id',
@@ -1190,18 +1249,18 @@ final class EventKoi_Tickets_Importer {
                 '_eventkoi_master_checkin_code',
                 '_eventkoi_synced',
             ];
-            // Only clean meta that was set by this importer (where _eventkoi_synced = 'yes'
-            // and there's a matching ticket_orders row with wc_ prefix — which we just deleted).
-            // Since the ticket_orders rows are already deleted, we clean meta on orders
-            // that had the synced flag but no longer have EK ticket orders.
-            foreach ( $ek_meta_keys as $meta_key ) {
-                $wpdb->query( $wpdb->prepare(
-                    "DELETE pm FROM {$wpdb->postmeta} pm
-                     INNER JOIN {$wpdb->posts} p ON pm.post_id = p.ID
-                     WHERE pm.meta_key = %s
-                       AND p.post_type = 'shop_order'",
-                    $meta_key
-                ) );
+            $synced_posts = $wpdb->get_col(
+                "SELECT DISTINCT pm.post_id FROM {$wpdb->postmeta} pm
+                 INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+                 WHERE pm.meta_key = '_eventkoi_synced' AND p.post_type = 'shop_order'"
+            );
+            if ( $synced_posts ) {
+                $synced_in = implode( ',', array_map( 'intval', $synced_posts ) );
+                foreach ( $ek_meta_keys as $meta_key ) {
+                    $wpdb->query(
+                        "DELETE FROM {$wpdb->postmeta} WHERE meta_key = '{$meta_key}' AND post_id IN ({$synced_in})"
+                    );
+                }
             }
         }
 
@@ -1877,6 +1936,74 @@ final class EventKoi_Tickets_Importer {
                     } else {
                         update_term_meta( (int) $op['term_id'], $op['key'], $op['old'] );
                     }
+                    break;
+                // Event Sync (Step 14) ops — rows this sync created are removed.
+                case 'insert_post':
+                    $post_id = (int) $op['id'];
+                    // Hard delete: this sync created the post (undo must not
+                    // leave a trashed copy behind to re-match against).
+                    wp_delete_post( $post_id, true );
+                    // Residual sweep AFTER the delete (so any EventKoi hooks
+                    // firing during deletion cannot re-add rows afterwards):
+                    // EventKoi data keyed to the event that does not cascade
+                    // with the post. Parent orders are keyed by checkout_id,
+                    // the base of the seat-scoped ticket_orders.order_id.
+                    $order_ids = $wpdb->get_col( $wpdb->prepare(
+                        "SELECT DISTINCT order_id FROM {$this->ek_table( 'ticket_orders' )} WHERE event_id = %d",
+                        $post_id
+                    ) );
+                    foreach ( (array) $order_ids as $order_id ) {
+                        $base = strstr( (string) $order_id, ':', true );
+                        $base = false === $base ? (string) $order_id : $base;
+                        $order_row_id = (int) $wpdb->get_var( $wpdb->prepare(
+                            "SELECT id FROM {$this->ek_table( 'orders' )} WHERE checkout_id = %s",
+                            $base
+                        ) );
+                        if ( $order_row_id ) {
+                            $wpdb->delete( $this->ek_table( 'order_notes' ), [ 'order_id' => $order_row_id ] );
+                            $wpdb->delete( $this->ek_table( 'orders' ), [ 'id' => $order_row_id ] );
+                        }
+                    }
+                    $wpdb->delete( $this->ek_table( 'ticket_orders' ), [ 'event_id' => $post_id ] );
+                    $wpdb->delete( $this->ek_table( 'rsvps' ), [ 'event_id' => $post_id ] );
+                    $wpdb->delete( $this->ek_table( 'tickets' ), [ 'event_id' => $post_id ] );
+                    $wpdb->delete( $this->ek_table( 'upcoming_index' ), [ 'event_id' => $post_id ] );
+                    break;
+                case 'insert_rsvp':
+                    $wpdb->delete( $this->ek_table( 'rsvps' ), [ 'id' => (int) $op['id'] ] );
+                    break;
+                case 'insert_ticket_order':
+                    foreach ( (array) $op['note_ids'] as $note_id ) {
+                        $wpdb->delete( $this->ek_table( 'order_notes' ), [ 'id' => (int) $note_id ] );
+                    }
+                    if ( ! empty( $op['order_row_id'] ) ) {
+                        $wpdb->delete( $this->ek_table( 'orders' ), [ 'id' => (int) $op['order_row_id'] ] );
+                    }
+                    foreach ( (array) $op['ticket_order_ids'] as $row_id ) {
+                        $wpdb->delete( $this->ek_table( 'ticket_orders' ), [ 'id' => (int) $row_id ] );
+                    }
+                    // create_manual_order overwrites quantity_sold with the
+                    // complete-order recount; run the same recount now that
+                    // this order's rows are gone (harmless when the ticket row
+                    // itself is deleted next — reverse replay order).
+                    $wpdb->query( $wpdb->prepare(
+                        "UPDATE {$this->ek_table( 'tickets' )} t
+                         SET t.quantity_sold = (
+                             SELECT COALESCE( SUM( o.quantity ), 0 )
+                             FROM {$this->ek_table( 'ticket_orders' )} o
+                             WHERE o.ticket_id = t.id
+                               AND o.event_id = t.event_id
+                               AND o.payment_status IN ( 'complete', 'completed', 'succeeded', 'paid', 'partially_refunded' )
+                         )
+                         WHERE t.id = %d",
+                        (int) $op['ticket_id']
+                    ) );
+                    break;
+                case 'insert_field':
+                    $wpdb->delete( $this->ek_table( 'fields' ), [ 'id' => (int) $op['id'] ] );
+                    break;
+                case 'insert_field_group':
+                    $wpdb->delete( $this->ek_table( 'field_groups' ), [ 'id' => (int) $op['id'] ] );
                     break;
             }
             $counts[ $op['type'] ] = ( $counts[ $op['type'] ] ?? 0 ) + 1;
@@ -4091,6 +4218,2054 @@ final class EventKoi_Tickets_Importer {
     }
 
     /* ------------------------------------------------------------------
+     * STEP 14 — EVENT SYNC (TEC EVENTS → EVENTKOI EVENTS)
+     *
+     * Imports actual TEC events into EventKoi, mirroring EventKoi's native
+     * importer (eventkoi/includes/core/class-tec-importer.php, v1.4.7.0) so
+     * both importers produce identical events and agree on the
+     * _tec_import_source_id dedup marker. Ported helpers carry provenance
+     * comments; deliberate divergences from native are marked inline:
+     *
+     *   - Ticket capacity: quantity_available is the FULL TEC capacity and
+     *     quantity_sold is pre-set from TEC total_sales (Step 7 model),
+     *     instead of native's sold-deducted capacity + give-back.
+     *   - No organizer_* postmeta or structured record fields (Step 12
+     *     removed those; Taxonomy Sync owns organizers).
+     *   - No custom-field conversion (scan reports the count only).
+     *   - WooCommerce attendees are NOT imported here — Run Migration owns
+     *     them via the _ekti_tec_product_{tec}_{product} bindings this sync
+     *     writes. Tickets Commerce attendees DO import here as zero-value
+     *     manual orders (native parity; TC has no Woo order to link).
+     *   - Hardening for the native importer's Critical Error: RSVP rows are
+     *     deduped by email per event+instance (EventKoi's StellarWP wrapper
+     *     throws DatabaseQueryException on the duplicate instead of letting
+     *     the insert return false), the dedup marker is written immediately
+     *     after wp_insert_post (native writes it last, leaving unmarked
+     *     duplicate drafts behind on any failure), each event runs inside
+     *     its own try/catch with per-event rollback, and the runner is
+     *     chunked with a time budget instead of one unchunked request.
+     * ------------------------------------------------------------------ */
+
+    /**
+     * TEC event IDs eligible for import: publish/draft/pending/future/private
+     * posts (native status filter; excludes trash/auto-draft), ordered by ID,
+     * minus events that already carry an EventKoi _tec_import_source_id
+     * marker on a non-trashed EventKoi event.
+     */
+    private function get_tec_event_import_ids() {
+        global $wpdb;
+
+        $imported = $wpdb->get_col(
+            "SELECT DISTINCT pm.meta_value FROM {$wpdb->postmeta} pm
+             INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+             WHERE pm.meta_key = '_tec_import_source_id'
+               AND p.post_status != 'trash'"
+        );
+        $imported = array_map( 'intval', array_filter( $imported, 'is_numeric' ) );
+
+        $sql = "SELECT ID FROM {$wpdb->posts}
+             WHERE post_type = 'tribe_events'
+               AND post_status IN ('publish','draft','pending','future','private')";
+        if ( $imported ) {
+            $sql .= ' AND ID NOT IN (' . implode( ',', array_map( 'intval', $imported ) ) . ')';
+        }
+        $sql .= ' ORDER BY ID ASC';
+
+        return array_map( 'intval', $wpdb->get_col( $sql ) );
+    }
+
+    /**
+     * Whether a TEC event is marked all-day. Ported from native
+     * TEC_Importer::is_all_day(): modern TEC stores '1', legacy 'yes'.
+     */
+    private function es_is_all_day( $tec_id ) {
+        $raw = get_post_meta( $tec_id, '_EventAllDay', true );
+        return in_array( $raw, [ 'yes', '1', 1, true ], true );
+    }
+
+    /**
+     * Convert a TEC wall-clock datetime to ISO 8601 Zulu. Ported from
+     * native TEC_Importer::to_iso_date(). Falls back to the raw string.
+     */
+    private function es_to_iso_date( $date, $timezone = '' ) {
+        if ( empty( $date ) ) {
+            return '';
+        }
+        try {
+            $tz = ! empty( $timezone ) ? new DateTimeZone( $timezone ) : wp_timezone();
+            $dt = new DateTime( $date, $tz );
+            $dt->setTimezone( new DateTimeZone( 'UTC' ) );
+            return $dt->format( 'Y-m-d\TH:i:s\Z' );
+        } catch ( Exception $e ) {
+            return $date;
+        }
+    }
+
+    /**
+     * Format a UTC MySQL datetime as ISO 8601 Zulu. Ported from native
+     * TEC_Importer::utc_to_iso().
+     */
+    private function es_utc_to_iso( $datetime ) {
+        if ( empty( $datetime ) ) {
+            return '';
+        }
+        try {
+            $dt = new DateTime( (string) $datetime, new DateTimeZone( 'UTC' ) );
+            return $dt->format( 'Y-m-d\TH:i:s\Z' );
+        } catch ( Exception $e ) {
+            return '';
+        }
+    }
+
+    /**
+     * Whether a TEC date range spans more than one calendar day, compared in
+     * the source wall-clock timezone. Ported from native
+     * TEC_Importer::spans_multiple_days().
+     */
+    private function es_spans_multiple_days( $start_date, $end_date ) {
+        if ( empty( $start_date ) || empty( $end_date ) ) {
+            return false;
+        }
+        try {
+            $start = new DateTime( $start_date );
+            $end   = new DateTime( $end_date );
+            if ( $end > $start && '00:00:00' === $end->format( 'H:i:s' ) ) {
+                $end->modify( '-1 second' );
+            }
+            return $start->format( 'Y-m-d' ) !== $end->format( 'Y-m-d' );
+        } catch ( Exception $e ) {
+            return false;
+        }
+    }
+
+    /**
+     * Every materialized TEC occurrence date as event_days rows (TEC 6.x
+     * wp_tec_occurrences). Ported from native
+     * TEC_Importer::get_tec_occurrence_days().
+     */
+    private function es_get_tec_occurrence_days( $tec_id, $all_day ) {
+        global $wpdb;
+
+        $table = $wpdb->prefix . 'tec_occurrences';
+        if ( $table !== $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) ) ) {
+            return [];
+        }
+
+        $rows = $wpdb->get_results( $wpdb->prepare(
+            "SELECT start_date_utc, end_date_utc FROM `{$table}` WHERE post_id = %d ORDER BY start_date_utc ASC",
+            $tec_id
+        ) );
+        if ( empty( $rows ) ) {
+            return [];
+        }
+
+        $days = [];
+        foreach ( $rows as $row ) {
+            $start = $this->es_utc_to_iso( $row->start_date_utc );
+            if ( '' === $start ) {
+                continue;
+            }
+            $end     = $this->es_utc_to_iso( $row->end_date_utc );
+            $days[] = [
+                'start_date' => $start,
+                'end_date'   => '' !== $end ? $end : $start,
+                'all_day'    => (bool) $all_day,
+            ];
+        }
+        return $days;
+    }
+
+    /**
+     * Convert TEC Pro recurrence rules to EventKoi recurrence_rules. Ported
+     * from native TEC_Importer::convert_recurrence_rules().
+     */
+    private function es_convert_recurrence_rules( $tec_rules, $start_date, $end_date, $timezone ) {
+        $ek_rules  = [];
+        $freq_map = [
+            'Daily'   => 'day',
+            'Weekly'  => 'week',
+            'Monthly' => 'month',
+            'Yearly'  => 'year',
+        ];
+
+        foreach ( (array) $tec_rules as $rule ) {
+            if ( empty( $rule['type'] ) ) {
+                continue;
+            }
+
+            $rule_type = $rule['type'];
+            if ( 'Custom' === $rule_type ) {
+                $rule_type = $rule['custom']['type'] ?? '';
+            }
+
+            $frequency = $freq_map[ $rule_type ] ?? '';
+            if ( empty( $frequency ) ) {
+                continue;
+            }
+
+            $start_iso = $this->es_to_iso_date( $start_date, $timezone );
+            $end_iso   = ! empty( $end_date ) ? $this->es_to_iso_date( $end_date, $timezone ) : '';
+            $interval  = ! empty( $rule['custom']['interval'] ) ? (int) $rule['custom']['interval'] : 1;
+
+            $ek_rule = [
+                'start_date'        => $start_iso,
+                'end_date'          => $end_iso,
+                'frequency'         => $frequency,
+                'every'             => $interval,
+                'all_day'           => false,
+                'working_days_only' => false,
+                'weekdays'          => [],
+                'months'            => [],
+                'month_day_rule'    => 'day-of-month',
+                'month_day_value'   => 1,
+                'ends'              => 'never',
+                'ends_after'        => 30,
+                'ends_on'           => '',
+            ];
+
+            try {
+                $start_dt                   = new DateTime( $start_iso );
+                $ek_rule['months']          = [ (int) $start_dt->format( 'n' ) - 1 ];
+                $ek_rule['month_day_value'] = (int) $start_dt->format( 'j' );
+            } catch ( Exception $e ) {
+                unset( $e );
+            }
+
+            if ( 'week' === $frequency && ! empty( $rule['custom']['week']['day'] ) ) {
+                $ek_days = [];
+                foreach ( (array) $rule['custom']['week']['day'] as $d ) {
+                    $d        = (int) $d;
+                    $ek_days[] = ( 7 === $d ) ? 0 : $d; // TEC 1=Mon..7=Sun → EK 0=Sun..6=Sat.
+                }
+                $ek_rule['weekdays'] = $ek_days;
+            }
+
+            if ( ! empty( $rule['end-type'] ) ) {
+                if ( 'After' === $rule['end-type'] && ! empty( $rule['end-count'] ) ) {
+                    $ek_rule['ends']       = 'after';
+                    $ek_rule['ends_after'] = (int) $rule['end-count'];
+                } elseif ( 'On' === $rule['end-type'] && ! empty( $rule['end'] ) ) {
+                    $ek_rule['ends']    = 'on';
+                    $ek_rule['ends_on'] = $this->es_to_iso_date( $rule['end'], $timezone );
+                }
+            }
+
+            $ek_rules[] = $ek_rule;
+        }
+
+        return $ek_rules;
+    }
+
+    /**
+     * Build the EventKoi locations array from the TEC venue. Ported from
+     * native TEC_Importer::build_locations().
+     */
+    private function es_build_locations( $tec_id, $show_map = false ) {
+        $venue_id = get_post_meta( $tec_id, '_EventVenueID', true );
+        if ( empty( $venue_id ) ) {
+            return [];
+        }
+        $venue = get_post( $venue_id );
+        if ( ! $venue ) {
+            return [];
+        }
+
+        $address = (string) get_post_meta( $venue_id, '_VenueAddress', true );
+        $city    = (string) get_post_meta( $venue_id, '_VenueCity', true );
+        $state   = (string) get_post_meta( $venue_id, '_VenueState', true );
+        $zip     = (string) get_post_meta( $venue_id, '_VenueZip', true );
+        $country = (string) get_post_meta( $venue_id, '_VenueCountry', true );
+        $lat     = (string) get_post_meta( $venue_id, '_VenueLat', true );
+        $lng     = (string) get_post_meta( $venue_id, '_VenueLng', true );
+
+        $address3 = implode( ', ', array_filter( [ $city, $state, $zip, $country ] ) );
+
+        $gmap_link = '';
+        if ( '' !== $lat && '' !== $lng ) {
+            $gmap_link = 'https://www.google.com/maps?q=' . rawurlencode( $lat . ',' . $lng );
+        } else {
+            $full = trim( $address . ', ' . $address3, ', ' );
+            if ( '' !== $full ) {
+                $gmap_link = 'https://www.google.com/maps?q=' . rawurlencode( $full );
+            }
+        }
+
+        return [
+            [
+                'id'          => wp_generate_uuid4(),
+                'type'        => 'physical',
+                'name'        => $venue->post_title,
+                'address1'    => $address,
+                'address2'    => '',
+                'address3'    => $address3,
+                'city'        => $city,
+                'state'       => $state,
+                'country'     => $country,
+                'zip'         => $zip,
+                'embed_gmap'  => (bool) $show_map,
+                'gmap_link'   => $gmap_link,
+                'virtual_url' => '',
+                'latitude'    => $lat,
+                'longitude'   => $lng,
+            ],
+        ];
+    }
+
+    /**
+     * Build a virtual-location entry. Ported from native
+     * TEC_Importer::build_virtual_location().
+     */
+    private function es_build_virtual_location( $url ) {
+        $host = (string) wp_parse_url( $url, PHP_URL_HOST );
+        return [
+            'id'          => wp_generate_uuid4(),
+            'type'        => 'virtual',
+            'name'        => '' !== $host ? $host : 'Event website',
+            'address1'    => '',
+            'address2'    => '',
+            'address3'    => '',
+            'city'        => '',
+            'state'       => '',
+            'country'     => '',
+            'zip'         => '',
+            'embed_gmap'  => false,
+            'gmap_link'   => '',
+            'virtual_url' => esc_url_raw( $url ),
+            'latitude'    => '',
+            'longitude'   => '',
+        ];
+    }
+
+    /**
+     * Canonical attendance type from the locations array. Ported from
+     * native TEC_Importer::infer_type_from_locations().
+     */
+    private function es_infer_type_from_locations( $locations ) {
+        $has_physical = false;
+        $has_virtual  = false;
+        foreach ( (array) $locations as $loc ) {
+            $type = sanitize_key( (string) ( $loc['type'] ?? 'physical' ) );
+            if ( in_array( $type, [ 'physical', 'inperson' ], true ) ) {
+                $has_physical = true;
+            } elseif ( in_array( $type, [ 'virtual', 'online' ], true ) ) {
+                $has_virtual = true;
+            }
+        }
+        if ( $has_physical && $has_virtual ) {
+            return 'mixed';
+        }
+        return $has_physical ? 'inperson' : 'online';
+    }
+
+    /**
+     * Virtual Events meeting URL for a TEC event (distinct from _EventURL).
+     * Ported from native TEC_Importer::get_tec_virtual_url().
+     */
+    private function es_get_tec_virtual_url( $tec_id ) {
+        if ( ! get_post_meta( $tec_id, '_tribe_events_is_virtual', true ) ) {
+            return '';
+        }
+        return esc_url_raw( (string) get_post_meta( $tec_id, '_tribe_events_virtual_url', true ) );
+    }
+
+    /**
+     * Structured organizer data from a TEC event. Ported from native
+     * TEC_Importer::get_organizer_data(). (Used only for the description
+     * tail — no organizer_* postmeta divergence.)
+     */
+    private function es_get_organizer_data( $tec_id ) {
+        $organizer_id = get_post_meta( $tec_id, '_EventOrganizerID', true );
+        if ( empty( $organizer_id ) ) {
+            return null;
+        }
+        $organizer = get_post( $organizer_id );
+        if ( ! $organizer ) {
+            return null;
+        }
+        return [
+            'name'    => (string) $organizer->post_title,
+            'email'   => (string) get_post_meta( $organizer_id, '_OrganizerEmail', true ),
+            'phone'   => (string) get_post_meta( $organizer_id, '_OrganizerPhone', true ),
+            'website' => (string) get_post_meta( $organizer_id, '_OrganizerWebsite', true ),
+        ];
+    }
+
+    /**
+     * Whether imported events should display their timezone. Ported from
+     * native TEC_Importer::tec_shows_timezone().
+     */
+    private function es_tec_shows_timezone() {
+        return function_exists( 'tribe_get_option' ) && (bool) tribe_get_option( 'tribe_events_timezones_show_zone', false );
+    }
+
+    /**
+     * Format a TEC cost value for the description tail. Ported from native
+     * TEC_Importer::format_cost_display().
+     */
+    private function es_format_cost_display( $cost_raw, $currency_symbol, $currency_pos ) {
+        if ( '' === $currency_symbol ) {
+            return (string) $cost_raw;
+        }
+        return ( 'suffix' === $currency_pos ) ? $cost_raw . $currency_symbol : $currency_symbol . $cost_raw;
+    }
+
+    /**
+     * Map a currency symbol to an ISO 4217 code. Ported from native
+     * TEC_Importer::infer_currency_code().
+     */
+    private function es_infer_currency_code( $code_meta, $symbol ) {
+        if ( '' !== (string) $code_meta ) {
+            return strtoupper( substr( sanitize_text_field( (string) $code_meta ), 0, 3 ) );
+        }
+        $map = [
+            '$'   => 'USD',
+            '£'   => 'GBP',
+            '€'   => 'EUR',
+            '¥'   => 'JPY',
+            '₹'   => 'INR',
+            '₩'   => 'KRW',
+            'C$'  => 'CAD',
+            'A$'  => 'AUD',
+            'kr'  => 'SEK',
+            'CHF' => 'CHF',
+            'R$'  => 'BRL',
+        ];
+        $trim = trim( (string) $symbol );
+        return $map[ $trim ] ?? 'USD';
+    }
+
+    /**
+     * The currency EventKoi checkout charges in. Ported from native
+     * TEC_Importer::get_checkout_currency().
+     */
+    private function es_get_checkout_currency() {
+        if ( class_exists( '\EventKoi\Core\WooCommerce_Checkout' )
+            && \EventKoi\Core\WooCommerce_Checkout::is_active()
+            && function_exists( 'get_woocommerce_currency' ) ) {
+            return strtoupper( get_woocommerce_currency() );
+        }
+        $settings = class_exists( '\EventKoi\Core\Settings' ) ? \EventKoi\Core\Settings::get() : [];
+        $currency = strtoupper( sanitize_text_field( (string) ( $settings['currency'] ?? 'USD' ) ) );
+        return preg_match( '/^[A-Z]{3}$/', $currency ) ? $currency : 'USD';
+    }
+
+    /**
+     * The currency Tickets Commerce charges in. Ported from native
+     * TEC_Importer::et_currency_code().
+     */
+    private function es_et_currency_code() {
+        $code = function_exists( 'tribe_get_option' ) ? (string) tribe_get_option( 'tickets-commerce-currency-code', 'USD' ) : 'USD';
+        $code = strtoupper( sanitize_text_field( $code ) );
+        return preg_match( '/^[A-Z]{3}$/', $code ) ? $code : 'USD';
+    }
+
+    /**
+     * The currency a WooCommerce ticket is priced in. Ported from native
+     * TEC_Importer::woo_currency_code().
+     */
+    private function es_woo_currency_code() {
+        if ( ! function_exists( 'get_woocommerce_currency' ) ) {
+            return '';
+        }
+        $code = strtoupper( sanitize_text_field( (string) get_woocommerce_currency() ) );
+        return preg_match( '/^[A-Z]{3}$/', $code ) ? $code : '';
+    }
+
+    /**
+     * Event Tickets ticket posts linked to a TEC event. Ported from native
+     * TEC_Importer::get_et_ticket_posts().
+     */
+    private function es_get_et_ticket_posts( $post_type, $meta_key, $tec_id ) {
+        $posts = get_posts( [
+            'post_type'      => $post_type,
+            'post_status'    => 'any',
+            'posts_per_page' => -1,
+            'orderby'        => [ 'menu_order' => 'ASC', 'ID' => 'ASC' ],
+            'meta_key'       => $meta_key,
+            'meta_value'     => $tec_id,
+        ] );
+        return is_array( $posts ) ? $posts : [];
+    }
+
+    /**
+     * Read an Event Tickets sale-window boundary as a UTC MySQL datetime.
+     * Ported from native TEC_Importer::et_ticket_datetime().
+     */
+    private function es_et_ticket_datetime( $ticket_id, $date_key, $time_key ) {
+        $date = trim( (string) get_post_meta( $ticket_id, $date_key, true ) );
+        if ( '' === $date ) {
+            return null;
+        }
+        $time = trim( (string) get_post_meta( $ticket_id, $time_key, true ) );
+        if ( '' !== $time && false === strpos( $date, ':' ) ) {
+            $date .= ' ' . $time;
+        }
+        try {
+            $dt = new DateTime( $date, wp_timezone() );
+            $dt->setTimezone( new DateTimeZone( 'UTC' ) );
+            return $dt->format( 'Y-m-d H:i:s' );
+        } catch ( Exception $e ) {
+            return null;
+        }
+    }
+
+    /**
+     * Read a TEC category's primary color (Category Colors term meta).
+     * Ported from native TEC_Importer::get_tec_category_color().
+     */
+    private function es_get_tec_category_color( $term_id ) {
+        $raw = trim( (string) get_term_meta( $term_id, 'tec-events-cat-colors-primary', true ) );
+        if ( '' === $raw ) {
+            return '';
+        }
+        if ( '#' !== $raw[0] && preg_match( '/^[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?$/', $raw ) ) {
+            $raw = '#' . $raw;
+        }
+        $hex = sanitize_hex_color( $raw );
+        return is_string( $hex ) ? $hex : '';
+    }
+
+    /**
+     * Base32 alphabet shared with EventKoi check-in tokens (no ambiguous
+     * 0/O/1/I). Ported from native TEC_Importer::rsvp_base32_encode().
+     */
+    private function es_rsvp_base32_encode( $bytes ) {
+        $alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+        $buffer   = 0;
+        $bits     = 0;
+        $output   = '';
+
+        $length = strlen( $bytes );
+        for ( $i = 0; $i < $length; $i++ ) {
+            $buffer = ( $buffer << 8 ) | ord( $bytes[ $i ] );
+            $bits  += 8;
+            while ( $bits >= 5 ) {
+                $index    = ( $buffer >> ( $bits - 5 ) ) & 31;
+                $output  .= $alphabet[ $index ];
+                $bits    -= 5;
+            }
+        }
+        if ( $bits > 0 ) {
+            $index   = ( $buffer << ( 5 - $bits ) ) & 31;
+            $output .= $alphabet[ $index ];
+        }
+        return $output;
+    }
+
+    /**
+     * Generate a unique RSVP check-in token. Ported from native
+     * TEC_Importer::generate_rsvp_checkin_token(), using $wpdb for the
+     * uniqueness probe (the StellarWP wrapper throws on any SQL error).
+     */
+    private function es_generate_rsvp_checkin_token() {
+        global $wpdb;
+        $max_attempts = 5;
+        for ( $i = 0; $i < $max_attempts; $i++ ) {
+            $token = substr( $this->es_rsvp_base32_encode( random_bytes( 8 ) ), 0, 12 );
+            $exists = $wpdb->get_var( $wpdb->prepare(
+                "SELECT id FROM {$this->ek_table( 'rsvps' )} WHERE checkin_token = %s LIMIT 1",
+                $token
+            ) );
+            if ( null === $exists ) {
+                return $token;
+            }
+        }
+        return substr( $this->es_rsvp_base32_encode( random_bytes( 8 ) ), 0, 12 );
+    }
+
+    /**
+     * Read-only Event Sync scan: eligibility counts, per-provider ticket and
+     * attendee volumes, currency state, custom-field count (report-only),
+     * adoption status for natively-imported events, and review items
+     * (duplicate-email RSVP events, orphan/trashed RSVP sources, events
+     * without a start date).
+     */
+    private function scan_event_sync() {
+        global $wpdb;
+
+        $imported_markers = $wpdb->get_results(
+            "SELECT pm.post_id AS ek_id, pm.meta_value AS tec_id
+             FROM {$wpdb->postmeta} pm
+             INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+             WHERE pm.meta_key = '_tec_import_source_id'
+               AND p.post_status != 'trash'
+               AND p.post_type = 'eventkoi_event'",
+            ARRAY_A
+        );
+        $imported_tec_ids = [];
+        foreach ( $imported_markers as $m ) {
+            $imported_tec_ids[ (int) $m['tec_id'] ] = (int) $m['ek_id'];
+        }
+
+        $posts = $wpdb->get_results(
+            "SELECT ID, post_title, post_status FROM {$wpdb->posts}
+             WHERE post_type = 'tribe_events'
+               AND post_status IN ('publish','draft','pending','future','private')",
+            ARRAY_A
+        );
+
+        $unimported = [];
+        $titles     = [];
+        $by_status  = [ 'publish' => 0, 'draft' => 0, 'pending' => 0, 'future' => 0, 'private' => 0 ];
+        foreach ( $posts as $p ) {
+            $titles[ (int) $p['ID'] ] = $p['post_title'];
+            if ( isset( $imported_tec_ids[ (int) $p['ID'] ] ) ) {
+                continue;
+            }
+            $unimported[] = (int) $p['ID'];
+            if ( isset( $by_status[ $p['post_status'] ] ) ) {
+                $by_status[ $p['post_status'] ]++;
+            }
+        }
+
+        $counts = [
+            'tec_total'          => count( $posts ),
+            'imported'           => count( $imported_tec_ids ),
+            'unimported'         => count( $unimported ),
+            'by_status'          => $by_status,
+            'woo_ticket_events'  => 0,
+            'woo_tickets'        => 0,
+            'tc_ticket_events'   => 0,
+            'tc_tickets'         => 0,
+            'rsvp_ticket_events' => 0,
+            'rsvp_tickets'       => 0,
+            'rsvp_capacity'      => 0,
+            'woo_attendees'      => 0,
+            'tc_attendees'       => 0,
+            'rsvp_attendees'     => 0,
+            'rsvp_unique_emails' => 0,
+            'rsvp_merged'        => 0,
+            'recurring'          => 0,
+            'all_day'            => 0,
+            'virtual'            => 0,
+            'with_images'        => 0,
+            'custom_field_events'=> 0,
+        ];
+
+        $review = [];
+        $in     = $unimported ? implode( ',', $unimported ) : '0';
+
+        if ( $unimported ) {
+            // Ticket posts per provider.
+            $ticket_rows = $wpdb->get_results(
+                "SELECT p.post_type, pm.meta_value AS tec_id, p.ID AS ticket_id
+                 FROM {$wpdb->posts} p
+                 INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
+                  AND pm.meta_key IN ('_tribe_rsvp_for_event','_tec_tickets_commerce_event','_tribe_wooticket_for_event')
+                 WHERE p.post_type IN ('tribe_rsvp_tickets','tec_tc_ticket','product')
+                   AND pm.meta_value IN ({$in})",
+                ARRAY_A
+            );
+            $ticket_events = [ 'tribe_rsvp_tickets' => [], 'tec_tc_ticket' => [], 'product' => [] ];
+            foreach ( $ticket_rows as $t ) {
+                $ticket_events[ $t['post_type'] ][ (int) $t['tec_id'] ] = true;
+            }
+            $counts['rsvp_ticket_events'] = count( $ticket_events['tribe_rsvp_tickets'] );
+            $counts['rsvp_tickets']       = count( array_filter( $ticket_rows, function ( $t ) {
+                return 'tribe_rsvp_tickets' === $t['post_type'];
+            } ) );
+            $counts['tc_ticket_events']   = count( $ticket_events['tec_tc_ticket'] );
+            $counts['tc_tickets']         = count( array_filter( $ticket_rows, function ( $t ) {
+                return 'tec_tc_ticket' === $t['post_type'];
+            } ) );
+            $counts['woo_ticket_events']  = count( $ticket_events['product'] );
+            $counts['woo_tickets']        = count( array_filter( $ticket_rows, function ( $t ) {
+                return 'product' === $t['post_type'];
+            } ) );
+
+            // RSVP capacity (RSVP-only events use it as EventKoi rsvp_capacity).
+            $rsvp_ticket_ids = array_map( 'intval', array_filter( array_map( function ( $t ) {
+                return 'tribe_rsvp_tickets' === $t['post_type'] ? (int) $t['ticket_id'] : 0;
+            }, $ticket_rows ) ) );
+            if ( $rsvp_ticket_ids ) {
+                $in_r  = implode( ',', $rsvp_ticket_ids );
+                $caps  = $wpdb->get_col(
+                    "SELECT meta_value FROM {$wpdb->postmeta}
+                     WHERE meta_key = '_tribe_ticket_capacity' AND post_id IN ({$in_r})"
+                );
+                foreach ( $caps as $c ) {
+                    $counts['rsvp_capacity'] += max( 0, (int) $c );
+                }
+            }
+
+            // WooCommerce attendees (Run Migration imports them — report only).
+            $counts['woo_attendees'] = (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM {$wpdb->posts} p
+                 INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
+                  AND pm.meta_key = '_tribe_wooticket_event'
+                 WHERE p.post_type = 'tribe_wooticket'
+                   AND p.post_status = 'publish'
+                   AND pm.meta_value IN ({$in})"
+            );
+
+            // Completed Tickets Commerce attendees (imported by this sync).
+            $counts['tc_attendees'] = (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM {$wpdb->posts} p
+                 INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
+                  AND pm.meta_key = '_tec_tickets_commerce_event'
+                 INNER JOIN {$wpdb->postmeta} st ON st.post_id = p.ID
+                  AND st.meta_key = '_tec_tickets_commerce_status'
+                 WHERE p.post_type = 'tec_tc_attendee'
+                   AND st.meta_value = 'completed'
+                   AND pm.meta_value IN ({$in})"
+            );
+
+            // RSVP attendee rows + duplicate-email math per event.
+            $rsvp_rows = $wpdb->get_results(
+                "SELECT pm.meta_value AS tec_id, a.ID AS attendee_id, e.meta_value AS email
+                 FROM {$wpdb->posts} a
+                 INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = a.ID
+                  AND pm.meta_key = '_tribe_rsvp_event'
+                 LEFT JOIN {$wpdb->postmeta} e ON e.post_id = a.ID
+                  AND e.meta_key = '_tribe_rsvp_email'
+                 WHERE a.post_type = 'tribe_rsvp_attendees'
+                   AND pm.meta_value IN ({$in})",
+                ARRAY_A
+            );
+            $by_event = [];
+            foreach ( $rsvp_rows as $r ) {
+                $by_event[ (int) $r['tec_id'] ][] = strtolower( trim( (string) $r['email'] ) );
+            }
+            foreach ( $by_event as $tec_id => $emails ) {
+                $unique  = count( array_unique( array_filter( $emails ) ) );
+                $rows    = count( $emails );
+                $counts['rsvp_attendees']     += $rows;
+                $counts['rsvp_unique_emails'] += $unique;
+                $counts['rsvp_merged']        += $rows - $unique;
+                if ( $unique < $rows ) {
+                    $review[] = [
+                        'tec_id' => $tec_id,
+                        'title'  => $titles[ $tec_id ] ?? ( '#' . $tec_id ),
+                        'reason' => 'Duplicate RSVP emails (native importer fatals here)',
+                        'detail' => $rows . ' RSVP rows / ' . $unique . ' unique emails — ' . ( $rows - $unique ) . ' duplicate row(s) will be merged during import',
+                    ];
+                }
+            }
+
+            // Events without a start date (cannot be imported).
+            $no_start = $wpdb->get_col(
+                "SELECT p.ID FROM {$wpdb->posts} p
+                 LEFT JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID
+                  AND pm.meta_key = '_EventStartDate'
+                 WHERE p.ID IN ({$in})
+                   AND (pm.meta_value IS NULL OR pm.meta_value = '')"
+            );
+            foreach ( (array) $no_start as $tec_id ) {
+                $review[] = [
+                    'tec_id' => (int) $tec_id,
+                    'title'  => $titles[ (int) $tec_id ] ?? ( '#' . $tec_id ),
+                    'reason' => 'No start date',
+                    'detail' => 'The event has no _EventStartDate; it will be reported as an error during the run.',
+                ];
+            }
+
+            // Shape profile: recurring / all-day / virtual / featured images.
+            $counts['recurring'] = (int) $wpdb->get_var(
+                "SELECT COUNT(DISTINCT pm.post_id) FROM {$wpdb->postmeta} pm
+                 WHERE pm.meta_key = '_EventRecurrence'
+                   AND pm.meta_value != ''
+                   AND pm.meta_value NOT LIKE '%\"rules\";a:0%'
+                   AND pm.post_id IN ({$in})"
+            );
+            $counts['all_day'] = (int) $wpdb->get_var(
+                "SELECT COUNT(DISTINCT pm.post_id) FROM {$wpdb->postmeta} pm
+                 WHERE pm.meta_key = '_EventAllDay'
+                   AND pm.meta_value IN ('yes','1')
+                   AND pm.post_id IN ({$in})"
+            );
+            $counts['virtual'] = (int) $wpdb->get_var(
+                "SELECT COUNT(DISTINCT pm.post_id) FROM {$wpdb->postmeta} pm
+                 WHERE pm.meta_key = '_tribe_events_is_virtual'
+                   AND pm.meta_value NOT IN ('','0')
+                   AND pm.post_id IN ({$in})"
+            );
+            $counts['with_images'] = (int) $wpdb->get_var(
+                "SELECT COUNT(DISTINCT pm.post_id) FROM {$wpdb->postmeta} pm
+                 WHERE pm.meta_key = '_thumbnail_id'
+                   AND pm.meta_value != ''
+                   AND pm.post_id IN ({$in})"
+            );
+
+            // Custom-field count (report-only — this sync does not convert them).
+            $public_meta = $wpdb->get_results(
+                "SELECT DISTINCT pm.post_id, pm.meta_key FROM {$wpdb->postmeta} pm
+                 WHERE pm.post_id IN ({$in})
+                   AND pm.meta_key NOT LIKE '\\_%'
+                   AND pm.meta_key NOT IN (
+                     'EventStartDate','EventEndDate','EventAllDay','EventStartTime','EventEndTime',
+                     'EventTimezone','EventTimezoneAbbr','EventURL','EventCost',
+                     'EventCurrencySymbol','EventCurrencyPosition','EventCurrencyCode',
+                     'EventShowMap','EventShowMapLink','EventVenueID','EventOrganizerID',
+                     'EventOrigin','EventHideFromUpcoming'
+                   )
+                   AND pm.meta_value != ''",
+                ARRAY_A
+            );
+            $ignored_prefixes = [ 'rank_math_', 'aioseo_', 'seopress_', 'wpseo_', 'jetpack_', 'monsterinsights_', 'footnotes', 'litespeed_', 'stackable_' ];
+            $cf_events = [];
+            foreach ( (array) $public_meta as $pm ) {
+                $skip = false;
+                foreach ( $ignored_prefixes as $pref ) {
+                    if ( '' !== $pref && 0 === strpos( $pm['meta_key'], $pref ) ) {
+                        $skip = true;
+                        break;
+                    }
+                }
+                if ( ! $skip ) {
+                    $cf_events[ (int) $pm['post_id'] ] = true;
+                }
+            }
+            $counts['custom_field_events'] = count( $cf_events );
+        }
+
+        // Orphan / trashed RSVP attendee sources (never importable — report only).
+        $orphan_rows = $wpdb->get_results(
+            "SELECT DISTINCT pm.meta_value AS tec_id, e.post_status AS status, COUNT(a.ID) AS attendees
+             FROM {$wpdb->postmeta} pm
+             INNER JOIN {$wpdb->posts} a ON a.ID = pm.post_id AND a.post_type = 'tribe_rsvp_attendees'
+             LEFT JOIN {$wpdb->posts} e ON e.ID = pm.meta_value AND e.post_type = 'tribe_events'
+             WHERE pm.meta_key = '_tribe_rsvp_event'
+               AND (e.ID IS NULL OR e.post_status = 'trash')
+             GROUP BY pm.meta_value, e.post_status",
+            ARRAY_A
+        );
+        foreach ( (array) $orphan_rows as $o ) {
+            $is_trashed = ! empty( $o['status'] ) && 'trash' === $o['status'];
+            $review[]   = [
+                'tec_id' => (int) $o['tec_id'],
+                'title'  => $titles[ (int) $o['tec_id'] ] ?? ( '#' . $o['tec_id'] ),
+                'reason' => $is_trashed ? 'RSVP source event is in Trash' : 'RSVP source event was deleted',
+                'detail' => (int) $o['attendees'] . ' RSVP attendee row(s) reference this TEC event; they are outside the import scope (not imported, report only).',
+            ];
+        }
+
+        // Orphan / trashed Tickets Commerce attendee sources (same report-only
+        // treatment). On this dataset all TC parent posts were permanently
+        // deleted by the old event-cleanup crons, so TC counts surface as 0
+        // and this review block is the operator's explanation why. Aggregated
+        // into one item per status — the per-event detail would be 50+ rows
+        // of the same finding.
+        $tc_orphan_rows = $wpdb->get_results(
+            "SELECT e.post_status AS status, COUNT(DISTINCT pm.meta_value) AS events, COUNT(a.ID) AS attendees
+             FROM {$wpdb->postmeta} pm
+             INNER JOIN {$wpdb->posts} a ON a.ID = pm.post_id AND a.post_type = 'tec_tc_attendee'
+             LEFT JOIN {$wpdb->posts} e ON e.ID = pm.meta_value AND e.post_type = 'tribe_events'
+             WHERE pm.meta_key = '_tec_tickets_commerce_event'
+               AND (e.ID IS NULL OR e.post_status = 'trash')
+             GROUP BY e.post_status",
+            ARRAY_A
+        );
+        foreach ( (array) $tc_orphan_rows as $o ) {
+            $is_trashed = ! empty( $o['status'] ) && 'trash' === $o['status'];
+            $review[]   = [
+                'tec_id' => 0,
+                'title'  => (int) $o['events'] . ' Tickets Commerce source event(s)',
+                'reason' => $is_trashed ? 'Tickets Commerce source events are in Trash' : 'Tickets Commerce source events were deleted',
+                'detail' => (int) $o['attendees'] . ' Tickets Commerce attendee row(s) reference ' . (int) $o['events'] . ' TEC event(s) with no live post; they are outside the import scope (not imported, report only).',
+            ];
+        }
+
+        // Currency state (native zeroed prices on mismatch — this sync keeps parity).
+        $et_currency      = $this->es_et_currency_code();
+        $checkout_currency = $this->es_get_checkout_currency();
+        $woo_currency     = $this->es_woo_currency_code();
+        $currency = [
+            'et'       => $et_currency,
+            'checkout' => $checkout_currency,
+            'woo'      => $woo_currency,
+            'tc_mismatch' => $et_currency !== $checkout_currency,
+            'woo_mismatch' => '' !== $woo_currency && $woo_currency !== $checkout_currency,
+        ];
+
+        // Native-import adoption status.
+        $adoption = $this->scan_native_adoption();
+
+        return [
+            'counts'   => $counts,
+            'currency' => $currency,
+            'review'   => $review,
+            'adoption' => $adoption,
+        ];
+    }
+
+    /**
+     * Which natively-imported events still have unflagged TEC WooCommerce
+     * attendees. "Adopt" flags those attendee posts _eventkoi_imported_from_tec
+     * so Run Migration will not double-import attendees EventKoi's native
+     * importer already brought over. Only events whose EventKoi copy already
+     * has ticket-order rows count as native adoptions — this sync's own
+     * events have no orders until Run Migration runs.
+     */
+    private function scan_native_adoption() {
+        global $wpdb;
+
+        $markers = $wpdb->get_results(
+            "SELECT pm.post_id AS ek_id, pm.meta_value AS tec_id
+             FROM {$wpdb->postmeta} pm
+             INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+             WHERE pm.meta_key = '_tec_import_source_id'
+               AND p.post_status != 'trash'
+               AND p.post_type = 'eventkoi_event'",
+            ARRAY_A
+        );
+
+        $candidate_events = 0;
+        $unflagged        = 0;
+        $events           = [];
+        foreach ( (array) $markers as $m ) {
+            $ek_id  = (int) $m['ek_id'];
+            $tec_id = (int) $m['tec_id'];
+
+            $order_rows = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$this->ek_table( 'ticket_orders' )} WHERE event_id = %d",
+                $ek_id
+            ) );
+            if ( 0 === $order_rows ) {
+                continue; // No EventKoi attendee history — nothing was natively imported.
+            }
+
+            $unflagged_rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT a.ID FROM {$wpdb->posts} a
+                 INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = a.ID
+                  AND pm.meta_key = '_tribe_wooticket_event' AND pm.meta_value = %s
+                 LEFT JOIN {$wpdb->postmeta} f ON f.post_id = a.ID
+                  AND f.meta_key = '_eventkoi_imported_from_tec'
+                 WHERE a.post_type = 'tribe_wooticket'
+                   AND a.post_status = 'publish'
+                   AND (f.meta_id IS NULL OR f.meta_value = '' OR f.meta_value = '0')",
+                (string) $tec_id
+            ), ARRAY_A );
+            if ( empty( $unflagged_rows ) ) {
+                continue;
+            }
+
+            $candidate_events++;
+            $unflagged   += count( $unflagged_rows );
+            $events[]    = [
+                'tec_id'    => $tec_id,
+                'ek_id'     => $ek_id,
+                'title'     => get_the_title( $ek_id ),
+                'attendees' => count( $unflagged_rows ),
+                'orders'    => $order_rows,
+            ];
+        }
+
+        return [
+            'marked_events' => count( (array) $markers ),
+            'candidate_events' => $candidate_events,
+            'unflagged_attendees' => $unflagged,
+            'events' => $events,
+        ];
+    }
+
+    /**
+     * Import one TEC event into EventKoi. Mirrors native
+     * TEC_Importer::import_single_event() with the divergences documented in
+     * the Step 14 header. All writes are recorded in $ops for undo; on a
+     * mid-event failure the caller replays the event's ops to roll it back.
+     *
+     * @param int   $tec_id        TEC event post ID.
+     * @param bool  $import_images Whether to reuse the TEC featured image.
+     * @param array $ops           Audit ledger (appended by reference).
+     * @return array|WP_Error Result summary, or WP_Error.
+     */
+    private function import_one_event( $tec_id, $import_images, &$ops ) {
+        global $wpdb;
+        $tec_id = (int) $tec_id;
+
+        // Re-check the dedup marker at execution time (runner resumability guard).
+        $existing = get_posts( [
+            'post_type'      => 'eventkoi_event',
+            'post_status'    => 'any',
+            'meta_key'       => '_tec_import_source_id',
+            'meta_value'     => $tec_id,
+            'posts_per_page' => 1,
+            'fields'         => 'ids',
+        ] );
+        if ( ! empty( $existing ) ) {
+            return new WP_Error( 'already_imported', 'Already imported (marker present).' );
+        }
+
+        $post = get_post( $tec_id );
+        if ( ! $post || 'tribe_events' !== $post->post_type ) {
+            return new WP_Error( 'invalid_event', 'TEC event not found.' );
+        }
+
+        $notes      = [];
+        $title      = $post->post_title;
+        $status     = $post->post_status;
+        $start_date = get_post_meta( $tec_id, '_EventStartDate', true );
+        $end_date   = get_post_meta( $tec_id, '_EventEndDate', true );
+        $timezone   = get_post_meta( $tec_id, '_EventTimezone', true );
+        $all_day    = $this->es_is_all_day( $tec_id );
+
+        if ( empty( $start_date ) ) {
+            return new WP_Error( 'no_start_date', 'Event has no start date.' );
+        }
+
+        // All-day events use an inclusive last day (native parity).
+        if ( $all_day && ! empty( $end_date ) ) {
+            $end_date = substr( (string) $end_date, 0, 10 ) . ' 23:59:59';
+        }
+
+        $start_iso = $this->es_to_iso_date( $start_date, $timezone );
+        $end_iso   = ! empty( $end_date ) ? $this->es_to_iso_date( $end_date, $timezone ) : '';
+
+        $is_multi_day  = $this->es_spans_multiple_days( $start_date, $end_date );
+        $standard_type = $is_multi_day ? 'continuous' : 'selected';
+
+        $event_days = [];
+        if ( ! $is_multi_day ) {
+            $event_days[] = [
+                'start_date' => $start_iso,
+                'end_date'   => '' !== $end_iso ? $end_iso : $start_iso,
+                'all_day'    => $all_day,
+            ];
+        } elseif ( $all_day ) {
+            $standard_type = 'continuous';
+            $event_days[]  = [
+                'start_date' => $start_iso,
+                'end_date'   => '' !== $end_iso ? $end_iso : $start_iso,
+                'all_day'    => true,
+            ];
+        }
+
+        // Locations from venue; a Virtual Events URL becomes a virtual location.
+        $show_map  = '1' === get_post_meta( $tec_id, '_EventShowMap', true );
+        $locations = $this->es_build_locations( $tec_id, $show_map );
+        $event_url   = (string) get_post_meta( $tec_id, '_EventURL', true );
+        $virtual_url = $this->es_get_tec_virtual_url( $tec_id );
+        if ( '' !== $virtual_url ) {
+            $locations[] = $this->es_build_virtual_location( $virtual_url );
+        }
+        $event_type = ! empty( $locations ) ? $this->es_infer_type_from_locations( $locations ) : 'inperson';
+
+        // Recurrence (TEC Pro).
+        $date_type        = 'standard';
+        $recurrence_rules = [];
+        $recurrence_meta  = get_post_meta( $tec_id, '_EventRecurrence', true );
+        if ( ! empty( $recurrence_meta ) && is_array( $recurrence_meta ) && ! empty( $recurrence_meta['rules'] ) ) {
+            $converted = $this->es_convert_recurrence_rules( $recurrence_meta['rules'], $start_date, $end_date, $timezone );
+            if ( ! empty( $converted ) ) {
+                $date_type        = 'recurring';
+                $recurrence_rules = $converted;
+                $event_days       = [];
+            }
+        }
+        if ( 'standard' === $date_type ) {
+            $occurrence_days = $this->es_get_tec_occurrence_days( $tec_id, $all_day );
+            if ( count( $occurrence_days ) > 1 ) {
+                $standard_type = 'selected';
+                $event_days    = $occurrence_days;
+            }
+        }
+
+        $new_post_id = wp_insert_post( [
+            'post_type'   => 'eventkoi_event',
+            'post_status' => $status,
+            'post_title'  => $title,
+            'post_name'   => '' !== $post->post_name ? $post->post_name : sanitize_title_with_dashes( $title, '', 'save' ),
+            'post_author' => get_current_user_id(),
+        ], true );
+        if ( is_wp_error( $new_post_id ) ) {
+            return $new_post_id;
+        }
+        $new_post_id = (int) $new_post_id;
+        $ops[]       = [ 'type' => 'insert_post', 'id' => $new_post_id ];
+
+        // Critical-Error hardening: write the dedup marker immediately so a
+        // failure later in this event can never leave an unmarked duplicate
+        // draft behind (native writes it last — its three failed runs each
+        // stranded a second copy of the event).
+        update_post_meta( $new_post_id, '_tec_import_source_id', $tec_id );
+
+        // Ticket types (RSVP / Tickets Commerce / WooCommerce).
+        $et_tickets = $this->import_event_tickets_sync( $tec_id, $new_post_id, $ops, $notes );
+
+        $cost_raw        = get_post_meta( $tec_id, '_EventCost', true );
+        $currency_symbol = get_post_meta( $tec_id, '_EventCurrencySymbol', true );
+        $currency_pos    = get_post_meta( $tec_id, '_EventCurrencyPosition', true );
+        $currency_code   = get_post_meta( $tec_id, '_EventCurrencyCode', true );
+
+        $ticket_id = 0;
+        if ( ! $et_tickets['found'] ) {
+            $ticket_id = $this->maybe_create_ticket_from_cost_sync( $new_post_id, $cost_raw, $currency_symbol, $currency_code, $ops );
+        }
+
+        $attendance_mode = ( $ticket_id || $et_tickets['imported'] > 0 ) ? 'tickets' : 'none';
+        if ( 'rsvp' === $et_tickets['attendance_mode'] ) {
+            $attendance_mode = 'rsvp';
+        }
+
+        // Description: TEC body through wpautop, plus organizer/cost tail.
+        $description    = wpautop( (string) $post->post_content );
+        $organizer_data = $this->es_get_organizer_data( $tec_id );
+        $tail           = [];
+
+        if ( $organizer_data && ! empty( $organizer_data['name'] ) ) {
+            $lines = [ '<strong>Organizer:</strong> ' . esc_html( $organizer_data['name'] ) ];
+            if ( ! empty( $organizer_data['email'] ) ) {
+                $lines[] = 'Email: <a href="mailto:' . esc_attr( $organizer_data['email'] ) . '">' . esc_html( $organizer_data['email'] ) . '</a>';
+            }
+            if ( ! empty( $organizer_data['phone'] ) ) {
+                $lines[] = 'Phone: ' . esc_html( $organizer_data['phone'] );
+            }
+            if ( ! empty( $organizer_data['website'] ) ) {
+                $lines[] = 'Website: <a href="' . esc_url( $organizer_data['website'] ) . '">' . esc_html( $organizer_data['website'] ) . '</a>';
+            }
+            $tail[] = '<p>' . implode( '<br>', $lines ) . '</p>';
+        }
+
+        if ( ! $ticket_id && ! $et_tickets['found'] && '' !== (string) $cost_raw ) {
+            $cost_display = $this->es_format_cost_display( $cost_raw, $currency_symbol, $currency_pos );
+            $tail[]       = '<p><strong>Cost:</strong> ' . esc_html( $cost_display ) . '</p>';
+        }
+
+        if ( ! empty( $tail ) ) {
+            $description .= "\n" . implode( "\n", $tail );
+        }
+
+        update_post_meta( $new_post_id, 'description', wp_kses_post( $description ) );
+        update_post_meta( $new_post_id, 'date_type', $date_type );
+        update_post_meta( $new_post_id, 'start_date', $start_iso );
+        update_post_meta( $new_post_id, 'start_timestamp', strtotime( $start_iso ) );
+        update_post_meta( $new_post_id, 'event_days', $event_days );
+        update_post_meta( $new_post_id, 'locations', $locations );
+        update_post_meta( $new_post_id, 'type', $event_type );
+        update_post_meta( $new_post_id, 'standard_type', $standard_type );
+        update_post_meta( $new_post_id, 'embed_gmap', $show_map );
+
+        // Mirror the first virtual URL into legacy top-level meta.
+        $virtual_url_legacy = '';
+        foreach ( $locations as $loc ) {
+            if ( in_array( ( $loc['type'] ?? '' ), [ 'virtual', 'online' ], true ) && ! empty( $loc['virtual_url'] ) ) {
+                $virtual_url_legacy = (string) $loc['virtual_url'];
+                break;
+            }
+        }
+        update_post_meta( $new_post_id, 'virtual_url', $virtual_url_legacy );
+        update_post_meta( $new_post_id, 'recurrence_rules', $recurrence_rules );
+        update_post_meta( $new_post_id, 'attendance_mode', $attendance_mode );
+        update_post_meta( $new_post_id, 'tickets_enabled', 'tickets' === $attendance_mode );
+        update_post_meta( $new_post_id, 'timezone_display', $this->es_tec_shows_timezone() );
+
+        if ( 'rsvp' === $attendance_mode ) {
+            update_post_meta( $new_post_id, 'rsvp_enabled', true );
+            if ( $et_tickets['rsvp_capacity'] > 0 ) {
+                update_post_meta( $new_post_id, 'rsvp_capacity', $et_tickets['rsvp_capacity'] );
+            }
+        }
+
+        // Shared (capped/global) Event Tickets stock maps to the per-event total.
+        if ( $et_tickets['event_capacity'] > 0 ) {
+            update_post_meta( $new_post_id, 'tickets_event_capacity', $et_tickets['event_capacity'] );
+        }
+
+        // Attendee history: RSVP rows for RSVP-only events, Tickets Commerce
+        // attendees as manual orders otherwise. WooCommerce attendees are
+        // deliberately left for Run Migration (see Step 14 header).
+        $attendees = $this->import_event_attendees_sync( $tec_id, $new_post_id, $et_tickets, $ops, $notes );
+
+        if ( ! empty( $end_iso ) ) {
+            update_post_meta( $new_post_id, 'end_date', $end_iso );
+            update_post_meta( $new_post_id, 'end_timestamp', strtotime( $end_iso ) );
+        }
+        if ( ! empty( $timezone ) ) {
+            update_post_meta( $new_post_id, 'timezone', $timezone );
+        }
+
+        // Legacy top-level location fields kept in sync with the primary entry.
+        if ( ! empty( $locations[0] ) ) {
+            $primary = $locations[0];
+            update_post_meta( $new_post_id, 'location', $primary );
+            update_post_meta( $new_post_id, 'address1', (string) ( $primary['address1'] ?? '' ) );
+            update_post_meta( $new_post_id, 'address2', (string) ( $primary['address2'] ?? '' ) );
+            update_post_meta( $new_post_id, 'address3', (string) ( $primary['address3'] ?? '' ) );
+            update_post_meta( $new_post_id, 'latitude', (string) ( $primary['latitude'] ?? '' ) );
+            update_post_meta( $new_post_id, 'longitude', (string) ( $primary['longitude'] ?? '' ) );
+            update_post_meta( $new_post_id, 'gmap_link', (string) ( $primary['gmap_link'] ?? '' ) );
+        }
+
+        // TEC categories → EventKoi calendars (with color backfill).
+        $this->map_categories_sync( $tec_id, $new_post_id, $ops );
+
+        // Featured image: reuse the TEC attachment (no sideload).
+        if ( $import_images ) {
+            $thumbnail_id = get_post_thumbnail_id( $tec_id );
+            if ( $thumbnail_id ) {
+                set_post_thumbnail( $new_post_id, $thumbnail_id );
+                $image_url = wp_get_attachment_url( $thumbnail_id );
+                if ( $image_url ) {
+                    update_post_meta( $new_post_id, 'image', $image_url );
+                    update_post_meta( $new_post_id, 'image_id', $thumbnail_id );
+                }
+            }
+        }
+
+        // Preserve TEC's Event Website link as a URL custom field.
+        if ( '' !== $event_url ) {
+            $this->import_event_website_field_sync( $new_post_id, $event_url, $ops );
+        }
+
+        // Rebuild the admin upcoming index (wp_insert_post fired save_post
+        // before any date meta existed — without this the event never appears
+        // in EventKoi's All/Upcoming lists).
+        if ( class_exists( '\\EventKoi\\Core\\Upcoming_Index' ) ) {
+            \EventKoi\Core\Upcoming_Index::rebuild_event( $new_post_id );
+        }
+
+        // Keep the saved mapping in step so Auto-Match / Run Migration agree.
+        $old_mapping = $this->get_saved_mapping();
+        if ( (int) ( $old_mapping[ $tec_id ] ?? 0 ) !== $new_post_id ) {
+            $new_mapping = $old_mapping;
+            $new_mapping[ $tec_id ] = $new_post_id;
+            $this->save_mapping( $new_mapping );
+            $ops[] = [ 'type' => 'update_option', 'name' => 'ekti_event_mapping', 'old' => $old_mapping ];
+        }
+
+        return [
+            'tec_id'           => $tec_id,
+            'event_id'         => $new_post_id,
+            'title'            => $title,
+            'status'           => $status,
+            'attendance_mode'  => $attendance_mode,
+            'tickets'          => $et_tickets['imported'],
+            'cost_ticket'      => (bool) $ticket_id,
+            'tc_attendees'     => $attendees['tc_attendees'],
+            'rsvp_rows'        => $attendees['rsvp_rows'],
+            'rsvp_merged'      => $attendees['rsvp_merged'],
+            'rsvp_skipped'     => $attendees['rsvp_skipped'],
+            'woo_attendees_skipped' => $attendees['woo_attendees_skipped'],
+            'bindings'         => $et_tickets['bindings'],
+            'notes'            => $notes,
+        ];
+    }
+
+    /**
+     * Import Event Tickets ticket types for one event. Mirrors native
+     * TEC_Importer::import_event_tickets() with the Step 14 capacity
+     * divergence: quantity_available is the FULL capacity and quantity_sold
+     * is pre-set from TEC total_sales (native deducts sold seats from the
+     * capacity and gives them back after attendee import).
+     *
+     * Also writes _ekti_tec_product_{tec}_{product} bindings for WooCommerce
+     * products so Run Migration binds its attendee import to the tickets
+     * created here (Step 7 pattern).
+     *
+     * @return array Native-shaped summary plus 'bindings' count.
+     */
+    private function import_event_tickets_sync( $tec_id, $new_post_id, &$ops, &$notes ) {
+        $summary = [
+            'found'           => false,
+            'attendance_mode' => '',
+            'imported'        => 0,
+            'skipped'         => [],
+            'rsvp_capacity'   => 0,
+            'event_capacity'  => 0,
+            'currency'        => '',
+            'ticket_id_map'   => [],
+            'sold_by_ticket'  => [],
+            'sold_total'      => 0,
+            'bindings'        => 0,
+        ];
+
+        if ( ! function_exists( 'eventkoi_is_tickets_feature_enabled' ) || ! eventkoi_is_tickets_feature_enabled() ) {
+            return $summary;
+        }
+
+        $rsvp_tickets = $this->es_get_et_ticket_posts( 'tribe_rsvp_tickets', '_tribe_rsvp_for_event', $tec_id );
+        $paid_tickets = $this->es_get_et_ticket_posts( 'tec_tc_ticket', '_tec_tickets_commerce_event', $tec_id );
+        $woo_tickets  = $this->es_get_et_ticket_posts( 'product', '_tribe_wooticket_for_event', $tec_id );
+
+        if ( empty( $rsvp_tickets ) && empty( $paid_tickets ) && empty( $woo_tickets ) ) {
+            return $summary;
+        }
+
+        $summary['found'] = true;
+
+        // RSVP-only events use EventKoi's native RSVP mode; no ticket rows.
+        if ( empty( $paid_tickets ) && empty( $woo_tickets ) ) {
+            $summary['attendance_mode'] = 'rsvp';
+            foreach ( $rsvp_tickets as $rsvp_ticket ) {
+                $summary['rsvp_capacity'] += max( 0, (int) get_post_meta( $rsvp_ticket->ID, '_tribe_ticket_capacity', true ) );
+            }
+            return $summary;
+        }
+
+        $summary['attendance_mode'] = 'tickets';
+
+        $checkout_currency   = $this->es_get_checkout_currency();
+        $summary['currency'] = $checkout_currency;
+        $tc_currency_ok      = $this->es_et_currency_code() === $checkout_currency;
+        $woo_currency        = $this->es_woo_currency_code();
+        $woo_currency_ok     = '' !== $woo_currency && $woo_currency === $checkout_currency;
+        $unpriced_paid       = 0;
+        $unpriced_woo        = 0;
+        $sold_total          = 0;
+        $sort_order          = 0;
+
+        foreach ( array_merge( $paid_tickets, $rsvp_tickets, $woo_tickets ) as $et_ticket ) {
+            $is_woo = 'product' === $et_ticket->post_type;
+            $price  = (float) get_post_meta( $et_ticket->ID, '_price', true );
+
+            if ( $price > 0 ) {
+                if ( $is_woo && ! $woo_currency_ok ) {
+                    $price = 0;
+                    ++$unpriced_woo;
+                } elseif ( ! $is_woo && ! $tc_currency_ok ) {
+                    $price = 0;
+                    ++$unpriced_paid;
+                }
+            }
+
+            $sold = max( 0, (int) get_post_meta( $et_ticket->ID, 'total_sales', true ) );
+
+            $inserted = $this->insert_imported_ticket_sync( $new_post_id, $et_ticket, $price, $checkout_currency, $sold, $sort_order, $ops );
+
+            if ( $inserted['id'] ) {
+                ++$summary['imported'];
+                ++$sort_order;
+                $sold_total += $sold;
+
+                $summary['ticket_id_map'][ (int) $et_ticket->ID ] = $inserted['id'];
+
+                // WooCommerce binding so Run Migration attaches to this ticket.
+                if ( $is_woo ) {
+                    $opt = '_ekti_tec_product_' . $tec_id . '_' . $et_ticket->ID;
+                    $old = get_option( $opt );
+                    update_option( $opt, (int) $inserted['id'] );
+                    $ops[] = $old
+                        ? [ 'type' => 'update_option', 'name' => $opt, 'old' => $old ]
+                        : [ 'type' => 'add_option', 'name' => $opt ];
+                    ++$summary['bindings'];
+                }
+            }
+        }
+
+        $summary['sold_total'] = $sold_total;
+
+        if ( $unpriced_paid > 0 ) {
+            $summary['skipped'][] = $unpriced_paid . ' paid ticket(s) imported without pricing: Event Tickets charges ' . $this->es_et_currency_code() . ' while checkout is ' . $checkout_currency . '.';
+        }
+        if ( $unpriced_woo > 0 ) {
+            $summary['skipped'][] = $unpriced_woo . ' WooCommerce ticket(s) imported without pricing: WooCommerce charges ' . $woo_currency . ' while checkout is ' . $checkout_currency . '.';
+        }
+        if ( $sold_total > 0 ) {
+            $notes[] = 'quantity_sold pre-set to TEC total_sales for ' . $sold_total . ' previously sold seat(s) (Step 7 capacity model).';
+        }
+
+        // Shared (capped/global) stock maps to the per-event total capacity.
+        // Unlike native, no sold deduction: quantity_sold already covers it.
+        $use_global = (string) get_post_meta( $tec_id, '_tribe_ticket_use_global_stock', true );
+        if ( in_array( $use_global, [ '1', 'yes', 'true' ], true ) ) {
+            $summary['event_capacity'] = max( 0, (int) get_post_meta( $tec_id, '_tribe_ticket_global_stock_level', true ) );
+        }
+
+        return $summary;
+    }
+
+    /**
+     * Insert one imported Event Tickets type as an eventkoi_tickets row.
+     * Mirrors native TEC_Importer::insert_imported_ticket() with the Step 14
+     * divergence: full capacity + pre-set quantity_sold (native stores
+     * capacity-minus-sold and leaves quantity_sold at 0 for the give-back).
+     */
+    private function insert_imported_ticket_sync( $event_id, $et_ticket, $price, $currency, $sold, $sort_order, &$ops ) {
+        global $wpdb;
+
+        $capacity = get_post_meta( $et_ticket->ID, '_tribe_ticket_capacity', true );
+        $capacity = ( '' === (string) $capacity || (int) $capacity < 0 ) ? null : (int) $capacity;
+
+        $data = [
+            'event_id'    => (int) $event_id,
+            'name'        => sanitize_text_field( $et_ticket->post_title ),
+            'description' => sanitize_textarea_field( $et_ticket->post_excerpt ),
+            'price'       => $price,
+            'currency'    => $currency,
+            'status'      => 'active',
+            'sort_order'  => (int) $sort_order,
+        ];
+        $formats = [ '%d', '%s', '%s', '%f', '%s', '%s', '%d' ];
+
+        if ( null !== $capacity ) {
+            $data['quantity_available'] = $capacity; // Full capacity (divergence).
+            $formats[]                   = '%d';
+        }
+
+        // Pre-set sold count so availability math is correct immediately.
+        $data['quantity_sold'] = max( 0, (int) $sold );
+        $formats[]             = '%d';
+
+        $sale_start = $this->es_et_ticket_datetime( $et_ticket->ID, '_ticket_start_date', '_ticket_start_time' );
+        if ( null !== $sale_start ) {
+            $data['sale_start'] = $sale_start;
+            $formats[]          = '%s';
+        }
+
+        $sale_end = $this->es_et_ticket_datetime( $et_ticket->ID, '_ticket_end_date', '_ticket_end_time' );
+        if ( null !== $sale_end ) {
+            $data['sale_end'] = $sale_end;
+            $formats[]        = '%s';
+        }
+
+        $inserted = $wpdb->insert( $this->ek_table( 'tickets' ), $data, $formats );
+        if ( ! $inserted ) {
+            return [ 'id' => 0 ];
+        }
+
+        $id     = (int) $wpdb->insert_id;
+        $ops[]  = [ 'type' => 'delete_ticket', 'id' => $id ];
+        return [ 'id' => $id ];
+    }
+
+    /**
+     * Create a single EventKoi ticket from TEC's free-text cost field when
+     * the cost is a positive numeric value. Mirrors native
+     * TEC_Importer::maybe_create_ticket_from_cost() (audited).
+     */
+    private function maybe_create_ticket_from_cost_sync( $event_id, $cost_raw, $currency_symbol, $currency_code, &$ops ) {
+        if ( '' === (string) $cost_raw ) {
+            return false;
+        }
+        if ( ! function_exists( 'eventkoi_is_tickets_feature_enabled' ) || ! eventkoi_is_tickets_feature_enabled() ) {
+            return false;
+        }
+        if ( ! preg_match( '/\d+(?:\.\d+)?/', (string) $cost_raw, $m ) ) {
+            return false; // Non-numeric: "Free", "Donation", "TBD" — description keeps the text.
+        }
+        $price = (float) $m[0];
+        if ( $price <= 0 ) {
+            return false;
+        }
+
+        $checkout_currency = $this->es_get_checkout_currency();
+        $has_tec_currency  = '' !== (string) $currency_code || '' !== trim( (string) $currency_symbol );
+        if ( $has_tec_currency && $this->es_infer_currency_code( $currency_code, $currency_symbol ) !== $checkout_currency ) {
+            return false;
+        }
+
+        global $wpdb;
+        $ok = $wpdb->insert( $this->ek_table( 'tickets' ), [
+            'event_id'    => (int) $event_id,
+            'name'        => 'General admission',
+            'description' => '',
+            'price'       => $price,
+            'currency'    => $checkout_currency,
+            'status'      => 'active',
+            'sort_order'  => 0,
+        ], [ '%d', '%s', '%s', '%f', '%s', '%s', '%d' ] );
+
+        if ( ! $ok ) {
+            return false;
+        }
+        $ops[] = [ 'type' => 'delete_ticket', 'id' => (int) $wpdb->insert_id ];
+        return (int) $wpdb->insert_id;
+    }
+
+    /**
+     * Import attendee history for one event: native EventKoi RSVP rows for
+     * RSVP-only events, Tickets Commerce attendees as zero-value manual
+     * orders otherwise. Mirrors native TEC_Importer::import_event_attendees()
+     * minus the WooCommerce branch (Run Migration owns those attendees via
+     * the product bindings written by import_event_tickets_sync()).
+     */
+    private function import_event_attendees_sync( $tec_id, $new_post_id, $et_tickets, &$ops, &$notes ) {
+        $summary = [
+            'tc_attendees'          => 0,
+            'rsvp_rows'             => 0,
+            'rsvp_merged'           => 0,
+            'rsvp_skipped'          => 0,
+            'woo_attendees_skipped' => 0,
+        ];
+
+        if ( ! $et_tickets['found'] ) {
+            return $summary;
+        }
+
+        if ( 'rsvp' === $et_tickets['attendance_mode'] ) {
+            $rsvp = $this->import_native_rsvp_attendees_sync( $tec_id, $new_post_id, $ops );
+            $summary['rsvp_rows']    = $rsvp['imported'];
+            $summary['rsvp_merged']  = $rsvp['merged'];
+            $summary['rsvp_skipped'] = $rsvp['skipped'];
+            foreach ( $rsvp['notes'] as $n ) {
+                $notes[] = $n;
+            }
+            return $summary;
+        }
+
+        $currency      = '' !== $et_tickets['currency'] ? $et_tickets['currency'] : $this->es_get_checkout_currency();
+        $ticket_id_map = $et_tickets['ticket_id_map'];
+
+        // Tickets Commerce attendees → zero-value manual orders.
+        $unmatched = 0;
+        $unusable  = 0;
+        $tc_attendees = $this->es_get_et_ticket_posts( 'tec_tc_attendee', '_tec_tickets_commerce_event', $tec_id );
+        foreach ( $tc_attendees as $attendee ) {
+            if ( 'completed' !== (string) get_post_meta( $attendee->ID, '_tec_tickets_commerce_status', true ) ) {
+                continue; // Pending/refunded/etc.; no completed sale to reflect.
+            }
+
+            $et_ticket_id = (int) get_post_meta( $attendee->ID, '_tec_tickets_commerce_ticket', true );
+            $ticket_id    = $ticket_id_map[ $et_ticket_id ] ?? 0;
+            if ( ! $ticket_id ) {
+                ++$unmatched;
+                continue;
+            }
+
+            $name = (string) get_post_meta( $attendee->ID, '_tec_tickets_commerce_full_name', true );
+            if ( '' === trim( $name ) ) {
+                $name = (string) get_post_meta( $attendee->ID, '_tec_tickets_commerce_purchaser_name', true );
+            }
+            $email = (string) get_post_meta( $attendee->ID, '_tec_tickets_commerce_email', true );
+            if ( '' === trim( $email ) ) {
+                $email = (string) get_post_meta( $attendee->ID, '_tec_tickets_commerce_purchaser_email', true );
+            }
+
+            if ( '' === trim( $name ) && '' === trim( $email ) ) {
+                ++$unusable;
+                continue;
+            }
+
+            if ( $this->create_manual_attendee_sync( $new_post_id, $ticket_id, $name, $email, $currency, $ops ) ) {
+                ++$summary['tc_attendees'];
+            }
+        }
+
+        if ( $unmatched > 0 ) {
+            $notes[] = $unmatched . ' Tickets Commerce attendee(s) not imported: no matching imported ticket.';
+        }
+        if ( $unusable > 0 ) {
+            $notes[] = $unusable . ' Tickets Commerce attendee(s) not imported: no recorded name or email.';
+        }
+
+        // WooCommerce attendees are deliberately left for Run Migration.
+        $woo_attendees = $this->es_get_et_ticket_posts( 'tribe_wooticket', '_tribe_wooticket_event', $tec_id );
+        if ( ! empty( $woo_attendees ) ) {
+            $summary['woo_attendees_skipped'] = count( $woo_attendees );
+            $notes[] = count( $woo_attendees ) . ' WooCommerce attendee(s) left for Run Migration (product bindings written).';
+        }
+
+        return $summary;
+    }
+
+    /**
+     * Import RSVP attendees for an RSVP-only event as native eventkoi_rsvps
+     * rows. Mirrors native TEC_Importer::import_native_rsvp_attendees() with
+     * the Critical-Error fix: rows are deduped by email per event+instance
+     * BEFORE insert (native inserts blindly and relies on a false return the
+     * StellarWP wrapper can never produce — a duplicate email instead throws
+     * an uncaught DatabaseQueryException that kills the whole run). Inserts
+     * go through $wpdb, which cannot throw, and the table's unique key stays
+     * as a second guard.
+     */
+    private function import_native_rsvp_attendees_sync( $tec_id, $new_post_id, &$ops ) {
+        global $wpdb;
+
+        $summary = [ 'imported' => 0, 'merged' => 0, 'skipped' => 0, 'notes' => [] ];
+
+        $rsvp_attendees = $this->es_get_et_ticket_posts( 'tribe_rsvp_attendees', '_tribe_rsvp_event', $tec_id );
+        if ( empty( $rsvp_attendees ) ) {
+            return $summary;
+        }
+
+        $instance_ts = absint( get_post_meta( $new_post_id, 'start_timestamp', true ) );
+        $now         = gmdate( 'Y-m-d H:i:s' );
+        $no_email    = 0;
+        $seen        = []; // Lowercased email => true, per event+instance.
+
+        foreach ( $rsvp_attendees as $attendee ) {
+            $email = sanitize_email( (string) get_post_meta( $attendee->ID, '_tribe_rsvp_email', true ) );
+
+            // email is NOT NULL and part of the table's unique key.
+            if ( '' === $email ) {
+                ++$no_email;
+                continue;
+            }
+
+            $key = strtolower( $email );
+            if ( isset( $seen[ $key ] ) ) {
+                ++$summary['merged'];
+                continue; // Deduplicate instead of tripping event_instance_email_uniq.
+            }
+            $seen[ $key ] = true;
+
+            $going         = 'no' !== (string) get_post_meta( $attendee->ID, '_tribe_rsvp_status', true );
+            $status        = $going ? 'going' : 'not_going';
+            $checkin_token = $going ? $this->es_generate_rsvp_checkin_token() : null;
+
+            $inserted = $wpdb->insert( $this->ek_table( 'rsvps' ), [
+                'event_id'         => (int) $new_post_id,
+                'instance_ts'      => $instance_ts,
+                'user_id'          => null,
+                'name'             => sanitize_text_field( (string) get_post_meta( $attendee->ID, '_tribe_rsvp_full_name', true ) ),
+                'email'            => $email,
+                'status'           => $status,
+                'guests'           => 0,
+                'meta'             => null,
+                'checkin_token'    => $checkin_token,
+                'checked_in'       => null,
+                'checked_in_count' => null,
+                'checkin_status'   => 'none',
+                'created'          => $now,
+                'updated'          => $now,
+            ] );
+
+            if ( $inserted ) {
+                ++$summary['imported'];
+                $ops[] = [ 'type' => 'insert_rsvp', 'id' => (int) $wpdb->insert_id ];
+            } else {
+                ++$summary['merged']; // Unique key guard tripped after all.
+            }
+        }
+
+        $summary['skipped'] = $no_email;
+        if ( $no_email > 0 ) {
+            $summary['notes'][] = $no_email . ' RSVP attendee(s) not imported: no recorded email.';
+        }
+        if ( $summary['merged'] > 0 ) {
+            $summary['notes'][] = $summary['merged'] . ' duplicate RSVP row(s) merged (same email for this event+instance).';
+        }
+
+        return $summary;
+    }
+
+    /**
+     * Create one zero-value manual attendee order via EventKoi's own path
+     * (Ticket_Order_Sync::create_manual_order — public static, the same path
+     * the native importer and the manual add-attendee action use), recording
+     * every row it writes for the undo ledger.
+     */
+    private function create_manual_attendee_sync( $event_id, $ticket_id, $name, $email, $currency, &$ops ) {
+        global $wpdb;
+
+        $name = '' !== trim( (string) $name ) ? $name : 'Imported attendee';
+
+        $result = \EventKoi\Core\Ticket_Order_Sync::create_manual_order( (int) $event_id, (int) $ticket_id, $name, (string) $email, 1, $currency, 0 );
+        if ( empty( $result['rows'] ) ) {
+            return false;
+        }
+
+        $base_id = (string) $result['order_id'];
+        $like    = $wpdb->esc_like( $base_id ) . '%';
+
+        $ticket_order_ids = array_map( 'intval', $wpdb->get_col( $wpdb->prepare(
+            "SELECT id FROM {$this->ek_table( 'ticket_orders' )} WHERE order_id LIKE %s",
+            $like
+        ) ) );
+        $order_row_id = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT id FROM {$this->ek_table( 'orders' )} WHERE checkout_id = %s",
+            $base_id
+        ) );
+        $note_ids = [];
+        if ( $order_row_id ) {
+            $note_ids = array_map( 'intval', $wpdb->get_col( $wpdb->prepare(
+                "SELECT id FROM {$this->ek_table( 'order_notes' )} WHERE order_id = %d",
+                $order_row_id
+            ) ) );
+        }
+
+        $ops[] = [
+            'type'              => 'insert_ticket_order',
+            'ticket_order_ids'  => $ticket_order_ids,
+            'order_id'          => $base_id,
+            'order_row_id'      => $order_row_id,
+            'note_ids'          => $note_ids,
+            'ticket_id'         => (int) $ticket_id,
+        ];
+
+        return true;
+    }
+
+    /**
+     * Map TEC categories to EventKoi calendars, creating matching terms with
+     * color backfill and a default-calendar fallback. Mirrors native
+     * TEC_Importer::map_categories(); every term/meta write is audited.
+     */
+    private function map_categories_sync( $tec_id, $new_post_id, &$ops ) {
+        $tec_cats = wp_get_post_terms( $tec_id, 'tribe_events_cat', [ 'fields' => 'all' ] );
+
+        if ( is_wp_error( $tec_cats ) || empty( $tec_cats ) ) {
+            $default_cal = function_exists( 'eventkoi_resolve_calendar_id' )
+                ? eventkoi_resolve_calendar_id( (int) get_option( 'eventkoi_default_event_cal', 0 ) )
+                : 0;
+            if ( $default_cal ) {
+                wp_set_post_terms( $new_post_id, [ (int) $default_cal ], 'event_cal' );
+            }
+            return;
+        }
+
+        $cal_ids = [];
+        foreach ( $tec_cats as $cat ) {
+            $color   = $this->es_get_tec_category_color( $cat->term_id );
+            $existing = get_term_by( 'slug', $cat->slug, 'event_cal' );
+
+            if ( $existing ) {
+                $cal_ids[] = (int) $existing->term_id;
+
+                // Backfill color only when the calendar has none yet (never overwrite).
+                if ( '' !== $color && '' === (string) get_term_meta( $existing->term_id, 'color', true ) ) {
+                    $old = get_term_meta( $existing->term_id, 'color', true );
+                    update_term_meta( $existing->term_id, 'color', $color );
+                    $ops[] = [ 'type' => 'set_termmeta', 'term_id' => (int) $existing->term_id, 'key' => 'color', 'old' => $old ];
+                }
+            } else {
+                $new_term = wp_insert_term( $cat->name, 'event_cal', [ 'slug' => $cat->slug ] );
+                if ( ! is_wp_error( $new_term ) ) {
+                    $cal_ids[] = (int) $new_term['term_id'];
+                    $ops[]    = [ 'type' => 'create_term', 'term_id' => (int) $new_term['term_id'], 'taxonomy' => 'event_cal' ];
+
+                    if ( '' !== $color ) {
+                        update_term_meta( $new_term['term_id'], 'color', $color );
+                        $ops[] = [ 'type' => 'set_termmeta', 'term_id' => (int) $new_term['term_id'], 'key' => 'color', 'old' => '' ];
+                    }
+                }
+            }
+        }
+
+        if ( ! empty( $cal_ids ) ) {
+            wp_set_post_terms( $new_post_id, $cal_ids, 'event_cal' );
+        }
+    }
+
+    /**
+     * Preserve TEC's Event Website link as an "Event website" URL custom
+     * field. Mirrors native TEC_Importer::import_event_website_field();
+     * field/group definitions created here are audited.
+     */
+    private function import_event_website_field_sync( $new_post_id, $url, &$ops ) {
+        global $wpdb;
+
+        $url = esc_url_raw( (string) $url );
+        if ( '' === $url || ! class_exists( '\EventKoi\Core\Fields' ) ) {
+            return;
+        }
+
+        $group_id  = $this->get_or_create_import_group_sync( $ops );
+        $field_key = 'event_website';
+        $field     = \EventKoi\Core\Fields::get_field_by_key( $field_key );
+
+        // A same-named field of another type belongs to the user; use a namespaced key.
+        if ( $field && 'url' !== ( $field['type'] ?? '' ) ) {
+            $field_key = 'tec_event_website';
+            $field     = \EventKoi\Core\Fields::get_field_by_key( $field_key );
+            if ( $field && 'url' !== ( $field['type'] ?? '' ) ) {
+                return;
+            }
+        }
+
+        if ( ! $field ) {
+            $result = \EventKoi\Core\Fields::create_field( [
+                'field_key' => $field_key,
+                'name'      => 'Event website',
+                'type'      => 'url',
+                'groups'    => $group_id ? [ $group_id ] : [],
+            ] );
+            if ( ! $result || is_wp_error( $result ) ) {
+                return;
+            }
+            $new_id = (int) ( is_object( $result ) ? ( $result->id ?? 0 ) : ( $result['id'] ?? 0 ) );
+            if ( $new_id ) {
+                $ops[] = [ 'type' => 'insert_field', 'id' => $new_id ];
+            }
+            $field_key = (string) ( is_object( $result ) ? ( $result->field_key ?? $field_key ) : ( $result['field_key'] ?? $field_key ) );
+        }
+
+        update_post_meta( $new_post_id, 'event_field_' . $field_key, $url );
+        $this->append_imported_custom_field_keys_sync( $new_post_id, [ $field_key ], $group_id );
+    }
+
+    /**
+     * Find or create the "Imported Fields" custom-field group. Mirrors native
+     * TEC_Importer::get_or_create_import_group() (audited).
+     */
+    private function get_or_create_import_group_sync( &$ops ) {
+        static $cached_id = null;
+        if ( null !== $cached_id ) {
+            return $cached_id;
+        }
+        if ( ! class_exists( '\EventKoi\Core\Field_Groups' ) ) {
+            $cached_id = 0;
+            return 0;
+        }
+
+        $group = \EventKoi\Core\Field_Groups::get_field_group_by_key( 'tec-import' );
+        if ( $group ) {
+            $cached_id = absint( is_object( $group ) ? ( $group->id ?? 0 ) : ( $group['id'] ?? 0 ) );
+            return $cached_id;
+        }
+
+        $group = \EventKoi\Core\Field_Groups::create_group( [
+            'group_key' => 'tec-import',
+            'name'      => 'Imported Fields',
+        ] );
+
+        $cached_id = ( is_array( $group ) || is_object( $group ) ) && ! is_wp_error( $group )
+            ? absint( is_object( $group ) ? ( $group->id ?? 0 ) : ( $group['id'] ?? 0 ) )
+            : 0;
+
+        if ( $cached_id ) {
+            $ops[] = [ 'type' => 'insert_field_group', 'id' => $cached_id ];
+        }
+
+        return $cached_id;
+    }
+
+    /**
+     * Track imported custom-field keys on an event. Mirrors native
+     * TEC_Importer::append_imported_custom_field_keys().
+     */
+    private function append_imported_custom_field_keys_sync( $event_id, array $field_keys, $group_id = 0 ) {
+        $existing_keys = get_post_meta( $event_id, 'eventkoi_custom_fields_keys', true );
+        $existing_keys = is_array( $existing_keys ) ? $existing_keys : [];
+        $field_keys    = array_filter( array_map( 'sanitize_key', $field_keys ) );
+        update_post_meta( $event_id, 'eventkoi_custom_fields_keys', array_values( array_unique( array_merge( $existing_keys, $field_keys ) ) ) );
+
+        if ( ! $group_id ) {
+            return;
+        }
+
+        $layout = get_post_meta( $event_id, 'custom_fields_layout', true );
+        $layout = is_array( $layout ) ? $layout : [];
+        foreach ( $layout as $item ) {
+            if ( is_array( $item ) && 'group' === ( $item['type'] ?? '' ) && absint( $item['id'] ?? 0 ) === absint( $group_id ) ) {
+                return;
+            }
+        }
+
+        $layout[] = [ 'type' => 'group', 'id' => absint( $group_id ) ];
+        update_post_meta( $event_id, 'custom_fields_layout', $layout );
+    }
+
+    /**
+     * Chunked, resumable Event Sync runner. Each call re-derives the pending
+     * queue (TEC events without an EventKoi _tec_import_source_id marker),
+     * imports up to $chunk events, and guards the loop with an 18-second
+     * budget so one request can never approach max_execution_time — the
+     * native importer runs everything in a single unchunked request and dies
+     * on timeout long before a few hundred events finish. Every event runs
+     * inside its own try/catch: a failure rolls just that event back through
+     * the audit ledger, becomes a review item, and the run continues.
+     *
+     * Failed events never receive a marker, so they would otherwise reappear
+     * in every subsequent chunk's pending queue and the run could never
+     * finish (the last chunks would re-fail the same events forever). The
+     * run state (ekti_event_sync_state) therefore remembers this run's
+     * failures and excludes them from the queue until the next run starts
+     * (the AJAX handler clears it on reset) or the state is undone — fixing
+     * an event in TEC and running the sync again retries exactly the failed
+     * set.
+     *
+     * @param int   $chunk         Events per request (default 25).
+     * @param bool  $import_images Whether to reuse the TEC featured image.
+     * @param array $ids           Optional explicit TEC event IDs to import
+     *                             (native run_import parity; used for
+     *                             targeted/QA runs; bypasses the failed-list
+     *                             so a targeted retry always attempts).
+     */
+    private function run_event_sync( $chunk = 25, $import_images = true, $ids = [] ) {
+        $chunk         = max( 1, min( 100, (int) $chunk ) );
+        $import_images = (bool) $import_images;
+        $targeted      = ! empty( $ids );
+
+        $state  = get_option( 'ekti_event_sync_state', [] );
+        $failed = $targeted || ! is_array( $state ) || ! is_array( $state['failed'] ?? null )
+            ? []
+            : $state['failed'];
+
+        $pending = $this->get_tec_event_import_ids();
+        if ( ! empty( $failed ) ) {
+            $failed_ids = array_map( 'absint', array_keys( $failed ) );
+            $pending    = array_values( array_diff( $pending, $failed_ids ) );
+        }
+        if ( $targeted ) {
+            $batch = array_values( array_filter( array_map( 'absint', (array) $ids ) ) );
+        } else {
+            $batch = array_slice( $pending, 0, $chunk );
+        }
+
+        $results = [];
+        $tally   = [
+            'imported'     => 0,
+            'skipped'      => 0,
+            'errors'       => 0,
+            'tickets'      => 0,
+            'cost_tickets' => 0,
+            'tc_attendees' => 0,
+            'rsvp_rows'    => 0,
+            'rsvp_merged'  => 0,
+        ];
+
+        $started_at = microtime( true );
+        foreach ( $batch as $tec_id ) {
+            // Stop before starting an event we might not finish in budget.
+            if ( microtime( true ) - $started_at > 18 ) {
+                break;
+            }
+
+            $event_ops = [];
+            try {
+                $result = $this->import_one_event( $tec_id, $import_images, $event_ops );
+            } catch ( Throwable $e ) {
+                $result = new WP_Error( 'exception', $e->getMessage() );
+            }
+
+            if ( is_wp_error( $result ) ) {
+                // Roll this event's partial writes back to its pre-import state.
+                if ( $event_ops ) {
+                    $this->replay_audit_ops( $event_ops );
+                }
+
+                if ( 'already_imported' === $result->get_error_code() ) {
+                    ++$tally['skipped'];
+                    continue; // Marker appeared after the batch was derived.
+                }
+
+                ++$tally['errors'];
+                $message   = $result->get_error_message();
+                $failed[ $tec_id ] = $message;
+                $results[] = [
+                    'tec_id' => $tec_id,
+                    'title'  => (string) get_the_title( $tec_id ),
+                    'status' => 'error',
+                    'error'  => $message,
+                ];
+                $this->log( "Event Sync: TEC event {$tec_id} failed and was rolled back: {$message}", 'ERROR' );
+                continue;
+            }
+
+            $this->audit_push_event_sync( $event_ops );
+
+            ++$tally['imported'];
+            $tally['tickets']      += $result['tickets'];
+            $tally['cost_tickets'] += $result['cost_ticket'] ? 1 : 0;
+            $tally['tc_attendees'] += $result['tc_attendees'];
+            $tally['rsvp_rows']    += $result['rsvp_rows'];
+            $tally['rsvp_merged']  += $result['rsvp_merged'];
+
+            $results[] = [
+                'tec_id'          => $result['tec_id'],
+                'event_id'        => $result['event_id'],
+                'title'           => $result['title'],
+                'status'          => $result['status'],
+                'attendance_mode' => $result['attendance_mode'],
+                'tickets'         => $result['tickets'],
+                'tc_attendees'    => $result['tc_attendees'],
+                'rsvp_rows'       => $result['rsvp_rows'],
+                'rsvp_merged'     => $result['rsvp_merged'],
+            ];
+        }
+
+        // Re-derive the queue after the batch — the resumability source of truth.
+        $remaining_ids = $this->get_tec_event_import_ids();
+        if ( ! $targeted && ! empty( $failed ) ) {
+            $remaining_ids = array_values( array_diff( $remaining_ids, array_map( 'absint', array_keys( $failed ) ) ) );
+        }
+        $processed = $tally['imported'] + $tally['skipped'] + $tally['errors'];
+
+        // Persist this run's failure memory (full runs only).
+        if ( ! $targeted ) {
+            update_option( 'ekti_event_sync_state', [ 'failed' => $failed ], false );
+        }
+
+        $this->log( sprintf(
+            'Event Sync: processed %d (imported %d, errors %d, skipped %d) — %d remaining.',
+            $processed,
+            $tally['imported'],
+            $tally['errors'],
+            $tally['skipped'],
+            count( $remaining_ids )
+        ) );
+
+        return [
+            'processed'    => $processed,
+            'tally'        => $tally,
+            'remaining'    => count( $remaining_ids ),
+            'total'        => count( $pending ),
+            'failed_total' => $targeted ? 0 : count( $failed ),
+            'done'         => ( $targeted && count( $batch ) === $processed ) || ( ! $targeted && 0 === count( $remaining_ids ) ),
+            'results'      => $results,
+        ];
+    }
+
+    /**
+     * Adopt pre-existing native imports: flag the TEC WooCommerce attendee
+     * posts behind natively-imported events with _eventkoi_imported_from_tec
+     * so Run Migration will not double-import attendees EventKoi's own
+     * importer already brought over. Audited into the event-sync ledger.
+     */
+    private function adopt_native_imports() {
+        global $wpdb;
+
+        $scan = $this->scan_native_adoption();
+        if ( empty( $scan['events'] ) ) {
+            return [ 'error' => 'No native imports to adopt: no natively-imported events with unflagged WooCommerce attendees were found.' ];
+        }
+
+        $ops     = [];
+        $flagged = 0;
+        foreach ( $scan['events'] as $ev ) {
+            $rows = $wpdb->get_results( $wpdb->prepare(
+                "SELECT a.ID FROM {$wpdb->posts} a
+                 INNER JOIN {$wpdb->postmeta} pm ON pm.post_id = a.ID
+                  AND pm.meta_key = '_tribe_wooticket_event' AND pm.meta_value = %s
+                 LEFT JOIN {$wpdb->postmeta} f ON f.post_id = a.ID
+                  AND f.meta_key = '_eventkoi_imported_from_tec'
+                 WHERE a.post_type = 'tribe_wooticket'
+                   AND a.post_status = 'publish'
+                   AND (f.meta_id IS NULL OR f.meta_value = '' OR f.meta_value = '0')",
+                (string) $ev['tec_id']
+            ), ARRAY_A );
+
+            foreach ( (array) $rows as $r ) {
+                $post_id = (int) $r['ID'];
+                $old     = get_post_meta( $post_id, '_eventkoi_imported_from_tec', true );
+                update_post_meta( $post_id, '_eventkoi_imported_from_tec', '1' );
+                $ops[]   = [ 'type' => 'update_postmeta', 'post' => $post_id, 'key' => '_eventkoi_imported_from_tec', 'old' => $old ];
+                ++$flagged;
+            }
+        }
+
+        $this->audit_push_event_sync( $ops );
+        $this->log( sprintf( 'Event Sync: adopted %d natively-imported attendee(s) across %d event(s).', $flagged, count( $scan['events'] ) ) );
+
+        return [ 'flagged' => $flagged, 'events' => count( $scan['events'] ) ];
+    }
+
+    /**
+     * Undo the last Event Sync run (and/or native-import adoption) by
+     * replaying the event-sync ledger in reverse. Events this sync created
+     * are hard-deleted together with their residual EventKoi rows; every
+     * other write is restored to its pre-run value.
+     */
+    private function undo_event_sync() {
+        $audit = get_option( 'ekti_event_sync_audit', [] );
+        if ( empty( $audit ) || ! is_array( $audit ) ) {
+            return [ 'error' => 'Nothing to undo.' ];
+        }
+        $counts = $this->replay_audit_ops( $audit );
+        delete_option( 'ekti_event_sync_audit' );
+        delete_option( 'ekti_event_sync_state' ); // Failure memory is stale post-undo.
+        $this->log( 'Event sync undo complete. ' . wp_json_encode( $counts ) );
+        return [ 'undone' => $counts ];
+    }
+
+    /**
+     * Append audit ops to the event-sync ledger (separate from
+     * ekti_sync_audit so undoing one step never replays another step's
+     * verified writes).
+     */
+    private function audit_push_event_sync( $ops ) {
+        if ( empty( $ops ) ) {
+            return;
+        }
+        $audit = get_option( 'ekti_event_sync_audit', [] );
+        if ( ! is_array( $audit ) ) {
+            $audit = [];
+        }
+        update_option( 'ekti_event_sync_audit', array_merge( $audit, $ops ), false );
+    }
+
+    /* ------------------------------------------------------------------
      * AJAX HANDLERS
      * ------------------------------------------------------------------ */
 
@@ -4419,6 +6594,44 @@ final class EventKoi_Tickets_Importer {
         wp_send_json_success( $result );
     }
 
+    public function ajax_scan_event_sync() {
+        $this->check_ajax();
+        wp_send_json_success( $this->scan_event_sync() );
+    }
+
+    public function ajax_run_event_sync() {
+        $this->check_ajax();
+        $chunk         = isset( $_POST['chunk'] ) ? max( 1, absint( $_POST['chunk'] ) ) : 25;
+        $import_images = ! isset( $_POST['import_images'] ) || ! in_array( $_POST['import_images'], [ '0', 'false', '' ], true );
+        $ids           = isset( $_POST['ids'] ) && '' !== trim( (string) $_POST['ids'] )
+            ? array_filter( array_map( 'absint', explode( ',', (string) $_POST['ids'] ) ) )
+            : [];
+        // First chunk of a fresh run: forget the previous run's failure memory
+        // so fixed events retry (same pattern as ajax_run_batch's reset flag).
+        if ( ! empty( $_POST['reset'] ) && 'true' === $_POST['reset'] ) {
+            delete_option( 'ekti_event_sync_state' );
+        }
+        wp_send_json_success( $this->run_event_sync( $chunk, $import_images, $ids ) );
+    }
+
+    public function ajax_adopt_native_imports() {
+        $this->check_ajax();
+        $result = $this->adopt_native_imports();
+        if ( isset( $result['error'] ) ) {
+            wp_send_json_error( $result['error'] );
+        }
+        wp_send_json_success( $result );
+    }
+
+    public function ajax_undo_event_sync() {
+        $this->check_ajax();
+        $result = $this->undo_event_sync();
+        if ( isset( $result['error'] ) ) {
+            wp_send_json_error( $result['error'] );
+        }
+        wp_send_json_success( $result );
+    }
+
     public function ajax_get_log() {
         $this->check_ajax();
         $lines = 50;
@@ -4470,6 +6683,58 @@ final class EventKoi_Tickets_Importer {
                 </div>
                 <div id="ekti-wc-warning" style="display:none;" class="notice notice-warning"><p>WooCommerce is not active. Order linking requires WooCommerce to be installed and active.</p></div>
                 <button class="button" id="ekti-refresh-stats">Refresh Stats</button>
+            </div>
+
+            <!-- Event Sync Panel -->
+            <div class="ekti-panel" id="ekti-event-sync-panel">
+                <h2>Event Sync (TEC &rarr; EventKoi)</h2>
+                <p>Import TEC events into EventKoi &mdash; the native importer's pipeline with the duplicate-RSVP Critical Error fixed, per-event error isolation, and a chunked resumable runner. Tickets Commerce and RSVP attendees import here; WooCommerce attendees stay with Run Migration via product bindings.</p>
+                <div class="ekti-actions">
+                    <button class="button button-primary" id="ekti-event-sync-scan">Scan Events</button>
+                    <button class="button" id="ekti-event-sync-run" disabled>Run Event Sync</button>
+                    <button class="button" id="ekti-event-sync-adopt" disabled>Adopt Native Imports</button>
+                    <button class="button button-secondary" id="ekti-event-sync-undo" style="color:#a00;">Undo Last Event Sync</button>
+                </div>
+                <div class="ekti-migration-options">
+                    <label>
+                        <input type="checkbox" id="ekti-event-sync-images" checked />
+                        <strong>Import images</strong> &mdash; reuse TEC featured images on imported events.
+                    </label>
+                    <label style="margin-left:1.5em;">
+                        TEC IDs (optional)
+                        <input type="text" id="ekti-event-sync-ids" placeholder="e.g. 52802, 52766" size="18" />
+                    </label>
+                </div>
+                <div id="ekti-event-sync-status" class="ekti-status"></div>
+                <div id="ekti-event-sync-progress-wrap" style="display:none;">
+                    <div class="ekti-progress-bar">
+                        <div class="ekti-progress-fill" id="ekti-event-sync-progress-fill" style="width:0%"></div>
+                    </div>
+                    <div class="ekti-progress-text" id="ekti-event-sync-progress-text">0%</div>
+                </div>
+                <div class="ekti-stats-grid" id="ekti-event-sync-stats" style="display:none;">
+                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-total">&mdash;</span><span class="ekti-stat-label">TEC Events</span></div>
+                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-imported">&mdash;</span><span class="ekti-stat-label">Already Imported</span></div>
+                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-unimported">&mdash;</span><span class="ekti-stat-label">To Import</span></div>
+                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-tickets">&mdash;</span><span class="ekti-stat-label">Ticket Types</span></div>
+                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-tc">&mdash;</span><span class="ekti-stat-label">TC Attendees</span></div>
+                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-rsvp">&mdash;</span><span class="ekti-stat-label">RSVP Rows</span></div>
+                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-woo">&mdash;</span><span class="ekti-stat-label">Woo Attendees (deferred)</span></div>
+                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-images">&mdash;</span><span class="ekti-stat-label">With Images</span></div>
+                </div>
+                <div id="ekti-es-review-wrap" style="display:none;">
+                    <h3>Review Items</h3>
+                    <table class="wp-list-table widefat fixed striped">
+                        <thead>
+                            <tr><th>TEC Event ID</th><th>Title</th><th>Reason</th><th>Detail</th></tr>
+                        </thead>
+                        <tbody id="ekti-es-review-tbody"></tbody>
+                    </table>
+                </div>
+                <div id="ekti-es-adoption-wrap" style="display:none;">
+                    <h3>Native Import Adoption</h3>
+                    <p class="description" id="ekti-es-adoption-text"></p>
+                </div>
             </div>
 
             <!-- Pre-Import Cleanup Panel -->

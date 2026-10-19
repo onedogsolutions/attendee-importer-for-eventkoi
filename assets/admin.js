@@ -1222,6 +1222,245 @@
     }
 
     /* ------------------------------------------------------------------ */
+    /*  EVENT SYNC (TEC → EVENTKOI EVENTS)                                */
+    /* ------------------------------------------------------------------ */
+
+    var esRunning = false;
+    var esTotals  = { unimported: 0 };
+    var esScan    = null;
+
+    function scanEventSync() {
+        appendConsole('Scanning TEC events...', 'info');
+        setStatus('#ekti-event-sync-status', '<span class="ekti-spinner"></span> Scanning...', 'info');
+        ajax('ekti_scan_event_sync', {}, function (resp) {
+            if (!resp.success) {
+                appendConsole('Event Sync scan error: ' + resp.data, 'error');
+                setStatus('#ekti-event-sync-status', 'Scan failed: ' + escapeHtml(resp.data), 'error');
+                return;
+            }
+            var d = resp.data;
+            esScan = d;
+            var c = d.counts;
+
+            $('#ekti-event-sync-stats').show();
+            $('#ekti-es-total').text(c.tec_total);
+            $('#ekti-es-imported').text(c.imported);
+            $('#ekti-es-unimported').text(c.unimported);
+            $('#ekti-es-tickets').text(c.woo_tickets + c.tc_tickets + c.rsvp_tickets);
+            $('#ekti-es-tc').text(c.tc_attendees);
+            $('#ekti-es-rsvp').text(c.rsvp_attendees + (c.rsvp_merged ? ' (+' + c.rsvp_merged + ' dup)' : ''));
+            $('#ekti-es-woo').text(c.woo_attendees);
+            $('#ekti-es-images').text(c.with_images);
+
+            // Review items.
+            var $rv = $('#ekti-es-review-tbody').empty();
+            $.each(d.review || [], function (i, r) {
+                $rv.append('<tr><td>' + r.tec_id + '</td><td>' + escapeHtml(r.title) + '</td>' +
+                    '<td>' + escapeHtml(r.reason) + '</td><td>' + escapeHtml(r.detail) + '</td></tr>');
+            });
+            $('#ekti-es-review-wrap').toggle((d.review || []).length > 0);
+
+            // Native-import adoption status.
+            var ad = d.adoption || {};
+            var adText = ad.candidate_events > 0
+                ? ad.candidate_events + ' natively-imported event(s) carry ' + ad.unflagged_attendees +
+                  ' unflagged WooCommerce attendee(s) that Run Migration would import again. Adopting flags them as already imported.'
+                : '';
+            $('#ekti-es-adoption-text').text(adText);
+            $('#ekti-es-adoption-wrap').toggle(adText !== '');
+            $('#ekti-event-sync-adopt').prop('disabled', esRunning || ad.candidate_events === 0);
+
+            esTotals = { unimported: c.unimported };
+            $('#ekti-event-sync-run').prop('disabled', esRunning || c.unimported === 0);
+
+            var notes = [];
+            if (c.recurring > 0) notes.push(c.recurring + ' recurring');
+            if (c.all_day > 0) notes.push(c.all_day + ' all-day');
+            if (c.virtual > 0) notes.push(c.virtual + ' virtual');
+            if (c.custom_field_events > 0) notes.push(c.custom_field_events + ' with custom fields (reported only, not converted)');
+            if (d.currency && d.currency.tc_mismatch) {
+                notes.push('currency mismatch: Event Tickets ' + d.currency.et + ' vs checkout ' + d.currency.checkout + ' (mismatched prices import as 0)');
+            }
+
+            var reviews = (d.review || []).length;
+            setStatus('#ekti-event-sync-status',
+                'Scan complete: <strong>' + c.unimported + '</strong> of ' + c.tec_total + ' TEC events to import (' +
+                c.by_status.publish + ' publish, ' + c.by_status.draft + ' draft); ' +
+                '<strong>' + c.rsvp_merged + '</strong> duplicate RSVP row(s) will be merged; ' +
+                '<strong>' + reviews + '</strong> review item(s)' +
+                (notes.length ? '; ' + notes.join(', ') : '') + '.',
+                reviews > 0 ? 'warning' : 'success'
+            );
+            appendConsole('Event Sync scan: ' + c.unimported + ' unimported, ' + c.imported + ' already imported, ' +
+                c.woo_tickets + ' Woo / ' + c.tc_tickets + ' TC / ' + c.rsvp_tickets + ' RSVP ticket type(s), ' +
+                c.tc_attendees + ' TC attendees, ' + c.rsvp_attendees + ' RSVP rows (' + c.rsvp_merged + ' duplicates), ' +
+                reviews + ' review items.', 'info');
+        });
+    }
+
+    function updateEsProgress(processed, total) {
+        var pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 100;
+        $('#ekti-event-sync-progress-fill').css('width', pct + '%');
+        $('#ekti-event-sync-progress-text').text(pct + '% (' + processed + '/' + total + ')');
+    }
+
+    function loopEventSync(ids) {
+        var grand = { imported: 0, tickets: 0, cost_tickets: 0, tc_attendees: 0, rsvp_rows: 0, rsvp_merged: 0, errors: 0, skipped: 0 };
+        var total = ids ? ids.split(',').filter(function (v) { return $.trim(v) !== ''; }).length : esTotals.unimported;
+        var noProgress = 0;
+        var firstChunk = true;
+        $('#ekti-event-sync-progress-wrap').show();
+        updateEsProgress(0, total);
+
+        function step() {
+            var payload = {
+                chunk: 25,
+                import_images: $('#ekti-event-sync-images').prop('checked') ? '1' : '0',
+                ids: ids || ''
+            };
+            // A fresh full run clears the previous run's failure memory so
+            // failed events are retried; targeted runs bypass it server-side.
+            if (firstChunk && !ids) {
+                payload.reset = 'true';
+            }
+            firstChunk = false;
+            ajax('ekti_run_event_sync', payload, function (resp) {
+                if (!resp.success) {
+                    appendConsole('Event Sync error: ' + resp.data, 'error');
+                    setStatus('#ekti-event-sync-status', 'Event Sync failed: ' + escapeHtml(resp.data), 'error');
+                    esRunning = false;
+                    $('#ekti-event-sync-run').prop('disabled', false);
+                    return;
+                }
+                var d = resp.data;
+
+                $.each(d.results || [], function (i, r) {
+                    if (r.status === 'error') {
+                        appendConsole('\u2717 Error TEC ' + r.tec_id + ' (' + escapeHtml(r.title || '?') + '): ' + escapeHtml(r.error) + ' — rolled back', 'error');
+                    } else {
+                        var bits = ['\u2713 ' + escapeHtml(r.title) + ' (TEC ' + r.tec_id + ' \u2192 EK #' + r.event_id + ')'];
+                        if (r.tickets) bits.push(r.tickets + ' ticket type(s)');
+                        if (r.tc_attendees) bits.push(r.tc_attendees + ' TC attendee(s)');
+                        if (r.rsvp_rows) bits.push(r.rsvp_rows + ' RSVP row(s)');
+                        if (r.rsvp_merged) bits.push(r.rsvp_merged + ' duplicate(s) merged');
+                        appendConsole(bits.join(', '));
+                    }
+                });
+
+                $.each(d.tally || {}, function (k, v) {
+                    grand[k] = (grand[k] || 0) + v;
+                });
+
+                var processed;
+                if (ids) {
+                    // Targeted run: only newly handled IDs advance the bar
+                    // (already-imported IDs skip silently on later rounds).
+                    processed = Math.min(total, (loopEventSync._p || 0) + d.tally.imported + d.tally.errors + (loopEventSync._p ? 0 : d.tally.skipped));
+                    loopEventSync._p = processed;
+                } else {
+                    processed = Math.max(0, total - d.remaining);
+                }
+                updateEsProgress(processed, total);
+
+                if (d.done) {
+                    appendConsole('=== Event Sync complete: ' + grand.imported + ' event(s) imported, ' +
+                        (grand.tickets + grand.cost_tickets) + ' ticket type(s), ' +
+                        grand.tc_attendees + ' TC attendee(s), ' +
+                        grand.rsvp_rows + ' RSVP row(s), ' +
+                        grand.rsvp_merged + ' duplicate(s) merged, ' +
+                        grand.errors + ' error(s) ===', 'info');
+                    setStatus('#ekti-event-sync-status',
+                        'Event Sync complete: <strong>' + grand.imported + '</strong> event(s) imported' +
+                        (grand.rsvp_merged ? ', <strong>' + grand.rsvp_merged + '</strong> duplicate RSVP row(s) merged' : '') +
+                        (grand.errors ? ', <strong>' + grand.errors + '</strong> error(s) rolled back — see console' : '') + '.',
+                        grand.errors ? 'warning' : 'success'
+                    );
+                    esRunning = false;
+                    loopEventSync._p = 0;
+                    updateEsProgress(total, total);
+                    scanEventSync();
+                    loadStats();
+                } else {
+                    // No-progress guard: three chunks with nothing processed = stall.
+                    if (d.processed === 0) {
+                        noProgress++;
+                        if (noProgress >= 3) {
+                            appendConsole('Event Sync stalled (3 chunks without progress) — stopping.', 'error');
+                            setStatus('#ekti-event-sync-status', 'Event Sync stalled — no progress across 3 chunks.', 'error');
+                            esRunning = false;
+                            loopEventSync._p = 0;
+                            $('#ekti-event-sync-run').prop('disabled', false);
+                            return;
+                        }
+                    } else {
+                        noProgress = 0;
+                    }
+                    setTimeout(step, 200);
+                }
+            });
+        }
+        loopEventSync._p = 0;
+        step();
+    }
+
+    function runEventSync() {
+        if (esRunning) return;
+        var ids = $.trim($('#ekti-event-sync-ids').val());
+        var label = ids ? 'the specified TEC event(s) [' + ids + ']' : esTotals.unimported + ' TEC event(s)';
+        if (!confirm('Import ' + label + ' into EventKoi? Already-imported events are skipped, per-event failures roll back, and everything is audited and undoable.')) {
+            return;
+        }
+        esRunning = true;
+        $('#ekti-event-sync-run, #ekti-event-sync-adopt').prop('disabled', true);
+        appendConsole('=== Starting Event Sync' + (ids ? ' (targeted: ' + ids + ')' : '') + ' ===', 'info');
+        loopEventSync(ids || '');
+    }
+
+    function adoptNativeImports() {
+        if (!esScan || !esScan.adoption || !esScan.adoption.candidate_events) return;
+        var ad = esScan.adoption;
+        if (!confirm('Flag ' + ad.unflagged_attendees + ' WooCommerce attendee(s) on ' + ad.candidate_events +
+            ' natively-imported event(s) as already imported, so Run Migration will not duplicate them?')) {
+            return;
+        }
+        appendConsole('=== Adopting Native Imports ===', 'warn');
+        ajax('ekti_adopt_native_imports', {}, function (resp) {
+            if (!resp.success) {
+                appendConsole('Adopt error: ' + resp.data, 'error');
+                setStatus('#ekti-event-sync-status', 'Adopt failed: ' + escapeHtml(resp.data), 'error');
+                return;
+            }
+            appendConsole('Adopted ' + resp.data.flagged + ' attendee(s) across ' + resp.data.events + ' event(s).', 'warn');
+            setStatus('#ekti-event-sync-status',
+                'Adopted <strong>' + resp.data.flagged + '</strong> natively-imported attendee(s) across <strong>' + resp.data.events + '</strong> event(s).',
+                'success'
+            );
+            scanEventSync();
+            loadStats();
+        });
+    }
+
+    function undoEventSync() {
+        if (!confirm('Undo the last Event Sync run? Events it created are permanently deleted with their tickets, orders and RSVP rows; adoption flags and other writes are reverted.')) {
+            return;
+        }
+        appendConsole('=== Undoing Last Event Sync ===', 'warn');
+        ajax('ekti_undo_event_sync', {}, function (resp) {
+            if (!resp.success) {
+                appendConsole('Undo error: ' + resp.data, 'error');
+                return;
+            }
+            var counts = resp.data.undone || {};
+            $.each(counts, function (type, n) {
+                appendConsole('  ' + type + ': ' + n, 'warn');
+            });
+            appendConsole('Undo complete.', 'warn');
+            scanEventSync();
+            loadStats();
+        });
+    }
+
+    /* ------------------------------------------------------------------ */
     /*  INIT                                                              */
     /* ------------------------------------------------------------------ */
 
@@ -1244,6 +1483,10 @@
         $('#ekti-sync-scan').on('click', scanTicketDetails);
         $('#ekti-sync-run').on('click', runSync);
         $('#ekti-sync-undo').on('click', undoSync);
+        $('#ekti-event-sync-scan').on('click', scanEventSync);
+        $('#ekti-event-sync-run').on('click', runEventSync);
+        $('#ekti-event-sync-adopt').on('click', adoptNativeImports);
+        $('#ekti-event-sync-undo').on('click', undoEventSync);
         $('#ekti-calsync-scan').on('click', scanCalendarSync);
         $('#ekti-calsync-save').on('click', saveCalMapping);
         $('#ekti-calsync-run').on('click', runCalSync);
