@@ -920,6 +920,17 @@
             var d = resp.data;
             var c = d.counts;
 
+            // Taxonomy not set up yet: point at step 2a instead of a table.
+            if (d.provision_needed) {
+                $('#ekti-tax-' + type + '-table-wrap').hide();
+                $('#ekti-tax-' + type + '-designation').hide();
+                $('#ekti-tax-' + type + '-save, #ekti-tax-' + type + '-run').prop('disabled', true);
+                setStatus('#ekti-tax-' + type + '-status',
+                    'The ' + type + ' taxonomy is not set up yet (' + (c.sources || 0) + ' TEC source(s) waiting). Create it in 2a above, then scan again.',
+                    'warning');
+                return;
+            }
+
             var termOptions = '<option value="">\u2014 None \u2014</option>';
             $.each(d.terms, function (i, term) {
                 termOptions += '<option value="' + term.term_id + '">' + escapeHtml(term.name) + ' (' + term.count + ')</option>';
@@ -996,7 +1007,8 @@
                 field_updates: c.field_updates || 0,
                 field_conflicts: c.field_conflicts || 0
             };
-            var canRun = c.pending > 0 || (c.field_updates || 0) > 0;
+            // New terms can be created before any event is imported.
+            var canRun = c.pending > 0 || c.new_terms > 0 || (c.field_updates || 0) > 0;
             if (type === 'locations' && $('#ekti-tax-locations-overwrite').prop('checked')) {
                 canRun = canRun || (c.field_conflicts || 0) > 0;
             }
@@ -1015,7 +1027,7 @@
 
             setStatus('#ekti-tax-' + type + '-status',
                 'Scan complete: <strong>' + c.sources + '</strong> ' + type + ' sources across ' +
-                '<strong>' + c.mapped_events + '</strong> mapped events; ' +
+                '<strong>' + c.mapped_events + '</strong> TEC events; ' +
                 '<strong>' + c.pending + '</strong> term assignments pending' +
                 (c.new_terms > 0 ? ' (<strong>' + c.new_terms + '</strong> new terms to create)' : '') +
                 (c.unmapped_sources > 0 ? '; <strong>' + c.unmapped_sources + '</strong> sources unmapped' : '') +
@@ -1098,6 +1110,7 @@
                     taxSyncRunning[type] = false;
                     updateTaxSyncProgress(type, total, total);
                     scanTaxonomySync(type);
+                    refreshWizard();
                 } else if (d.applied === 0) {
                     appendConsole(type + ' sync stopped: no progress made with ' + (total - processed) + ' items still pending.', 'error');
                     taxSyncRunning[type] = false;
@@ -1123,8 +1136,10 @@
         if (type === 'locations') {
             var overwrite = $('#ekti-tax-locations-overwrite').prop('checked');
             extra = { overwrite: overwrite ? 'true' : 'false', sync_fields: 'true' };
-            msg = 'Apply ' + totals.pending + ' location term assignment(s)' +
-                (totals.new_terms > 0 ? ' (creating ' + totals.new_terms + ' new term(s) populated with TEC address data)' : '');
+            msg = totals.pending > 0
+                ? 'Apply ' + totals.pending + ' location term assignment(s)' +
+                  (totals.new_terms > 0 ? ' (creating ' + totals.new_terms + ' new term(s) populated with TEC address data)' : '')
+                : 'Create ' + totals.new_terms + ' new location term(s) populated with TEC address data';
             if (totals.field_updates > 0) {
                 msg += ' and fill ' + totals.field_updates + ' empty term address field(s)';
             }
@@ -1135,8 +1150,10 @@
                 (overwrite ? '; non-empty fields are overwritten with TEC data' : '; non-empty fields are left alone (review conflicts in the table)') +
                 '. Existing terms are never removed. Changes are audited and can be undone.';
         } else {
-            msg = 'Apply ' + totals.pending + ' ' + type + ' term assignments' +
-                (totals.new_terms > 0 ? ' (creating ' + totals.new_terms + ' new term(s))' : '') +
+            msg = (totals.pending > 0
+                ? 'Apply ' + totals.pending + ' ' + type + ' term assignments' +
+                  (totals.new_terms > 0 ? ' (creating ' + totals.new_terms + ' new term(s))' : '')
+                : 'Create ' + totals.new_terms + ' new ' + type + ' term(s)') +
                 '? Existing terms are never removed. Changes are audited and can be undone.';
         }
         if (!confirm(msg)) {
@@ -1460,6 +1477,833 @@
     }
 
     /* ------------------------------------------------------------------ */
+    /*  IMPORT WIZARD (v1.9.0)                                            */
+    /* ------------------------------------------------------------------ */
+
+    var WZ_STEPS = ['preflight', 'taxonomies', 'events', 'tickets', 'orders', 'finish'];
+    var WZ_LABELS = { events: 'events', tickets: 'tickets', orders: 'orders' };
+    var wz = { summary: null, running: false, verifyOk: {}, opened: false };
+
+    function wzApproved(step) {
+        return !!(wz.summary && wz.summary.approved && wz.summary.approved[step]);
+    }
+
+    function wzPrev(step) {
+        var i = WZ_STEPS.indexOf(step);
+        return i > 0 ? WZ_STEPS[i - 1] : null;
+    }
+
+    function wzLocked(step) {
+        if (step === 'preflight' || step === 'taxonomies') {
+            return false; // Taxonomy setup can be reopened at any time.
+        }
+        var prev = wzPrev(step);
+        return prev ? !wzApproved(prev) : false;
+    }
+
+    function wzActiveStep() {
+        for (var i = 0; i < WZ_STEPS.length - 1; i++) {
+            if (!wzApproved(WZ_STEPS[i])) {
+                return WZ_STEPS[i];
+            }
+        }
+        return 'finish';
+    }
+
+    function wzStage(stage) {
+        return (wz.summary && wz.summary.stages && wz.summary.stages[stage]) || { done: 0, remaining: 0, failed: 0, ledger: 0 };
+    }
+
+    function wzOpen(step) {
+        if (wzLocked(step)) return;
+        $('.ekti-step[data-step="' + step + '"]').addClass('is-open');
+    }
+
+    function renderWizard() {
+        var active = wzActiveStep();
+        $.each(WZ_STEPS, function (i, step) {
+            var $li = $('#ekti-stepper li[data-step="' + step + '"]');
+            var $sec = $('.ekti-step[data-step="' + step + '"]');
+            var approved = wzApproved(step);
+            var locked = wzLocked(step);
+            $li.toggleClass('is-approved', approved).toggleClass('is-active', step === active).toggleClass('is-locked', locked);
+            $sec.toggleClass('is-locked', locked);
+            if (locked) {
+                $sec.removeClass('is-open');
+            }
+
+            var $badge = $sec.find('.ekti-step-badge').removeClass('is-approved is-active is-warning');
+            if (approved) {
+                $badge.addClass('is-approved').text('Approved');
+            } else if (locked) {
+                $badge.text('Locked');
+            } else if (WZ_LABELS[step]) {
+                var st = wzStage(step);
+                if (st.done > 0 && st.remaining > 0) {
+                    $badge.addClass('is-active').text(st.done + ' done, ' + st.remaining + ' to go');
+                } else if (st.done > 0) {
+                    $badge.addClass(st.failed ? 'is-warning' : 'is-active').text('Imported — review' + (st.failed ? ' (' + st.failed + ' failed)' : ''));
+                } else {
+                    $badge.addClass('is-active').text('Ready');
+                }
+            } else if (step === 'finish') {
+                $badge.text(active === 'finish' ? 'Done' : '');
+            } else {
+                $badge.addClass('is-active').text('To do');
+            }
+        });
+
+        // Stage buttons.
+        $.each(['events', 'tickets', 'orders'], function (i, stage) {
+            var st = wzStage(stage);
+            var prevOk = wzApproved(wzPrev(stage));
+            $('#ekti-wz-' + stage + '-run').prop('disabled', wz.running || !prevOk || st.remaining === 0 || wzApproved(stage));
+            $('#ekti-wz-' + stage + '-preview').prop('disabled', wz.running || !prevOk);
+            $('#ekti-wz-' + stage + '-check').prop('disabled', wz.running || st.done === 0);
+            $('#ekti-wz-' + stage + '-approve').prop('disabled', wz.running || wzApproved(stage) || st.remaining > 0 || !wz.verifyOk[stage]);
+            $('#ekti-wz-' + stage + '-undo').prop('disabled', wz.running || st.ledger === 0);
+        });
+        $('#ekti-wz-taxonomies-approve').prop('disabled', wz.running || wzApproved('taxonomies') || !wzApproved('preflight'));
+        $('#ekti-wz-undo-all').prop('disabled', wz.running);
+
+        renderSetupCards();
+        renderFinish();
+
+        if (!wz.opened) {
+            wz.opened = true;
+            wzOpen(active);
+        }
+    }
+
+    function refreshWizard(cb) {
+        ajax('ekti_wizard_state', {}, function (resp) {
+            if (!resp.success) {
+                appendConsole('Wizard state error: ' + resp.data, 'error');
+                return;
+            }
+            wz.summary = resp.data;
+            $.each(['events', 'tickets', 'orders'], function (i, stage) {
+                if (resp.data.verified && resp.data.verified[stage]) {
+                    wz.verifyOk[stage] = !!resp.data.verified[stage].ok;
+                }
+            });
+            renderWizard();
+            if (cb) cb();
+        });
+    }
+
+    function approveStep(step, after) {
+        ajax('ekti_wizard_approve', { step: step }, function (resp) {
+            if (!resp.success) {
+                appendConsole('Approve "' + step + '": ' + resp.data, 'error');
+                setStatus('#ekti-wz-' + step + '-status', escapeHtml(resp.data), 'error');
+                return;
+            }
+            appendConsole('Step "' + step + '" approved.', 'info');
+            wz.summary = resp.data;
+            renderWizard();
+            var next = WZ_STEPS[WZ_STEPS.indexOf(step) + 1];
+            $('.ekti-step[data-step="' + step + '"]').removeClass('is-open');
+            if (next) {
+                wzOpen(next);
+                $('html, body').animate({ scrollTop: $('.ekti-step[data-step="' + next + '"]').offset().top - 60 }, 200);
+            }
+            if (after) after();
+        });
+    }
+
+    /* Step 1: Preflight ------------------------------------------------- */
+
+    function runPreflight() {
+        setStatus('#ekti-wz-preflight-status', '<span class="ekti-spinner"></span> Checking...', 'info');
+        ajax('ekti_preflight', {}, function (resp) {
+            if (!resp.success) {
+                setStatus('#ekti-wz-preflight-status', 'Checks failed: ' + escapeHtml(resp.data), 'error');
+                return;
+            }
+            var d = resp.data;
+            var $tb = $('#ekti-wz-preflight-table tbody').empty();
+            var labels = { ok: 'OK', warn: 'Check', fail: 'Blocked' };
+            $.each(d.checks, function (i, c) {
+                $tb.append('<tr><td>' + escapeHtml(c.label) + '</td><td><span class="ekti-pill ' + c.status + '">' + labels[c.status] + '</span></td><td>' + escapeHtml(c.detail) + '</td></tr>');
+            });
+            $('#ekti-wz-preflight-table').show();
+            var warns = d.checks.filter(function (c) { return c.status === 'warn'; }).length;
+            setStatus('#ekti-wz-preflight-status',
+                d.ok ? ('All required checks passed' + (warns ? ' — ' + warns + ' item(s) to look at before continuing.' : '.')) : 'Fix the blocked items, then run the checks again.',
+                d.ok ? (warns ? 'warning' : 'success') : 'error');
+            $('#ekti-wz-preflight-approve').prop('disabled', !d.ok || wzApproved('preflight'));
+        });
+    }
+
+    /* Step 2a: taxonomy setup cards ------------------------------------ */
+
+    var SLOT_LABELS = {
+        address1: 'Address line 1', address2: 'Address line 2', city: 'City', state: 'State',
+        country: 'Country', zip: 'ZIP', latitude: 'Latitude', longitude: 'Longitude'
+    };
+
+    function setupStatusLine(st, type) {
+        var name = type === 'locations' ? 'Locations' : 'Instructors';
+        switch (st.status) {
+            case 'ready':
+                if (type === 'locations') {
+                    return '<span class="ekti-pill ok">Ready</span> Taxonomy <strong>' + escapeHtml(st.target) + '</strong> is the Saved Locations taxonomy, ' +
+                        Object.keys(st.map || {}).length + ' of ' + st.slots.length + ' address slots mapped.';
+                }
+                return '<span class="ekti-pill ok">Ready</span> Taxonomy <strong>' + escapeHtml(st.target) + '</strong> exists.';
+            case 'not_designated':
+                return '<span class="ekti-pill warn">Not designated</span> Taxonomy <strong>' + escapeHtml(st.target) + '</strong> exists but is not set as Saved Locations' +
+                    (st.designated ? ' (currently: ' + escapeHtml(st.designated) + ')' : '') + '.';
+            case 'unmapped':
+                return '<span class="ekti-pill warn">Slots unmapped</span> Saved Locations is on for <strong>' + escapeHtml(st.target) + '</strong> but only ' +
+                    Object.keys(st.map || {}).length + ' of ' + st.slots.length + ' address slots are mapped.';
+            case 'unsupported':
+                return '<span class="ekti-pill fail">Unavailable</span> ' + escapeHtml(st.message);
+            default:
+                return '<span class="ekti-pill">Not set up</span> No ' + name + ' taxonomy exists in EventKoi yet.';
+        }
+    }
+
+    function renderSetupCards() {
+        if (!wz.summary || !wz.summary.taxonomies) return;
+        $.each(['locations', 'instructors'], function (i, type) {
+            var st = wz.summary.taxonomies[type];
+            var $card = $('#ekti-setup-' + type);
+            // Keep a form the user is editing.
+            if ($card.data('editing')) return;
+            var title = type === 'locations' ? 'Locations (Saved Locations)' : 'Instructors';
+            var html = '<h5>' + title + '</h5><p>' + setupStatusLine(st, type) + '</p>';
+            if (st.conflict) {
+                html += '<p class="description" style="color:#b32d2e;">' + escapeHtml(st.conflict) + '</p>';
+            }
+            if (st.status !== 'unsupported') {
+                html += '<button type="button" class="button ekti-setup-edit" data-type="' + type + '">' +
+                    (st.status === 'ready' ? 'Change…' : 'Set up…') + '</button>';
+            }
+            $card.html(html);
+        });
+    }
+
+    function fieldRowsHtml(fields) {
+        var html = '';
+        $.each(fields, function (i, f) {
+            html += '<div class="ekti-field-row" style="display:flex;gap:6px;margin:3px 0;">' +
+                '<input type="text" class="ekti-f-key" value="' + escapeHtml(f.key) + '" size="12" title="Field key" />' +
+                '<input type="text" class="ekti-f-label" value="' + escapeHtml(f.label) + '" size="20" title="Label" /></div>';
+        });
+        return html;
+    }
+
+    function slotGridHtml(keys, map) {
+        var html = '<div class="ekti-slot-grid">';
+        $.each(Object.keys(SLOT_LABELS), function (i, slot) {
+            var opts = '<option value="">— not mapped —</option>';
+            $.each(keys, function (j, k) {
+                opts += '<option value="' + escapeHtml(k.key) + '"' + (map[slot] === k.key ? ' selected' : '') + '>' + escapeHtml(k.label + ' (' + k.key + ')') + '</option>';
+            });
+            html += '<label>' + SLOT_LABELS[slot] + '</label><select class="ekti-slot" data-slot="' + slot + '">' + opts + '</select>';
+        });
+        return html + '</div>';
+    }
+
+    function openSetupForm(type) {
+        var st = wz.summary.taxonomies[type];
+        var $card = $('#ekti-setup-' + type).data('editing', true);
+        var defs = st.definitions || [];
+        var hasTarget = st.target !== '';
+        var useExisting = hasTarget || (type === 'locations' && defs.length > 0 && st.status !== 'missing');
+        var p = st.proposed;
+
+        var defOpts = '';
+        $.each(defs, function (i, d) {
+            var sel = (st.target === d.slug) ? ' selected' : '';
+            defOpts += '<option value="' + escapeHtml(d.slug) + '"' + sel + '>' + escapeHtml(d.plural + ' (' + d.slug + ', ' + d.fields.length + ' fields, ' + d.terms + ' terms)') + '</option>';
+        });
+
+        var html = '<h5>' + (type === 'locations' ? 'Locations (Saved Locations)' : 'Instructors') + '</h5>' +
+            '<p><label><input type="radio" name="ekti-mode-' + type + '" value="create"' + (useExisting ? '' : ' checked') + ' /> Create a new taxonomy</label><br/>' +
+            '<label><input type="radio" name="ekti-mode-' + type + '" value="existing"' + (useExisting ? ' checked' : '') + (defs.length ? '' : ' disabled') + ' /> Use an existing EventKoi taxonomy</label></p>' +
+            '<div class="ekti-mode-create"' + (useExisting ? ' style="display:none;"' : '') + '>' +
+            '<p><label>Slug <input type="text" class="ekti-new-slug" value="' + escapeHtml(p.slug) + '" size="14" /></label> ' +
+            '<label>Singular <input type="text" class="ekti-new-singular" value="' + escapeHtml(p.singular) + '" size="12" /></label> ' +
+            '<label>Plural <input type="text" class="ekti-new-plural" value="' + escapeHtml(p.plural) + '" size="12" /></label></p>' +
+            (type === 'locations' ? '<p class="description">Term fields (key / label). Each one becomes an address field on every location.</p>' + fieldRowsHtml(p.fields) : '<p class="description">Instructor terms carry the name only.</p>') +
+            '</div>' +
+            '<div class="ekti-mode-existing"' + (useExisting ? '' : ' style="display:none;"') + '>' +
+            '<p><select class="ekti-existing-slug">' + defOpts + '</select></p></div>';
+        if (type === 'locations') {
+            html += '<p class="description" style="margin-top:8px;">Address mapping — which term field fills each part of an event\'s address:</p><div class="ekti-slot-wrap"></div>';
+        }
+        html += '<div class="ekti-actions"><button type="button" class="button button-primary ekti-setup-save" data-type="' + type + '">Save Taxonomy</button>' +
+            '<button type="button" class="button ekti-setup-cancel" data-type="' + type + '">Cancel</button></div>';
+        $card.html(html);
+        if (type === 'locations') {
+            refreshSlotGrid();
+        }
+    }
+
+    /* The slot grid follows the chosen field source (new rows or an existing definition). */
+    function refreshSlotGrid() {
+        var st = wz.summary.taxonomies.locations;
+        var $card = $('#ekti-setup-locations');
+        var mode = $card.find('input[name="ekti-mode-locations"]:checked').val();
+        var keys = [];
+        var map;
+        if (mode === 'existing') {
+            var slug = $card.find('.ekti-existing-slug').val();
+            $.each(st.definitions || [], function (i, d) {
+                if (d.slug === slug) {
+                    keys = d.fields;
+                }
+            });
+            map = (slug === st.target && Object.keys(st.map || {}).length) ? st.map : {};
+            if (!Object.keys(map).length) {
+                // Suggest by matching field keys to the proposed keys.
+                $.each(st.proposed_map, function (slot, key) {
+                    $.each(keys, function (i, k) {
+                        if (k.key === key) map[slot] = key;
+                    });
+                });
+            }
+        } else {
+            $card.find('.ekti-field-row').each(function () {
+                var k = $.trim($(this).find('.ekti-f-key').val());
+                if (k) keys.push({ key: k, label: $.trim($(this).find('.ekti-f-label').val()) || k });
+            });
+            map = st.proposed_map;
+        }
+        $card.find('.ekti-slot-wrap').html(slotGridHtml(keys, map));
+    }
+
+    function saveSetup(type) {
+        var $card = $('#ekti-setup-' + type);
+        var mode = $card.find('input[name="ekti-mode-' + type + '"]:checked').val();
+        var config = { mode: mode };
+        if (mode === 'existing') {
+            config.existing_slug = $card.find('.ekti-existing-slug').val();
+        } else {
+            config.slug = $.trim($card.find('.ekti-new-slug').val());
+            config.singular = $.trim($card.find('.ekti-new-singular').val());
+            config.plural = $.trim($card.find('.ekti-new-plural').val());
+            config.fields = [];
+            $card.find('.ekti-field-row').each(function () {
+                var k = $.trim($(this).find('.ekti-f-key').val());
+                if (k) config.fields.push({ key: k, label: $.trim($(this).find('.ekti-f-label').val()) || k });
+            });
+        }
+        if (type === 'locations') {
+            config.map = {};
+            $card.find('.ekti-slot').each(function () {
+                if ($(this).val()) config.map[$(this).data('slot')] = $(this).val();
+            });
+        }
+        var what = mode === 'existing' ? 'use "' + config.existing_slug + '"' : 'create the "' + config.slug + '" taxonomy';
+        if (!confirm('Save: ' + what + (type === 'locations' ? ' and set it as EventKoi\'s Saved Locations taxonomy' : '') + '? This changes EventKoi\'s taxonomy settings and can be undone with "Undo Taxonomy Setup".')) {
+            return;
+        }
+        appendConsole('Setting up ' + type + ' taxonomy...', 'info');
+        ajax('ekti_provision_taxonomy', { type: type, config: JSON.stringify(config) }, function (resp) {
+            if (!resp.success) {
+                appendConsole('Taxonomy setup error (' + type + '): ' + resp.data, 'error');
+                setStatus('#ekti-wz-taxonomies-status', 'Setup failed: ' + escapeHtml(resp.data), 'error');
+                return;
+            }
+            var d = resp.data;
+            appendConsole('✓ ' + type + ' taxonomy "' + d.slug + '" ' + (d.created ? 'created' : 'ready') +
+                (d.added && !d.created ? ' (' + d.added + ' field(s) added)' : '') + '.', 'info');
+            $card.data('editing', false);
+            refreshWizard(function () {
+                scanTaxonomySync(type);
+            });
+        });
+    }
+
+    function undoProvision() {
+        if (!confirm('Undo the taxonomy setup? EventKoi\'s taxonomy settings are restored and any taxonomy this wizard created is deleted with its terms. Undo the term matching (2b) first.')) {
+            return;
+        }
+        ajax('ekti_undo_taxonomy_provision', {}, function (resp) {
+            if (!resp.success) {
+                appendConsole('Undo taxonomy setup: ' + resp.data, 'error');
+                setStatus('#ekti-wz-taxonomies-status', escapeHtml(resp.data), 'error');
+                return;
+            }
+            appendConsole('Taxonomy setup undone. ' + JSON.stringify(resp.data.undone), 'warn');
+            refreshWizard(function () {
+                scanTaxonomySync('locations');
+                scanTaxonomySync('instructors');
+            });
+        });
+    }
+
+    function approveTaxonomies() {
+        var t = wz.summary.taxonomies;
+        var warn = [];
+        if (t.locations.status !== 'ready') warn.push('the Locations taxonomy is not ready');
+        if (!t.mapped.locations) warn.push('no TEC venues are matched to locations');
+        if (t.instructors.status !== 'ready') warn.push('the Instructors taxonomy is not set up');
+        if (!t.mapped.instructors) warn.push('no TEC organizers are matched to instructors');
+        if (warn.length && !confirm('Continue anyway? ' + warn.join('; ') + '. Events imported now will not get those terms (Taxonomy Sync can add them later).')) {
+            return;
+        }
+        approveStep('taxonomies');
+    }
+
+    /* Generic chunk loop ------------------------------------------------ */
+
+    function loopChunks(opts) {
+        var noProgress = 0;
+        var first = true;
+        function step() {
+            var data = opts.data(first);
+            first = false;
+            ajax(opts.action, data, function (resp) {
+                if (!resp.success) {
+                    opts.onError(resp.data);
+                    return;
+                }
+                var d = resp.data;
+                var moved = opts.onChunk(d);
+                if (opts.isDone(d)) {
+                    opts.onDone();
+                    return;
+                }
+                noProgress = moved ? 0 : noProgress + 1;
+                if (noProgress >= 3) {
+                    opts.onError('stalled — no progress across 3 requests');
+                    return;
+                }
+                setTimeout(step, 150);
+            });
+        }
+        step();
+    }
+
+    function wzProgress(stage, processed, total) {
+        var pct = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 100;
+        var $p = $('#ekti-wz-' + stage + '-progress').show();
+        $p.find('.ekti-progress-fill').css('width', pct + '%');
+        $p.find('.ekti-progress-text').text(pct + '% (' + processed + '/' + total + ')');
+    }
+
+    /* Steps 3-5: previews ----------------------------------------------- */
+
+    function tiles(items) {
+        var html = '<div class="ekti-stats-grid">';
+        $.each(items, function (i, it) {
+            html += '<div class="ekti-stat"><span class="ekti-stat-value">' + escapeHtml(String(it[1])) + '</span><span class="ekti-stat-label">' + escapeHtml(it[0]) + '</span></div>';
+        });
+        return html + '</div>';
+    }
+
+    function previewEvents() {
+        setStatus('#ekti-wz-events-status', '<span class="ekti-spinner"></span> Scanning TEC events...', 'info');
+        ajax('ekti_scan_event_sync', {}, function (resp) {
+            if (!resp.success) {
+                setStatus('#ekti-wz-events-status', 'Preview failed: ' + escapeHtml(resp.data), 'error');
+                return;
+            }
+            var c = resp.data.counts;
+            var html = tiles([
+                ['TEC events', c.tec_total], ['To import', c.unimported], ['Already in EventKoi', c.imported],
+                ['Published / draft', c.by_status.publish + ' / ' + c.by_status.draft], ['With images', c.with_images],
+                ['Ticket types', c.woo_tickets + c.tc_tickets + c.rsvp_tickets], ['Woo attendees', c.woo_attendees]
+            ]);
+            var review = resp.data.review || [];
+            if (review.length) {
+                html += '<h4>Review items (' + review.length + ')</h4><div class="ekti-wz-scroll"><table class="wp-list-table widefat fixed striped"><thead><tr><th style="width:10%">TEC ID</th><th>Title</th><th>Reason</th><th>Detail</th></tr></thead><tbody>';
+                $.each(review, function (i, r) {
+                    html += '<tr><td>' + (r.tec_id || '') + '</td><td>' + escapeHtml(r.title) + '</td><td>' + escapeHtml(r.reason) + '</td><td>' + escapeHtml(r.detail) + '</td></tr>';
+                });
+                html += '</tbody></table></div>';
+            }
+            if (resp.data.adoption && resp.data.adoption.candidate_events) {
+                html += '<div class="notice notice-warning inline"><p>' + resp.data.adoption.candidate_events + ' natively imported event(s) already carry attendee history. Run "Adopt Native Imports" under Advanced tools &rarr; Event Sync before the order matching step.</p></div>';
+            }
+            $('#ekti-wz-events-preview-out').html(html);
+            var noStart = review.filter(function (r) { return r.reason === 'No start date'; }).length;
+            setStatus('#ekti-wz-events-status', '<strong>' + (c.unimported - noStart) + '</strong> event(s) will be imported' +
+                (noStart ? '; <strong>' + noStart + '</strong> without a start date will be reported and skipped' : '') + '.', review.length ? 'warning' : 'success');
+            refreshWizard();
+        });
+    }
+
+    function previewTickets() {
+        setStatus('#ekti-wz-tickets-status', '<span class="ekti-spinner"></span> Building the ticket plan...', 'info');
+        ajax('ekti_preview_tickets', {}, function (resp) {
+            if (!resp.success) {
+                setStatus('#ekti-wz-tickets-status', 'Preview failed: ' + escapeHtml(resp.data), 'error');
+                return;
+            }
+            var c = resp.data.counts;
+            var html = tiles([
+                ['Events', c.events], ['Ticketed events', c.ticketed_events], ['Ticket types', c.tickets],
+                ['WooCommerce', c.woo], ['RSVP-only events', c.rsvp_events], ['From cost field', c.cost_tickets],
+                ['Unlimited capacity', c.unlimited], ['No tickets', c.no_tickets]
+            ]);
+            var flags = [];
+            if (c.multi_product) flags.push(c.multi_product + ' event(s) with several ticket types');
+            if (c.inverted_windows) flags.push(c.inverted_windows + ' ticket(s) whose sale window ends before it starts');
+            if (c.unpriced) flags.push(c.unpriced + ' ticket(s) imported without a price (currency mismatch)');
+            var rows = 0;
+            html += '<div class="ekti-wz-scroll"><table class="wp-list-table widefat striped"><thead><tr><th>Event</th><th>Ticket</th><th>Price</th><th>Capacity</th><th>Sold in TEC</th><th>Available now</th><th>On sale (site time)</th><th>Flags</th></tr></thead><tbody>';
+            $.each(resp.data.events, function (i, ev) {
+                if (rows > 400) return false;
+                if (ev.mode === 'rsvp') {
+                    html += '<tr><td>' + escapeHtml(ev.title) + '</td><td colspan="7"><em>RSVP only</em></td></tr>';
+                    rows++;
+                    return;
+                }
+                $.each(ev.tickets, function (j, t) {
+                    rows++;
+                    var cap = t.capacity === null ? 'unlimited' : t.capacity;
+                    var avail = t.available === null ? '—' : t.available;
+                    var win = (t.sale_start || '—') + ' → ' + (t.sale_end || '—');
+                    html += '<tr><td>' + (j === 0 ? escapeHtml(ev.title) : '') + '</td><td>' + escapeHtml(t.name) + ' <span class="ekti-pill">' + t.provider + '</span></td>' +
+                        '<td>' + Number(t.price).toFixed(2) + '</td><td>' + cap + '</td><td>' + t.sold + '</td><td>' + avail + '</td><td style="font-size:11px;">' + escapeHtml(win) + '</td>' +
+                        '<td style="font-size:11px;color:#8a6d00;">' + (j === 0 ? escapeHtml(ev.flags.join('; ')) : '') + '</td></tr>';
+                });
+            });
+            html += '</tbody></table></div>';
+            if (rows > 400) {
+                html += '<p class="description">Showing the first 400 rows.</p>';
+            }
+            html += '<p class="description">"Available now" holds back the seats TEC already sold; each imported paid attendee gives one seat back in the next step, so the final number matches TEC.</p>';
+            $('#ekti-wz-tickets-preview-out').html(html);
+            setStatus('#ekti-wz-tickets-status', '<strong>' + c.tickets + '</strong> ticket type(s) across <strong>' + c.events + '</strong> event(s).' + (flags.length ? ' Review: ' + escapeHtml(flags.join('; ')) + '.' : ''), flags.length ? 'warning' : 'success');
+        });
+    }
+
+    function previewOrders() {
+        var agg = { events: 0, woo_rows: 0, woo_orders: 0, woo_unpaid: 0, by_status: {}, tc_attendees: 0, rsvp_rows: 0, rsvp_merged: 0, not_linked: 0 };
+        var rows = [];
+        var extra = {};
+        var offset = 0;
+        var total = 0;
+        setStatus('#ekti-wz-orders-status', '<span class="ekti-spinner"></span> Dry-running the order matching...', 'info');
+        loopChunks({
+            action: 'ekti_preview_orders',
+            data: function () { return { offset: offset }; },
+            onChunk: function (d) {
+                total = d.total;
+                if (d.offset === 0) {
+                    extra = { orphans: d.orphan_attendees, multi: d.multi_event_orders };
+                }
+                $.each(['events', 'woo_rows', 'woo_orders', 'woo_unpaid', 'tc_attendees', 'rsvp_rows', 'rsvp_merged', 'not_linked'], function (i, k) {
+                    agg[k] += d.agg[k];
+                });
+                $.each(d.agg.by_status, function (s, n) {
+                    agg.by_status[s] = (agg.by_status[s] || 0) + n;
+                });
+                rows = rows.concat(d.rows);
+                var moved = d.next > offset;
+                offset = d.next;
+                wzProgress('orders', offset, total);
+                return moved;
+            },
+            isDone: function (d) { return d.done; },
+            onError: function (msg) {
+                setStatus('#ekti-wz-orders-status', 'Preview failed: ' + escapeHtml(msg), 'error');
+            },
+            onDone: function () {
+                $('#ekti-wz-orders-progress').hide();
+                var statuses = '';
+                $.each(agg.by_status, function (s, n) {
+                    var cls = (s === 'complete' || s === 'partially_refunded') ? 'ok' : 'warn';
+                    statuses += '<span class="ekti-pill ' + cls + '">' + escapeHtml(s) + ': ' + n + '</span>';
+                });
+                var html = tiles([
+                    ['Events', agg.events], ['Woo attendees to link', agg.woo_rows], ['Event \u00d7 order links', agg.woo_orders],
+                    ['Not counted as sold', agg.woo_unpaid], ['TC attendees', agg.tc_attendees], ['RSVP rows', agg.rsvp_rows],
+                    ['Cannot be linked', agg.not_linked]
+                ]);
+                html += '<p>Order status mapping: ' + (statuses || '—') + '</p>';
+                html += '<p class="description">' + (extra.multi || 0) + ' WooCommerce order(s) span several events (each seat stays on its own event). ' +
+                    (extra.orphans || 0) + ' TEC attendee(s) belong to events that no longer exist and are not imported.</p>';
+                var noted = rows.filter(function (r) { return r.notes && r.notes.length; });
+                var show = noted.concat(rows.filter(function (r) { return !(r.notes && r.notes.length); })).slice(0, 300);
+                html += '<div class="ekti-wz-scroll"><table class="wp-list-table widefat striped"><thead><tr><th>Event</th><th>Woo attendees</th><th>Orders</th><th>Statuses</th><th>Other</th><th>Notes</th></tr></thead><tbody>';
+                $.each(show, function (i, r) {
+                    var st = [];
+                    $.each(r.by_status || {}, function (s, n) { st.push(s + ' ' + n); });
+                    html += '<tr><td>' + escapeHtml(r.title) + '</td><td>' + r.woo_rows + '</td><td>' + r.orders + '</td><td style="font-size:11px;">' + escapeHtml(st.join(', ')) + '</td>' +
+                        '<td style="font-size:11px;">' + escapeHtml(r.other || '') + '</td><td style="font-size:11px;color:#b32d2e;">' + escapeHtml((r.notes || []).join(' ')) + '</td></tr>';
+                });
+                html += '</tbody></table></div>';
+                $('#ekti-wz-orders-preview-out').html(html);
+                setStatus('#ekti-wz-orders-status', '<strong>' + agg.woo_rows + '</strong> WooCommerce attendee(s) will be linked to their orders' +
+                    (noted.length ? '; ' + noted.length + ' event(s) have notes (listed first).' : '.'), (noted.length || agg.not_linked) ? 'warning' : 'success');
+            }
+        });
+    }
+
+    /* Steps 3-5: run, verify, undo ------------------------------------- */
+
+    /* Plain text: appendConsole() escapes. */
+    function stageResultLine(stage, r) {
+        if (r.status === 'error') {
+            return ['✗ ' + (r.title || '?') + ' (' + (r.tec_id ? 'TEC ' + r.tec_id : 'EK #' + r.event_id) + '): ' + r.error + ' — rolled back', 'error'];
+        }
+        var bits = ['✓ ' + r.title + ' (TEC ' + r.tec_id + ' → EK #' + r.event_id + ')'];
+        if (stage === 'events') {
+            var tx = r.taxonomies || {};
+            if (tx.locations) bits.push('location');
+            if (tx.instructors) bits.push(tx.instructors + ' instructor(s)');
+        } else if (stage === 'tickets') {
+            bits.push(r.tickets + ' ticket type(s)' + (r.cost_ticket ? ' + cost ticket' : '') + ', ' + r.attendance_mode);
+        } else {
+            if (r.woo_attendees) bits.push(r.woo_attendees + ' Woo attendee(s) / ' + r.woo_orders + ' order(s)' + (r.woo_unpaid ? ' (' + r.woo_unpaid + ' not sold)' : ''));
+            if (r.tc_attendees) bits.push(r.tc_attendees + ' TC attendee(s)');
+            if (r.rsvp_rows) bits.push(r.rsvp_rows + ' RSVP row(s)' + (r.rsvp_merged ? ', ' + r.rsvp_merged + ' merged' : ''));
+            $.each(r.notes || [], function (i, n) { bits.push(n); });
+        }
+        return [bits.join(', '), ''];
+    }
+
+    function runStage(stage) {
+        if (wz.running) return;
+        var st = wzStage(stage);
+        if (!confirm('Import ' + WZ_LABELS[stage] + ' for ' + st.remaining + ' event(s)? Each event is rolled back on its own if it fails, and the step can be undone.')) {
+            return;
+        }
+        wz.running = true;
+        renderWizard();
+        $('#ekti-wz-' + stage + '-verify').empty();
+        appendConsole('=== Wizard: importing ' + WZ_LABELS[stage] + ' ===', 'info');
+        var total = st.remaining;
+        var ok = 0;
+        var errors = 0;
+        wzProgress(stage, 0, total);
+        loopChunks({
+            action: 'ekti_run_event_stage',
+            data: function (first) {
+                var data = { stage: stage };
+                if (first) data.reset = 'true';
+                if (stage === 'events') data.import_images = $('#ekti-wz-events-images').prop('checked') ? '1' : '0';
+                return data;
+            },
+            onChunk: function (d) {
+                $.each(d.results || [], function (i, r) {
+                    var line = stageResultLine(stage, r);
+                    appendConsole(line[0], line[1]);
+                });
+                ok += d.tally.imported;
+                errors += d.tally.errors;
+                wzProgress(stage, Math.max(0, total - d.remaining), total);
+                return d.processed > 0;
+            },
+            isDone: function (d) { return d.done; },
+            onError: function (msg) {
+                appendConsole('Wizard ' + stage + ' stage error: ' + msg, 'error');
+                setStatus('#ekti-wz-' + stage + '-status', 'Stopped: ' + escapeHtml(msg) + '. Run it again to resume.', 'error');
+                wz.running = false;
+                refreshWizard();
+            },
+            onDone: function () {
+                wz.running = false;
+                appendConsole('=== ' + WZ_LABELS[stage] + ' stage complete: ' + ok + ' event(s), ' + errors + ' error(s) ===', 'info');
+                setStatus('#ekti-wz-' + stage + '-status', 'Done: <strong>' + ok + '</strong> event(s) processed' + (errors ? ', <strong>' + errors + '</strong> failed and rolled back' : '') + '. Review the results below, then approve.', errors ? 'warning' : 'success');
+                refreshWizard(function () { verifyStage(stage); });
+            }
+        });
+    }
+
+    function verifyStage(stage) {
+        var $out = $('#ekti-wz-' + stage + '-verify').html('<p><span class="ekti-spinner"></span> Checking results...</p>');
+        ajax('ekti_verify_stage', { stage: stage }, function (resp) {
+            if (!resp.success) {
+                $out.html('<div class="notice notice-error inline"><p>' + escapeHtml(resp.data) + '</p></div>');
+                return;
+            }
+            var v = resp.data;
+            var ok = v.ok && v.remaining === 0;
+            wz.verifyOk[stage] = ok;
+            var html = '<h4>Results check</h4><table class="wp-list-table widefat fixed striped"><tbody>';
+            html += '<tr><td style="width:45%">Events done</td><td>' + v.done + '</td></tr>';
+            html += '<tr><td>Still pending</td><td>' + v.remaining + '</td></tr>';
+            html += '<tr><td>Failed (rolled back)</td><td>' + v.failed.length + '</td></tr>';
+            if (v.by_status) {
+                var bs = [];
+                $.each(v.by_status, function (s, n) { bs.push(s + ': ' + n); });
+                html += '<tr><td>' + (stage === 'orders' ? 'Attendee rows by status' : 'Events by status') + '</td><td>' + escapeHtml(bs.join(', ')) + '</td></tr>';
+            }
+            $.each(v.checks, function (i, c) {
+                html += '<tr><td>' + escapeHtml(c.label) + '</td><td>' + escapeHtml(String(c.value)) + '</td></tr>';
+            });
+            html += '</tbody></table>';
+            if (v.samples && v.samples.length) {
+                html += '<p>Spot-check: ';
+                $.each(v.samples, function (i, s) {
+                    html += '<a href="' + escapeHtml(s.url) + '" target="_blank" rel="noopener">' + escapeHtml(s.title) + '</a>' + (i < v.samples.length - 1 ? ' · ' : '');
+                });
+                html += '</p>';
+            }
+            if (v.failed.length) {
+                html += '<h4>Failed</h4><div class="ekti-wz-scroll"><table class="wp-list-table widefat striped"><tbody>';
+                $.each(v.failed, function (i, f) {
+                    html += '<tr><td style="width:10%">' + f.id + '</td><td>' + escapeHtml(f.title) + '</td><td>' + escapeHtml(f.error) + '</td></tr>';
+                });
+                html += '</tbody></table></div>';
+            }
+            if (v.mismatches.length) {
+                html += '<h4 style="color:#b32d2e;">Mismatches (' + v.mismatches.length + ')</h4><div class="ekti-wz-scroll"><table class="wp-list-table widefat striped"><tbody>';
+                $.each(v.mismatches, function (i, m) {
+                    html += '<tr><td style="width:10%">' + m.id + '</td><td>' + escapeHtml(m.title) + '</td><td>' + escapeHtml(m.detail) + '</td></tr>';
+                });
+                html += '</tbody></table></div>';
+            }
+            html += ok
+                ? '<div class="notice notice-success inline"><p>Checks passed' + (v.failed.length ? ' (failed events are listed above and stay out of the import)' : '') + '. Approve to continue.</p></div>'
+                : '<div class="notice notice-warning inline"><p>' + (v.remaining ? 'Some events are still pending — run the step again. ' : '') + (v.mismatches.length ? 'Resolve the mismatches (or undo this step) before approving.' : '') + '</p></div>';
+            $out.html(html);
+            renderWizard();
+        });
+    }
+
+    function undoStage(stage, quiet, after) {
+        if (!quiet && !confirm('Undo the ' + WZ_LABELS[stage] + ' step? Everything it wrote is removed' + (stage === 'events' ? ' (imported events are permanently deleted)' : '') + '.')) {
+            return;
+        }
+        wz.running = true;
+        renderWizard();
+        appendConsole('=== Undoing ' + WZ_LABELS[stage] + ' step ===', 'warn');
+        var undone = 0;
+        loopChunks({
+            action: 'ekti_undo_event_stage',
+            data: function () { return { stage: stage }; },
+            onChunk: function (d) {
+                undone += d.ops;
+                appendConsole('  ' + d.ops + ' op(s) reverted, ' + d.remaining + ' remaining', 'warn');
+                return d.ops > 0;
+            },
+            isDone: function (d) { return d.done; },
+            onError: function (msg) {
+                wz.running = false;
+                appendConsole('Undo ' + stage + ': ' + msg, 'error');
+                setStatus('#ekti-wz-' + stage + '-status', escapeHtml(msg), 'error');
+                refreshWizard();
+                if (after) after(msg);
+            },
+            onDone: function () {
+                wz.running = false;
+                wz.verifyOk[stage] = false;
+                appendConsole(WZ_LABELS[stage] + ' step undone (' + undone + ' op(s)).', 'warn');
+                $('#ekti-wz-' + stage + '-verify, #ekti-wz-' + stage + '-preview-out').empty();
+                setStatus('#ekti-wz-' + stage + '-status', 'Undone.', 'info');
+                refreshWizard();
+                if (after) after();
+            }
+        });
+    }
+
+    function undoEverything() {
+        if (!confirm('Undo the entire import? Orders, tickets and events are removed (events permanently deleted), term matching is reverted and the taxonomy setup is restored. This can take a few minutes.')) {
+            return;
+        }
+        var stages = ['orders', 'tickets', 'events'];
+        function nextStage() {
+            var stage = stages.shift();
+            if (!stage) {
+                return undoTerms(['instructors', 'locations']);
+            }
+            if (wzStage(stage).ledger === 0) {
+                return nextStage();
+            }
+            undoStage(stage, true, function (err) {
+                if (err) {
+                    setStatus('#ekti-wz-finish-status', 'Stopped while undoing ' + stage + ': ' + escapeHtml(err), 'error');
+                    return;
+                }
+                nextStage();
+            });
+        }
+        function undoTerms(types) {
+            var type = types.shift();
+            if (!type) {
+                ajax('ekti_undo_taxonomy_provision', {}, function () {
+                    appendConsole('=== Entire import undone ===', 'warn');
+                    setStatus('#ekti-wz-finish-status', 'The import has been undone.', 'success');
+                    refreshWizard(function () {
+                        scanTaxonomySync('locations');
+                        scanTaxonomySync('instructors');
+                    });
+                });
+                return;
+            }
+            ajax('ekti_undo_taxonomy_sync', { type: type }, function () {
+                appendConsole(type + ' term matching reverted.', 'warn');
+                undoTerms(types);
+            });
+        }
+        nextStage();
+    }
+
+    function renderFinish() {
+        if (!wz.summary) return;
+        var s = wz.summary.stages;
+        var all = wzApproved('orders');
+        $('#ekti-wz-finish-summary').html(
+            '<p>' + (all ? '<span class="ekti-pill ok">Complete</span> ' : '') +
+            '<strong>' + s.events.done + '</strong> event(s) imported, <strong>' + s.tickets.done + '</strong> with tickets processed, <strong>' + s.orders.done + '</strong> with orders linked' +
+            (s.events.failed ? '; ' + s.events.failed + ' event(s) could not be imported (see the Events step)' : '') + '.</p>'
+        );
+    }
+
+    function initWizard() {
+        $('#ekti-wizard').on('click', '.ekti-step-title', function () {
+            var $sec = $(this).closest('.ekti-step');
+            if ($sec.hasClass('is-locked')) return;
+            $sec.toggleClass('is-open');
+        });
+        $('#ekti-stepper').on('click', 'li', function () {
+            var step = $(this).data('step');
+            if (wzLocked(step)) return;
+            wzOpen(step);
+            $('html, body').animate({ scrollTop: $('.ekti-step[data-step="' + step + '"]').offset().top - 60 }, 200);
+        });
+        $('#ekti-wz-preflight-run').on('click', runPreflight);
+        $('#ekti-wz-preflight-approve').on('click', function () { approveStep('preflight'); });
+        $(document).on('click', '.ekti-setup-edit', function () { openSetupForm($(this).data('type')); });
+        $(document).on('click', '.ekti-setup-cancel', function () {
+            $('#ekti-setup-' + $(this).data('type')).data('editing', false);
+            renderSetupCards();
+        });
+        $(document).on('click', '.ekti-setup-save', function () { saveSetup($(this).data('type')); });
+        $(document).on('change', 'input[name^="ekti-mode-"]', function () {
+            var $card = $(this).closest('.ekti-setup-card');
+            var existing = $(this).val() === 'existing';
+            $card.find('.ekti-mode-create').toggle(!existing);
+            $card.find('.ekti-mode-existing').toggle(existing);
+            if ($card.data('type') === 'locations') refreshSlotGrid();
+        });
+        $(document).on('change', '#ekti-setup-locations .ekti-existing-slug', refreshSlotGrid);
+        $(document).on('change', '#ekti-setup-locations .ekti-f-key', refreshSlotGrid);
+        $('#ekti-wz-provision-undo').on('click', undoProvision);
+        $('#ekti-wz-taxonomies-approve').on('click', approveTaxonomies);
+        $('#ekti-wz-events-preview').on('click', previewEvents);
+        $('#ekti-wz-tickets-preview').on('click', previewTickets);
+        $('#ekti-wz-orders-preview').on('click', previewOrders);
+        $.each(['events', 'tickets', 'orders'], function (i, stage) {
+            $('#ekti-wz-' + stage + '-run').on('click', function () { runStage(stage); });
+            $('#ekti-wz-' + stage + '-check').on('click', function () { verifyStage(stage); });
+            $('#ekti-wz-' + stage + '-approve').on('click', function () { approveStep(stage); });
+            $('#ekti-wz-' + stage + '-undo').on('click', function () { undoStage(stage); });
+        });
+        $('#ekti-wz-undo-all').on('click', undoEverything);
+
+        refreshWizard(function () {
+            scanTaxonomySync('locations');
+            scanTaxonomySync('instructors');
+            $.each(['events', 'tickets', 'orders'], function (i, stage) {
+                if (wzStage(stage).done > 0 && !wzApproved(stage)) {
+                    verifyStage(stage);
+                }
+            });
+        });
+    }
+
+    /* ------------------------------------------------------------------ */
     /*  INIT                                                              */
     /* ------------------------------------------------------------------ */
 
@@ -1499,7 +2343,7 @@
         $('#ekti-tax-locations-overwrite').on('change', function () {
             if (taxSyncRunning.locations) return;
             var t = taxSyncTotals.locations;
-            var canRun = t.pending > 0 || t.field_updates > 0 ||
+            var canRun = t.pending > 0 || t.new_terms > 0 || t.field_updates > 0 ||
                 ($(this).prop('checked') && t.field_conflicts > 0);
             $('#ekti-tax-locations-run').prop('disabled', !canRun);
         });
@@ -1522,6 +2366,7 @@
         });
         $('#ekti-load-log').on('click', loadLog);
         $('#ekti-clear-log').on('click', clearLog);
+        initWizard();
     });
 
 })(jQuery);

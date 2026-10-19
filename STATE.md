@@ -7,16 +7,17 @@ condensed version of each build step so progress and plan travel together in one
 top-level document.
 
 - **Branch:** `main`
-- **Plugin version:** 1.8.0
-- **Last updated:** 2026-10-18
-- **Overall status:** ✅ **v1.8.0 ticket data parity rewrite shipped and
-  QA-passed on ott-dev (2026-10-18).** Event Sync now follows EventKoi's
-  native importer ticket model (capacity − sold, then give-back) and
-  imports WooCommerce attendees inline as WC-linked, status-aware
-  `ticket_orders` rows through one shared writer that Run Migration also
-  uses. Full run: 688/688 tickets have `quantity_sold` == TEC paid
-  attendees and 682/682 capacity-limited tickets have the expected
-  remaining. See Step 15.
+- **Plugin version:** 1.9.0
+- **Last updated:** 2026-10-19
+- **Overall status:** ✅ **v1.9.0 Import Wizard shipped and QA-passed on
+  ott-dev (2026-10-19), backend and click-through UI.** The Tools page now leads with a 6-step wizard (Preflight →
+  Locations & Instructors → Events → Tickets → Order matching → Finish)
+  with review stops after events, tickets and orders. The importer can
+  now create EventKoi's Locations (Saved Locations) and Instructors
+  taxonomies itself and match TEC venues/organizers to terms before any
+  event exists. Staged run on dev reproduced the Step 15 acceptance
+  numbers exactly; per-stage and full undo restore the baseline. See
+  Step 16.
 
 ## Shared project facts (true for every step)
 
@@ -63,10 +64,24 @@ top-level document.
 | 13 | Saved Locations term field sync (TEC venue addresses → builder term fields, overwrite + undo) | ✅ Done | — |
 | 14 | Event Sync (TEC events → EventKoi events — native-importer port, Critical-Error fix, chunked runner, adoption + undo) | ✅ Done | — |
 | 15 | Ticket data parity rewrite (native ticket/capacity model, inline WC-linked attendee import, status-aware rows, shared writer for Run Migration) | ✅ Done | — |
+| 16 | One-shot Import Wizard (staged events → tickets → orders with 3 review stops) + taxonomy provisioning from the UI | ✅ Done | — |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
+
+**Step 16 (2026-10-19):** dev is left in the fully imported state from
+the UI wizard run (all 5 steps approved): 658 events, 688 tickets, 2,306
+WC-linked rows, 2,088 sold, 3 location + 32 instructor terms, Saved
+Locations active.
+
+1. **"Undo Entire Import" was not clicked in the UI.** The same sequence
+   passed in backend QA. Run it from the Finish step if dev needs
+   resetting (budget about 6 minutes).
+2. **TEC cleaner on dev is back at 12 months** (`trash-past-events` =
+   12). Preflight flags it as a warning. Raise it to 24 (or off) before
+   relying on dev data long-term.
+3. Earlier items below still apply.
 
 **Step 15 QA complete (2026-10-18) — results under Step 15 below.** Dev is
 left in the fully synced v1.8.0 state.
@@ -920,7 +935,423 @@ empty baseline.
 
 ---
 
+### Step 16 — One-shot Import Wizard + taxonomy creation (v1.9.0) ✅
+
+**Goal:** one guided run on the Tools page takes a site from "TEC + Woo,
+empty EventKoi" to a finished migration. The run stops three times for
+the user to review: **events**, **tickets**, and **order matching**. The
+Locations and Instructors syncs must work on a fresh EventKoi install,
+which means the importer creates the taxonomies themselves (builder
+definitions, address fields, Saved Locations designation and slot map),
+not just the terms. Today it needs a human to set those up first in
+EventKoi Settings > Taxonomies (`scan_taxonomy_sync()` returns
+`ekti_no_location_taxonomy`; reset ott-dev has 0 builder taxonomies).
+
+**Current gaps (from code review, 2026-10-18):**
+
+- Ten stacked panels in historical build order, not pipeline order. The
+  Calendar Sync, Pre-Import Cleanup, Ticket Details Sync, Event Mapping
+  and Run Migration panels are now repair/legacy tools: v1.8 Event Sync
+  creates mapping, tickets, sale windows and WC-linked attendees itself.
+- Copy is out of date: the Event Sync description still says Woo
+  attendees "stay with Run Migration", and its tile is labelled "Woo
+  Attendees (deferred)". Overview tiles count Run Migration's view
+  ("Attendees to Import", "WC Orders to Link"), which is ~0 after v1.8.
+- `import_one_event()` does event → tickets → attendees → give-back in
+  one pass per event, so there is nowhere to stop between tickets and
+  orders.
+- Taxonomy Sync expects the `locations` / `instructors` taxonomies to
+  already exist (`get_taxonomy_for_type()`, `get_saved_location_field_map()`).
+- Undo is per-ledger (`ekti_event_sync_audit`, `ekti_tax_sync_audit_*`, …).
+  Nothing gives an "undo this stage" or "undo the whole wizard" action.
+
+#### Phase 0 — ott-dev discovery ✅ (2026-10-18, EventKoi 1.4.7.0)
+
+Reference: EventKoi doc "Turn a custom taxonomy into reusable Saved
+Locations" (eventkoi.com/docs/custom-data/taxonomies/…). In EventKoi's UI
+it's a three-step flow under Settings > Taxonomies: turn on "Replace
+default location fields with", pick a taxonomy built for venues, then map
+its fields to address details. After that, the event editor shows a term
+dropdown instead of address fields. Existing events keep their built-in
+address until a term is chosen. The doc says this needs EventKoi Pro, but
+the classes ship in `eventkoi/eventkoi.php` 1.4.7.0 on dev.
+
+**Current state of ott-dev:**
+- `eventkoi_taxonomies`, `eventkoi_location_taxonomy` and
+  `eventkoi_location_taxonomy_map` are all **absent**. Neither `locations`
+  nor `instructors` is registered.
+- 0 EventKoi events and an empty `ekti_event_mapping`: the EventKoi side
+  was reset again.
+- The **active importer is v1.7.0**, not the v1.8.0 build that was QA'd.
+  Deploy the current build before any wizard QA.
+- TEC data: 3 venues (Austin 38370, San Antonio - Central 38374, The Bake
+  Lab 38379) and 37 published organizers.
+
+**EventKoi API to reuse.** These are public statics, so no option writes
+by hand:
+
+| Need | Call | Notes |
+|---|---|---|
+| Create or update a taxonomy definition | `EventKoi\Core\Taxonomies::save( $def )` | `$def` = slug, singular, plural, hierarchical, public, show_in_menu, name_label, fields[] of {key, label, type, description, options?}. Field types: text, textarea, url, image, gmap, dropdown, checkbox, radio. Keys go through `sanitize_key`, must be unique, and are stored as `eventkoi_field_{key}` term meta. Slug rules (create only): 1–32 chars, not an existing taxonomy, not a reserved word, no rewrite collision. |
+| Make it usable in the same request | `Taxonomies::register()` + `Taxonomies::invalidate_rewrites()` | `register()` skips taxonomies that already exist. EventKoi normally calls it from `Post_Types` on `init`. `invalidate_rewrites()` makes the next `init` flush rewrite rules once, so archive pages work. |
+| Designate it as Saved Locations | `EventKoi\Core\Location_Taxonomy::set_slug( $slug )` | Refuses a slug that isn't in `Taxonomies::all()`. Upstream quirk: its "different slug → clear map" check runs after `update_option`, so the old map is never cleared. Always call `set_map()` right after. |
+| Map address slots to fields | `Location_Taxonomy::set_map( [slot => field_key] )` | Slots: address1, address2, city, state, country, zip, latitude, longitude. Unknown keys are dropped. |
+| Write term field values | `Taxonomy_Fields::save_values( $term_id, $slug, $values )` | Our `sync_location_term_fields()` writes the same meta directly and stays as-is. |
+| Delete a definition (undo) | `Taxonomies::delete( $slug, $delete_terms )` | |
+
+**Measured slug checks:** `locations` ok; `venues` ok; `instructors` ok;
+`location` is **rejected** (TEC's `tribe_venue` rewrite owns it).
+
+**How events pick their address:** an event uses its assigned term when
+the designation is active and the event's `location_mode` meta is not
+`manual`. If the meta is absent, the event is in taxonomy mode. Events
+with no term still show their built-in `locations` meta, which Event Sync
+keeps writing as the fallback, as EventKoi intends.
+
+#### Phase 1 — Location taxonomy set-up and venue matching (backend)
+
+This is the step where the user sets up the location taxonomy and then
+matches TEC venues to it. The taxonomy doesn't exist yet, so there's
+nothing to match against until it is set up.
+
+- **`get_taxonomy_setup_state( $type )`** (read-only) reports one of
+  three states:
+  1. no definition yet → returns a **proposed definition**;
+  2. a definition exists but isn't designated, or has unmapped slots →
+     returns the gaps;
+  3. ready → returns the slot map and fields.
+
+  For locations it also lists every EventKoi builder taxonomy, so the
+  user can designate an existing one instead of creating one.
+- **Proposed Locations definition** (every value editable in the UI
+  before saving):
+
+  | Setting | Value |
+  |---|---|
+  | slug | `locations` |
+  | singular / plural | Location / Locations |
+  | public | on |
+  | hierarchical | off |
+  | fields (all `text`) | `address_1`, `address_2`, `city`, `state`, `zip`, `country`, `latitude`, `longitude`; optional `gmap` "Map" field |
+  | slot map | 1:1 onto those fields → 8/8 slots mapped |
+
+- **Proposed Instructors definition:** slug `instructors`, Instructor /
+  Instructors, no fields by default. Contact fields are an open decision.
+- **`provision_taxonomy( $type, $def, $slot_map, &$ops )`** does the
+  writes. It records the old values of `eventkoi_taxonomies`,
+  `eventkoi_location_taxonomy` and `eventkoi_location_taxonomy_map`
+  (new `set_option` op; null = absent). Then it runs
+  `Taxonomies::save()` → `register()` → `invalidate_rewrites()`, and for
+  locations `set_slug()` → `set_map()`. If any step returns a `WP_Error`,
+  it stops and shows EventKoi's message.
+- **Rules for existing definitions:**
+  - Reuse it.
+  - Only *append* missing fields, passing the stored fields with their
+    `original_key`, so EventKoi's rename/alias logic never fires.
+  - Never remove or rename a field.
+  - Never re-designate when a different taxonomy is already the Saved
+    Locations taxonomy, unless the user explicitly picks that in the UI.
+- New ledger `ekti_tax_provision_audit`, separate from the term-sync
+  ledgers. Undo restores the three options exactly, deletes definitions
+  this run created (`Taxonomies::delete( $slug, true )`, terms included,
+  only when the ledger shows we created them), and calls
+  `invalidate_rewrites()`.
+- **Venue matching** reuses the existing Taxonomy Sync pieces against the
+  newly provisioned taxonomy: `get_tec_location_sources()`,
+  `auto_map_sources_to_terms()` (exact → containment → fuzzy ≥ 85%),
+  create-new terms via `create_taxonomy_term()` (which fills address fields
+  from the venue when the designation is active), and
+  `sync_location_term_fields()` with fill-empty or overwrite. On a fresh
+  install every venue proposes "create new" with its address preview.
+- **Sources no longer depend on imported events.** Today
+  `get_tec_location_sources()` walks `ekti_event_mapping`, which is empty
+  on a fresh install. For the set-up step, enumerate TEC venues and
+  organizers directly (event counts from `_EventVenueID` /
+  `_EventOrganizerID` across importable events). Terms can then be created
+  and matched **before** Event Sync runs. Assignment to events happens
+  later, when the events exist.
+- `scan_taxonomy_sync()` stops erroring when the taxonomy is missing.
+  It returns the setup state with `provision_needed: true`.
+
+#### Phase 2 — Staged event import (backend)
+
+Split `import_one_event()` into three resumable stages while keeping the
+Step 15 ordering semantics (tickets → event capacity → attendees →
+give-back):
+
+| Stage | Writes | Per-event marker |
+|---|---|---|
+| `events` | post, dates, locations array, categories → calendars, image, website field, mapping entry, upcoming index, **taxonomy assignment** (if mappings are saved) | `_tec_import_source_id` (existing) |
+| `tickets` | `import_event_tickets_sync()`, cost fallback ticket, `tickets_event_capacity`, attendance mode, product bindings | `_ekti_stage_tickets` = summary JSON incl. per-ticket `deducted` |
+| `orders` | `import_event_attendees_sync()` (RSVP / TC / Woo via `link_woo_attendees()`), `give_back_imported_capacity_sync()` using the persisted `deducted` | `_ekti_stage_orders` = summary |
+
+- `run_event_sync()` gains a `$stage` argument. The pending queue for
+  each stage is "previous stage marker present, own marker absent". It is
+  re-derived per chunk as it is today, so every stage stays resumable
+  after a PHP death.
+- Upcoming-index rebuild runs again after `tickets`, because attendance
+  mode changes.
+- Every op is tagged `stage`. New `undo_stage( $stage )` replays only
+  that stage's ops in reverse, LIFO only: tickets can't be undone while
+  orders exist. The existing "Undo Last Event Sync" keeps replaying the
+  whole ledger.
+- **Dry-run previews**, one per review stop:
+  - events: the existing `scan_event_sync()`.
+  - tickets: a read-only per-event ticket plan (name, price, currency,
+    capacity, `deducted`, sale window, binding). Flags multi-product
+    events, price ≠ TEC current price, inverted windows, and the
+    unlimited count.
+  - orders: `link_woo_attendees( …, $dry_run = true )` over the pending
+    events. Shows per-WC-order status mapping, multi-event orders (32 on
+    dev), orphan attendees on deleted TEC events (856, report-only),
+    unrepresented seats, and the expected `quantity_sold` and remaining
+    per ticket.
+- **Post-stage verification** (each stop also shows what was written):
+  - events: created / errors (no-start-date) / drafts.
+  - tickets: count == TEC live products, bindings == tickets.
+  - orders: the Step 15 acceptance check run live. `sold == paid
+    attendees` per ticket, remaining == expected, 0 duplicate order_ids
+    or tokens, 0 `eventkoi_charges` rows for WC. Mismatches block "Finish".
+
+#### Phase 3 — Wizard UI (admin page restructure)
+
+New primary panel **Import Wizard** at the top. Its state is kept in
+`ekti_wizard_state` (current step, completed steps, timestamps, last
+verification results), so reloading the page resumes where it left off.
+
+1. **Preflight** (auto): EventKoi / TEC / ET+ / Woo active and versions;
+   TEC `trash-past-events` ≥ 24 or off, `delete-past-events` off; native
+   imports present (offer Adopt); existing ledgers non-empty (warn about a
+   partial previous run); log file writable.
+2. **Locations & Instructors.** This step can be opened on its own from
+   Advanced tools, outside the wizard. It has two sub-steps:
+   - **2a. Set up the taxonomy.**
+     - **Locations card:** status line (not set up / set up but not
+       designated as Saved Locations / N of 8 slots mapped / ready).
+       Choice: "Create a new Locations taxonomy" (prefilled, editable
+       slug/labels/field list) or "Use an existing EventKoi taxonomy"
+       (dropdown).
+     - **Slot-mapping grid:** 8 address slots → field dropdowns, matching
+       EventKoi's own settings screen.
+     - **Save taxonomy** runs `provision_taxonomy()` and re-scans. A link
+       to EventKoi Settings > Taxonomies is offered for anyone who prefers
+       to set it up there; the card then reads the result.
+     - **Instructors card:** the same, without the slot grid.
+   - **2b. Match TEC venues and organizers to terms.** Uses the existing
+     mapping table: TEC venue → existing term or "➕ Create new", a
+     per-slot address preview (TEC value → term value, conflicts flagged),
+     the fill-empty/overwrite checkbox, and auto-match badges. **Save &
+     create terms** saves the mappings, creates the new terms and writes
+     their address fields.
+   - Undo buttons for 2a and 2b.
+   - Moving to Events requires 2a = ready for Locations, and every venue
+     either mapped or explicitly marked "skip".
+   - Term **assignment** to events happens in the events stage.
+3. **Events — review stop 1:** scan tiles + review items → **Import
+   events** (chunked progress + console) → verification summary with
+   links to a few sample events in EventKoi → **Approve events** /
+   **Undo events**.
+4. **Tickets — review stop 2:** ticket plan preview → **Import tickets**
+   → verification (ticket totals, flagged rows) → **Approve tickets** /
+   **Undo tickets**.
+5. **Order matching — review stop 3:** dry-run linkage preview (status
+   breakdown, multi-event orders, orphans) → **Link orders & attendees**
+   → acceptance report → **Approve** / **Undo orders**.
+6. **Finish:** summary report (counts per stage, review items carried
+   forward, link to the log), the optional organizer custom-field cleanup
+   (Step 12), and **Undo entire import** (stage undos in reverse, then
+   taxonomy provisioning).
+
+- Buttons for a step stay disabled until the previous step is approved.
+  Each stop's tables reuse the existing renderers in `admin.js`
+  (`scanEventSync`, taxonomy table builders).
+- **Advanced tools** (collapsed `<details>` below the wizard): Event
+  Mapping, Run Migration (for events Event Sync did not create), Ticket
+  Details Sync, Pre-Import Cleanup, Adopt Native Imports, Legacy Calendar
+  Sync (undo only), Import Log. The standalone Event Sync and Taxonomy
+  Sync panels move here as "manual mode".
+- Copy fixes: remove "deferred" and "stay with Run Migration". Retarget
+  the Overview tiles to the wizard pipeline (TEC events / imported /
+  tickets / linked WC orders / review items).
+- `admin.js`: new `wizard` module (state load/save, step gating, one
+  generic chunk-loop helper replacing the six near-identical
+  `loop*()` copies; existing call sites move onto it). CSS for a
+  stepper header plus approved, active and locked step states. No build
+  step, same jQuery IIFE.
+
+#### Phase 4 — QA on ott-dev (connector required)
+
+1. Deploy the zip (top-level `eventkoi-tickets-importer/` dir), run
+   `wp plugin install --force --activate`, call `opcache_invalidate`,
+   check the md5 matches.
+2. **Fresh-install path** (dev is already in this state as of
+   2026-10-18: no taxonomy options, 0 events). Before the end-to-end run,
+   test 2a on its own: create → `Location_Taxonomy::is_active()` true and
+   8/8 slots; designate an existing taxonomy; undo restores the options to
+   absent and removes the definition. Run the wizard end to end through the UI
+   in the browser pane (not via reflection), stopping at each review.
+   Expect: taxonomies created with 8/8 slots, ~3 location terms and
+   ~28 instructor terms with address fields, 658 events plus 35
+   no-start-date review items, 688 tickets, 2,306 Woo rows in 1,594
+   orders, and the Step 15 acceptance numbers (2,088 sold == paid).
+3. **Existing-definition path:** re-run with curated definitions in
+   place. Expect 0 definition changes and fields only appended.
+4. **Resumability:** kill a chunk mid-stage (MCP 30 s timeout) and
+   resume. Expect identical totals.
+5. **Undo:** run per-stage LIFO undo, then "Undo entire import". Expect
+   the Phase 0 baseline exactly, including the three EventKoi options.
+6. **Idempotency:** a second full wizard run creates 0 rows.
+7. `php -l`, `node --check`, and an EventKoi REST spot-check of events
+   and orders.
+
+#### Out of scope
+
+Status-sync QA on refunded orders (Next action 1), the upstream EventKoi
+bug report, `uninstall.php`, and i18n. The new options (`ekti_wizard_state`,
+`ekti_tax_provision_audit`) and `_ekti_stage_*` meta are added to the
+uninstall list when that step lands.
+
+#### Decisions (2026-10-19, user)
+
+Recommended defaults taken: slug `locations`; terms are assigned during
+the events stage; Instructors is name-only; no `gmap` field.
+
+#### Implementation notes (as built)
+
+- **Provisioning:** `provision_taxonomy()` → `Taxonomies::save()` /
+  `register()` / `invalidate_rewrites()`, then for locations
+  `Location_Taxonomy::set_slug()` + `set_map()`. Ledger
+  `ekti_tax_provision_audit` (new ops `restore_option`,
+  `provision_taxonomy`). Undo is refused while a term-sync ledger is
+  non-empty, and unregisters the taxonomy for the current request.
+  `get_taxonomy_setup_state()` reports missing / not_designated /
+  unmapped / ready / unsupported.
+- **Sources before events:** `get_tec_event_pairs()` (every importable
+  TEC event → EventKoi ID or 0) feeds `get_tec_locations( true )` and
+  `get_tec_organizer_sources()`. Scan and run skip ek_id 0 for
+  assignment, so terms can be created first. Also fixed: the organizer
+  fallback ran for every event (`$names` was never filled).
+- **Stages:** `import_one_event( …, $full )` is the events stage.
+  `import_event_tickets_stage()` / `import_event_orders_stage()` are the
+  other two. The full single-pass path still calls all three inline.
+  Stage markers: `_ekti_stage_events` / `_ekti_stage_tickets` (the
+  ticket summary, including `sold_by_ticket`, persisted for the give-back)
+  / `_ekti_stage_orders`. The description cost tail is decided up front
+  via `es_has_et_tickets()` + `cost_ticket_spec()`. Give-back is now
+  audited (`ticket_qty_add`, plus `update_postmeta` for
+  `tickets_event_capacity`), so the orders stage can be undone on its own.
+- **Runner / undo:** `run_event_sync( …, 'events' )` and
+  `run_event_stage( 'tickets'|'orders' )`. Ops are tagged `stage` in
+  `ekti_event_sync_audit`. `undo_event_stage()` is LIFO-guarded,
+  time-budgeted, persists every 250 ops, and clears that step's
+  approvals.
+- **Review data:** `preview_ticket_stage()`, `preview_orders_stage()`
+  (chunked dry run of `link_woo_attendees()`), `verify_stage()` (orders
+  = the Step 15 acceptance check, live), `preflight()`.
+- **Wizard state:** `ekti_wizard_state` (approved / verified per step).
+  `wizard_approve()` enforces order, empty queues, and passed order
+  verification.
+- **UI:** the wizard panel and an Activity console sit on top. The old
+  panels are under a collapsed "Advanced tools", except Taxonomy Sync,
+  which now lives in wizard step 2b. The stale "Woo Attendees (deferred)"
+  and "stay with Run Migration" copy is gone. New `loopChunks()` helper
+  for the wizard.
+  **Deviation:** the six existing `loop*()` copies were left as they are
+  (not refactored onto the helper) to keep the legacy tools unchanged.
+
+#### Dev QA results (2026-10-19, ott-dev, importer v1.9.0 / EventKoi 1.4.7.0)
+
+Driven through the same methods the AJAX handlers call (MCP + reflection).
+The browser pane needed a WordPress sign-in, so the click-through UI pass
+is still open.
+
+- **Deploy:** zip via `novamira/create-upload-link` +
+  `novamira/run-wp-cli plugin install --force --activate` (the `wp`
+  binary is not on PHP's PATH). md5 matched; upload removed.
+- **Baseline:** 0 EventKoi events/tickets/orders, no taxonomy options.
+- **Preflight:** all required checks ok. One warning: TEC
+  `trash-past-events` = 12.
+- **Provisioning:** Locations created and designated, 8/8 slots,
+  `is_active()` true. Instructors created. Re-provision is a no-op
+  (created false, 0 fields added). Undo returned all three EventKoi
+  options to absent.
+- **Term matching before any event exists:** 3 location terms with 23
+  address fields (Austin, San Antonio - Central, The Bake Lab).
+  32 instructor terms.
+- **Events stage:** 658 imported + 35 no-start-date errors (= Step 15).
+  656 events got a location term, 595 an instructor term, 658 indexed.
+  0 tickets / 0 order rows written. Attendance mode = none until the
+  tickets stage. 2,587 ledger ops.
+- **Tickets stage:** preview predicted 688 types (38 multi-type events,
+  6 RSVP-only, 6 unlimited, 0 inverted windows). Run produced 688/688
+  rows and 688 bindings, sold 0. LIFO guard refused an events undo.
+  Tickets undo (3,905 ops) restored the exact post-events state, and a
+  re-run reproduced 688/688.
+- **Orders preview (dry run, 0 writes):** 2,306 Woo rows (2,049 complete
+  / 39 partially_refunded / 215 refunded / 3 failed), 9 RSVP rows
+  (2 merged), 0 unlinkable. 51 multi-event WC orders and 1,216 orphan
+  attendees, both report-only.
+- **Orders stage:** 2,306 rows, 2,088 sold, 1,594 linked WC orders.
+  688 Woo tickets checked with 0 mismatches (sold == sold rows, rows ==
+  TEC attendees, remaining == expected). 0 duplicate order IDs or
+  tokens, 0 WooCommerce charges rows. Identical to Step 15.
+- **Idempotency:** a second run of every stage made 0 new events, ticket
+  rows or order rows (the 35 dateless events retried and failed again).
+- **Full undo:** orders (7,033 ops) → tickets (3,905) → events (2,587)
+  → term matching → provisioning. Result: 0 events / tickets / rows /
+  RSVPs / flags / WC meta / bindings / location+instructor terms; one
+  `event_cal` term (default); taxonomy options absent; 0 orphan meta.
+  Inert empty options and wizard state were cleared afterwards.
+- **Speed on dev:** events ≈ 5/s, tickets ≈ 5/s, orders ≈ 3/s; undo
+  ≈ 110–150 ops/s (events), ~2,800 ops per 25 s (orders).
+
+#### UI pass (2026-10-19, browser pane, narrow ~560 px viewport)
+
+Run end to end from a clean baseline by clicking the wizard. Native
+`confirm()` dialogs were auto-accepted in-page.
+
+- Preflight → approve. 2a: Locations created via the setup form (8/8
+  slots prefilled), Instructors created. 2b: Create Terms & Apply → 3
+  location terms (23 address fields) and 32 instructor terms → approve
+  (no warnings). Each step unlocked and opened the next.
+- Events: preview, then run (693 → 658 imported, 35 rolled back, about
+  4.5 min). Results check: 656 with a location term, 595 with an
+  instructor term, 658 indexed → approve.
+- Tickets: preview 688 types → run (about 2.5 min) → 688 / 688, 688
+  bindings → approve.
+- Orders: preview 2,306 rows (status split as in backend QA) → run
+  (about 4.5 min) → acceptance passed (2,306 / 2,088 sold / 1,594
+  orders / 0 mismatches / 0 duplicates / 0 charges) → approve.
+  Finish shows Complete.
+- Reload mid-run resumes at the right step (state is server-side). 0
+  console errors.
+- **Fixed during the pass** (all redeployed):
+  - unmatched sources now default to "Create new term" (fresh installs
+    had Create Terms & Apply disabled);
+  - asset versions include file mtime (the browser was serving stale
+    JS/CSS);
+  - titles are decoded (`&#038;`, and `&amp;` double-escaped in the
+    console);
+  - spot-check links are spread across the run;
+  - copy: "TEC events", confirm text when 0 assignments, events preview
+    subtracts dateless events, "Event × order links";
+  - narrow-width CSS: setup cards, slot grid, buttons, tables. 0
+    horizontal overflow, measured.
+- Side effect noticed: Rank Math logs a "deleted term
+  /locations/austin/" notice after an undo deletes a location term.
+  Notice only, no redirect created.
+
+---
+
 ## Admin UI ✅
+
+**v1.9.0 layout:** Import Wizard (6 steps, review stops after events,
+tickets and orders; taxonomy setup and term matching in step 2) →
+Activity console → collapsed **Advanced tools** (Run Migration Overview,
+single-pass Event Sync, Event Mapping, Run Migration, Pre-Import Cleanup,
+Ticket Details Sync, Legacy Calendar Sync, Import Log). The eight-panel
+description below is the pre-1.9 layout; those panels now sit under
+Advanced tools.
 
 Server-rendered PHP page (`render_admin_page()`) with eight panels:
 1. **Overview** — stats grid (TEC events, attendees, EventKoi events, mapped/
@@ -1207,6 +1638,20 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
   35 unusable events). Location/instructor term assignments from
   v1.5.0 went with the pre-cleanup event population (0 assignments
   today) — re-run Taxonomy Sync after Event Sync to repopulate.
+
+- 2026-10-19: **Step 16 — wizard + taxonomy provisioning.** Provisioning
+  goes through EventKoi's public statics (`Taxonomies::save()`,
+  `Location_Taxonomy::set_slug()` / `set_map()`) rather than raw option
+  writes, so EventKoi's own validation runs (slug collision with TEC's
+  `location` rewrite, field-key rules). `set_slug()` never clears a
+  previous map (it compares after writing), so `set_map()` is always
+  called explicitly. Stage state lives on the event as meta rather than
+  a queue option (same resumability rationale as Step 14). Stage undo
+  shares the event-sync ledger via a `stage` tag, so "Undo Last Event
+  Sync" still reverts everything. The orders stage needs the per-ticket
+  `deducted` seats from the tickets stage, so the ticket summary is
+  persisted in `_ekti_stage_tickets`. The 1.7.0 build found active on dev
+  (STATE said 1.8.0) was replaced by 1.9.0.
 
 - 2026-10-18: **Step 15 — native ticket model + WC-linked attendees.**
   WC attendees stay WC-linked (real price, real WC status, WC meta) rather

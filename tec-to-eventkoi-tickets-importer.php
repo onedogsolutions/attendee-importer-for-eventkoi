@@ -3,7 +3,7 @@
  * Plugin Name: EventKoi Tickets Importer
  * Plugin URI:  https://onedog.solutions
  * Description: Migrates tickets and attendees from The Events Calendar (Event Tickets / Event Tickets Plus) to EventKoi.
- * Version:     1.8.0
+ * Version:     1.9.0
  * Author:      One Dog Solutions
  * Author URI:  https://onedog.solutions
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'EKTI_VERSION', '1.8.0' );
+define( 'EKTI_VERSION', '1.9.0' );
 define( 'EKTI_LOG_DIR', WP_CONTENT_DIR . '/uploads' );
 define( 'EKTI_LOG_FILE', EKTI_LOG_DIR . '/eventkoi-import.log' );
 define( 'EKTI_BATCH_SIZE', 30 );
@@ -82,6 +82,16 @@ final class EventKoi_Tickets_Importer {
         add_action( 'wp_ajax_ekti_run_event_sync', [ $this, 'ajax_run_event_sync' ] );
         add_action( 'wp_ajax_ekti_adopt_native_imports', [ $this, 'ajax_adopt_native_imports' ] );
         add_action( 'wp_ajax_ekti_undo_event_sync', [ $this, 'ajax_undo_event_sync' ] );
+        add_action( 'wp_ajax_ekti_wizard_state', [ $this, 'ajax_wizard_state' ] );
+        add_action( 'wp_ajax_ekti_wizard_approve', [ $this, 'ajax_wizard_approve' ] );
+        add_action( 'wp_ajax_ekti_preflight', [ $this, 'ajax_preflight' ] );
+        add_action( 'wp_ajax_ekti_provision_taxonomy', [ $this, 'ajax_provision_taxonomy' ] );
+        add_action( 'wp_ajax_ekti_undo_taxonomy_provision', [ $this, 'ajax_undo_taxonomy_provision' ] );
+        add_action( 'wp_ajax_ekti_run_event_stage', [ $this, 'ajax_run_event_stage' ] );
+        add_action( 'wp_ajax_ekti_undo_event_stage', [ $this, 'ajax_undo_event_stage' ] );
+        add_action( 'wp_ajax_ekti_preview_tickets', [ $this, 'ajax_preview_tickets' ] );
+        add_action( 'wp_ajax_ekti_preview_orders', [ $this, 'ajax_preview_orders' ] );
+        add_action( 'wp_ajax_ekti_verify_stage', [ $this, 'ajax_verify_stage' ] );
         add_action( 'wp_ajax_ekti_get_log', [ $this, 'ajax_get_log' ] );
         add_action( 'wp_ajax_ekti_clear_log', [ $this, 'ajax_clear_log' ] );
     }
@@ -117,8 +127,13 @@ final class EventKoi_Tickets_Importer {
         if ( 'tools_page_eventkoi-ticket-importer' !== $hook ) {
             return;
         }
-        wp_enqueue_style( 'ekti-admin', plugin_dir_url( __FILE__ ) . 'assets/admin.css', [], EKTI_VERSION );
-        wp_enqueue_script( 'ekti-admin', plugin_dir_url( __FILE__ ) . 'assets/admin.js', [ 'jquery' ], EKTI_VERSION, true );
+        // File mtime in the version busts browser caches on every deploy.
+        $ver = function ( $rel ) {
+            $path = plugin_dir_path( __FILE__ ) . $rel;
+            return EKTI_VERSION . ( file_exists( $path ) ? '.' . filemtime( $path ) : '' );
+        };
+        wp_enqueue_style( 'ekti-admin', plugin_dir_url( __FILE__ ) . 'assets/admin.css', [], $ver( 'assets/admin.css' ) );
+        wp_enqueue_script( 'ekti-admin', plugin_dir_url( __FILE__ ) . 'assets/admin.js', [ 'jquery' ], $ver( 'assets/admin.js' ), true );
         wp_localize_script( 'ekti-admin', 'EKTI', [
             'ajax_url'  => admin_url( 'admin-ajax.php' ),
             'nonce'     => wp_create_nonce( 'ekti_nonce' ),
@@ -1500,6 +1515,34 @@ final class EventKoi_Tickets_Importer {
                 case 'insert_field_group':
                     $wpdb->delete( $this->ek_table( 'field_groups' ), [ 'id' => (int) $op['id'] ] );
                     break;
+                // Step 16 ops.
+                case 'restore_option':
+                    if ( null === $op['old'] ) {
+                        delete_option( $op['name'] );
+                    } else {
+                        update_option( $op['name'], $op['old'] );
+                    }
+                    break;
+                case 'provision_taxonomy':
+                    if ( ! empty( $op['created'] ) && class_exists( '\\EventKoi\\Core\\Taxonomies' ) ) {
+                        \EventKoi\Core\Taxonomies::delete( (string) $op['slug'], true );
+                        // Also drop it from this request, so a re-create in
+                        // the same request is not refused as "slug exists".
+                        if ( taxonomy_exists( (string) $op['slug'] ) ) {
+                            unregister_taxonomy( (string) $op['slug'] );
+                        }
+                    }
+                    if ( class_exists( '\\EventKoi\\Core\\Taxonomies' ) ) {
+                        \EventKoi\Core\Taxonomies::invalidate_rewrites();
+                    }
+                    break;
+                case 'ticket_qty_add':
+                    $wpdb->query( $wpdb->prepare(
+                        "UPDATE {$this->ek_table( 'tickets' )} SET quantity_available = quantity_available - %d WHERE id = %d",
+                        (int) $op['delta'],
+                        (int) $op['id']
+                    ) );
+                    break;
             }
             $counts[ $op['type'] ] = ( $counts[ $op['type'] ] ?? 0 ) + 1;
         }
@@ -2166,15 +2209,22 @@ final class EventKoi_Tickets_Importer {
      * Fallback: the location name left on the EventKoi event by
      * EventKoi's native importer (`location` meta array, `name` key).
      * Returns key => [ name, venue_id, events (tec_id => ek_id) ].
+     *
+     * With $include_unimported, every importable TEC event counts (ek_id 0
+     * when it has no EventKoi copy yet) so venues can be matched to terms
+     * before Event Sync runs (Step 16 wizard).
      */
-    private function get_tec_locations() {
-        $mapping   = $this->get_saved_mapping();
+    private function get_tec_locations( $include_unimported = false ) {
+        $mapping   = $include_unimported ? $this->get_tec_event_pairs() : $this->get_saved_mapping();
         $locations = [];
 
         foreach ( $mapping as $tec_id => $ek_id ) {
             $tec_id = (int) $tec_id;
             $ek_id  = (int) $ek_id;
-            if ( ! $ek_id || ! get_post( $ek_id ) ) {
+            if ( $ek_id && ! get_post( $ek_id ) ) {
+                $ek_id = 0;
+            }
+            if ( ! $ek_id && ! $include_unimported ) {
                 continue;
             }
 
@@ -2188,7 +2238,7 @@ final class EventKoi_Tickets_Importer {
                     $venue_id = $vid;
                 }
             }
-            if ( '' === trim( $name ) ) {
+            if ( '' === trim( $name ) && $ek_id ) {
                 $loc = get_post_meta( $ek_id, 'location', true );
                 if ( is_array( $loc ) && ! empty( $loc['name'] ) ) {
                     $name = $loc['name'];
@@ -2635,7 +2685,10 @@ final class EventKoi_Tickets_Importer {
             return $this->get_location_taxonomy_slug();
         }
         if ( 'instructors' === $type ) {
-            return EKTI_INSTRUCTOR_TAXONOMY;
+            return taxonomy_exists( EKTI_INSTRUCTOR_TAXONOMY )
+                && is_object_in_taxonomy( 'eventkoi_event', EKTI_INSTRUCTOR_TAXONOMY )
+                ? EKTI_INSTRUCTOR_TAXONOMY
+                : '';
         }
         return '';
     }
@@ -3115,7 +3168,7 @@ final class EventKoi_Tickets_Importer {
 
     private function get_tec_location_sources() {
         $sources = [];
-        foreach ( $this->get_tec_locations() as $key => $loc ) {
+        foreach ( $this->get_tec_locations( true ) as $key => $loc ) {
             $sources[ $key ] = [
                 'name'       => $loc['name'],
                 'source_id'  => $loc['venue_id'],
@@ -3131,16 +3184,18 @@ final class EventKoi_Tickets_Importer {
      *
      * Primary source: TEC organizer post title via _EventOrganizerID meta.
      * Fallback: the organizer value stored by EventKoi's native importer
-     * in a custom field (detected automatically).
+     * in a custom field (detected automatically). Covers every importable
+     * TEC event (ek_id 0 = not imported yet) so organizers can be matched
+     * to terms before Event Sync runs.
      */
     private function get_tec_organizer_sources() {
-        $mapping = $this->get_saved_mapping();
+        $mapping = $this->get_tec_event_pairs();
         $sources = [];
         foreach ( $mapping as $tec_id => $ek_id ) {
             $tec_id = (int) $tec_id;
             $ek_id  = (int) $ek_id;
-            if ( ! $ek_id || ! get_post( $ek_id ) ) {
-                continue;
+            if ( $ek_id && ! get_post( $ek_id ) ) {
+                $ek_id = 0;
             }
             $names = [];
             $oids  = get_post_meta( $tec_id, '_EventOrganizerID', true );
@@ -3163,9 +3218,10 @@ final class EventKoi_Tickets_Importer {
                         $sources[ $key ] = [ 'name' => $name, 'source_id' => $oid, 'events' => [] ];
                     }
                     $sources[ $key ]['events'][ $tec_id ] = $ek_id;
+                    $names[] = $name;
                 }
             }
-            if ( empty( $names ) ) {
+            if ( empty( $names ) && $ek_id ) {
                 $fallback = $this->get_eventkoi_organizer_fallback( $ek_id );
                 if ( $fallback ) {
                     $name = $fallback;
@@ -3430,11 +3486,17 @@ final class EventKoi_Tickets_Importer {
     private function scan_taxonomy_sync( $type ) {
         $taxonomy = $this->get_taxonomy_for_type( $type );
         if ( ! $taxonomy ) {
-            if ( 'locations' === $type ) {
-                return new WP_Error(
-                    'ekti_no_location_taxonomy',
-                    'No Locations taxonomy is available. Create one in EventKoi (Settings > Taxonomies) or register a "locations" taxonomy first.'
-                );
+            if ( in_array( $type, [ 'locations', 'instructors' ], true ) ) {
+                // Step 16: report the setup state instead of failing, so the
+                // UI can offer to create the taxonomy first.
+                return [
+                    'provision_needed' => true,
+                    'setup'            => $this->get_taxonomy_setup_state( $type ),
+                    'sources'          => [],
+                    'terms'            => [],
+                    'counts'           => [ 'sources' => count( $this->get_tec_taxonomy_sources( $type ) ) ],
+                    'saved_locations'  => null,
+                ];
             }
             return new WP_Error( 'ekti_invalid_type', 'Invalid taxonomy sync type.' );
         }
@@ -3483,13 +3545,19 @@ final class EventKoi_Tickets_Importer {
         foreach ( $sources as $key => $source ) {
             $sugg = isset( $suggestions[ $key ] ) ? $suggestions[ $key ] : [ 'term_id' => null, 'term_name' => null, 'match_source' => 'none' ];
             $selected = isset( $saved[ $key ] ) ? $saved[ $key ] : $sugg['term_id'];
+            // No saved choice and no matching term (e.g. a fresh taxonomy):
+            // propose creating a term named after the TEC source.
+            if ( ! isset( $saved[ $key ] ) && empty( $selected ) ) {
+                $selected = 'new:' . sanitize_text_field( $source['name'] );
+            }
             $is_new   = is_string( $selected ) && 0 === strpos( $selected, 'new:' );
             $term_id  = $is_new ? 0 : (int) $selected;
             $pending  = 0;
             $seen     = [];
             foreach ( $source['events'] as $ek_id ) {
                 $counts['mapped_events']++;
-                if ( isset( $seen[ $ek_id ] ) ) {
+                // Not imported yet: counted, nothing to assign until Event Sync runs.
+                if ( $ek_id <= 0 || isset( $seen[ $ek_id ] ) ) {
                     continue;
                 }
                 $seen[ $ek_id ] = true;
@@ -3541,10 +3609,12 @@ final class EventKoi_Tickets_Importer {
             ];
         }
         return [
-            'sources'         => $rows,
-            'terms'           => $terms,
-            'counts'          => $counts,
-            'saved_locations' => $saved_locations,
+            'provision_needed' => false,
+            'setup'            => $this->get_taxonomy_setup_state( $type ),
+            'sources'          => $rows,
+            'terms'            => $terms,
+            'counts'           => $counts,
+            'saved_locations'  => $saved_locations,
         ];
     }
 
@@ -3643,7 +3713,7 @@ final class EventKoi_Tickets_Importer {
                 continue;
             }
             foreach ( $sources[ $key ]['events'] as $tec_id => $ek_id ) {
-                if ( isset( $seen[ $ek_id . ':' . $term_id ] ) ) {
+                if ( $ek_id <= 0 || isset( $seen[ $ek_id . ':' . $term_id ] ) ) {
                     continue;
                 }
                 $seen[ $ek_id . ':' . $term_id ] = true;
@@ -3710,6 +3780,441 @@ final class EventKoi_Tickets_Importer {
         delete_option( $option );
         $this->log( "Taxonomy sync ({$type}) undo complete. " . wp_json_encode( $counts ) );
         return [ 'undone' => $counts ];
+    }
+
+    /* ------------------------------------------------------------------
+     * STEP 16 — TAXONOMY PROVISIONING
+     *
+     * Creates the EventKoi builder taxonomies the Taxonomy Sync targets
+     * (Locations with address fields + the Saved Locations designation and
+     * slot map; Instructors) through EventKoi's own public statics —
+     * Taxonomies::save() / register(), Location_Taxonomy::set_slug() /
+     * set_map() — so definitions are validated and stored exactly as
+     * EventKoi's Settings > Taxonomies screen stores them. Audited into the
+     * separate ekti_tax_provision_audit ledger.
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Every importable TEC event (native status filter) => its EventKoi
+     * event ID, or 0 when it has none yet. The saved mapping wins, then the
+     * lowest-ID live `_tec_import_source_id` marker.
+     */
+    private function get_tec_event_pairs() {
+        global $wpdb;
+        $pairs = [];
+        $ids   = $wpdb->get_col(
+            "SELECT ID FROM {$wpdb->posts}
+             WHERE post_type = 'tribe_events'
+               AND post_status IN ('publish','draft','pending','future','private')
+             ORDER BY ID ASC"
+        );
+        foreach ( $ids as $id ) {
+            $pairs[ (int) $id ] = 0;
+        }
+        $markers = $wpdb->get_results(
+            "SELECT pm.meta_value AS tec_id, pm.post_id AS ek_id
+             FROM {$wpdb->postmeta} pm
+             INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
+             WHERE pm.meta_key = '_tec_import_source_id'
+               AND p.post_type = 'eventkoi_event'
+               AND p.post_status NOT IN ('trash','auto-draft')
+             ORDER BY pm.post_id ASC",
+            ARRAY_A
+        );
+        foreach ( $markers as $m ) {
+            $tec_id = (int) $m['tec_id'];
+            if ( isset( $pairs[ $tec_id ] ) && ! $pairs[ $tec_id ] ) {
+                $pairs[ $tec_id ] = (int) $m['ek_id'];
+            }
+        }
+        foreach ( $this->get_saved_mapping() as $tec_id => $ek_id ) {
+            if ( (int) $ek_id > 0 ) {
+                $pairs[ (int) $tec_id ] = (int) $ek_id;
+            }
+        }
+        return $pairs;
+    }
+
+    private function ek_taxonomy_api_available() {
+        return class_exists( '\\EventKoi\\Core\\Taxonomies' )
+            && class_exists( '\\EventKoi\\Core\\Location_Taxonomy' )
+            && class_exists( '\\EventKoi\\Core\\Taxonomy_Fields' );
+    }
+
+    /**
+     * The definition the importer proposes when the taxonomy is missing.
+     * Locations: one text field per Saved Locations address slot.
+     * Instructors: name only.
+     */
+    private function proposed_taxonomy_definition( $type ) {
+        if ( 'locations' === $type ) {
+            $labels = [
+                'address_1' => 'Address line 1',
+                'address_2' => 'Address line 2',
+                'city'      => 'City',
+                'state'     => 'State / Province',
+                'zip'       => 'ZIP / Postal code',
+                'country'   => 'Country',
+                'latitude'  => 'Latitude',
+                'longitude' => 'Longitude',
+            ];
+            $fields = [];
+            foreach ( $labels as $key => $label ) {
+                $fields[] = [ 'key' => $key, 'label' => $label, 'type' => 'text', 'description' => '' ];
+            }
+            return [
+                'slug'         => EKTI_LOCATION_TAXONOMY,
+                'singular'     => 'Location',
+                'plural'       => 'Locations',
+                'hierarchical' => false,
+                'public'       => true,
+                'show_in_menu' => true,
+                'fields'       => $fields,
+            ];
+        }
+        return [
+            'slug'         => EKTI_INSTRUCTOR_TAXONOMY,
+            'singular'     => 'Instructor',
+            'plural'       => 'Instructors',
+            'hierarchical' => false,
+            'public'       => true,
+            'show_in_menu' => true,
+            'fields'       => [],
+        ];
+    }
+
+    /**
+     * Default slot => field-key map for the proposed Locations definition.
+     */
+    private function proposed_slot_map() {
+        return [
+            'address1'  => 'address_1',
+            'address2'  => 'address_2',
+            'city'      => 'city',
+            'state'     => 'state',
+            'country'   => 'country',
+            'zip'       => 'zip',
+            'latitude'  => 'latitude',
+            'longitude' => 'longitude',
+        ];
+    }
+
+    /**
+     * Where a taxonomy type stands: missing / not designated (locations) /
+     * slots unmapped (locations) / ready. Read-only.
+     */
+    private function get_taxonomy_setup_state( $type ) {
+        $api   = $this->ek_taxonomy_api_available();
+        $defs  = $api ? \EventKoi\Core\Taxonomies::all() : (array) get_option( 'eventkoi_taxonomies', [] );
+        $slug  = 'locations' === $type ? EKTI_LOCATION_TAXONOMY : EKTI_INSTRUCTOR_TAXONOMY;
+
+        $definitions = [];
+        foreach ( $defs as $def_slug => $def ) {
+            if ( ! is_array( $def ) ) {
+                continue;
+            }
+            $fields = [];
+            foreach ( (array) ( $def['fields'] ?? [] ) as $f ) {
+                if ( is_array( $f ) && ! empty( $f['key'] ) ) {
+                    $fields[] = [
+                        'key'   => (string) $f['key'],
+                        'label' => (string) ( $f['label'] ?? $f['key'] ),
+                        'type'  => (string) ( $f['type'] ?? 'text' ),
+                    ];
+                }
+            }
+            $definitions[] = [
+                'slug'     => (string) $def_slug,
+                'singular' => (string) ( $def['singular'] ?? $def_slug ),
+                'plural'   => (string) ( $def['plural'] ?? $def_slug ),
+                'fields'   => $fields,
+                'terms'    => taxonomy_exists( (string) $def_slug ) ? (int) wp_count_terms( [ 'taxonomy' => (string) $def_slug, 'hide_empty' => false ] ) : 0,
+            ];
+        }
+
+        $state = [
+            'type'          => $type,
+            'api'           => $api,
+            'status'        => 'missing',
+            'target'        => '',
+            'designated'    => '',
+            'map'           => [],
+            'slots'         => $this->location_slots,
+            'definitions'   => $definitions,
+            'proposed'      => $this->proposed_taxonomy_definition( $type ),
+            'proposed_map'  => 'locations' === $type ? $this->proposed_slot_map() : [],
+            'conflict'      => '',
+            'message'       => '',
+        ];
+
+        if ( ! $api ) {
+            $state['status']  = 'unsupported';
+            $state['message'] = 'EventKoi\'s Taxonomy Builder is not available. Update EventKoi to 1.4.6 or later.';
+            return $state;
+        }
+
+        if ( 'instructors' === $type ) {
+            if ( isset( $defs[ $slug ] ) ) {
+                $state['status'] = 'ready';
+                $state['target'] = $slug;
+            } elseif ( taxonomy_exists( $slug ) ) {
+                $state['conflict'] = 'A taxonomy named "' . $slug . '" is registered by another plugin.';
+            }
+            return $state;
+        }
+
+        $designated          = \EventKoi\Core\Location_Taxonomy::get_slug();
+        $state['designated'] = $designated;
+        $target              = ( '' !== $designated && isset( $defs[ $designated ] ) )
+            ? $designated
+            : ( isset( $defs[ $slug ] ) ? $slug : '' );
+        $state['target']     = $target;
+
+        if ( '' === $target ) {
+            if ( taxonomy_exists( $slug ) ) {
+                $state['conflict'] = 'A taxonomy named "' . $slug . '" is registered by another plugin.';
+            }
+            return $state;
+        }
+
+        if ( $designated !== $target || ! \EventKoi\Core\Location_Taxonomy::is_active() ) {
+            $state['status'] = 'not_designated';
+            return $state;
+        }
+
+        $field_map    = $this->get_saved_location_field_map();
+        $state['map'] = $field_map['slots'];
+        $state['status'] = empty( $field_map['unmapped_slots'] ) ? 'ready' : 'unmapped';
+        return $state;
+    }
+
+    /**
+     * Value of an option, or null when the option does not exist.
+     */
+    private function get_option_or_null( $name ) {
+        $missing = '__ekti_missing__';
+        $value   = get_option( $name, $missing );
+        return $missing === $value ? null : $value;
+    }
+
+    /**
+     * Create (or extend) a builder taxonomy and, for locations, designate it
+     * as Saved Locations with a slot map.
+     *
+     * @param string $type  locations|instructors.
+     * @param array  $input mode (create|existing), slug, singular, plural,
+     *                      fields[], existing_slug, map (slot => field key).
+     * @return array|WP_Error
+     */
+    private function provision_taxonomy( $type, $input ) {
+        if ( ! in_array( $type, [ 'locations', 'instructors' ], true ) ) {
+            return new WP_Error( 'ekti_invalid_type', 'Invalid taxonomy type.' );
+        }
+        if ( ! $this->ek_taxonomy_api_available() ) {
+            return new WP_Error( 'ekti_no_taxonomy_api', 'EventKoi\'s Taxonomy Builder is not available. Update EventKoi to 1.4.6 or later.' );
+        }
+
+        $mode = isset( $input['mode'] ) && 'existing' === $input['mode'] ? 'existing' : 'create';
+        $ops  = [];
+        // Snapshot EventKoi's options first; reverse replay restores them
+        // after the definition delete (ops pushed later replay first).
+        foreach ( [ 'eventkoi_taxonomies', 'eventkoi_location_taxonomy', 'eventkoi_location_taxonomy_map' ] as $name ) {
+            $ops[] = [ 'type' => 'restore_option', 'name' => $name, 'old' => $this->get_option_or_null( $name ) ];
+        }
+
+        $created = false;
+        $added   = 0;
+        if ( 'existing' === $mode ) {
+            $target = sanitize_key( (string) ( $input['existing_slug'] ?? '' ) );
+            if ( '' === $target || null === \EventKoi\Core\Taxonomies::get( $target ) ) {
+                return new WP_Error( 'ekti_unknown_taxonomy', 'Choose an existing EventKoi taxonomy.' );
+            }
+        } else {
+            $proposed = $this->proposed_taxonomy_definition( $type );
+            $target   = sanitize_key( (string) ( $input['slug'] ?? $proposed['slug'] ) );
+            if ( '' === $target ) {
+                $target = $proposed['slug'];
+            }
+            $requested = [];
+            foreach ( (array) ( $input['fields'] ?? $proposed['fields'] ) as $f ) {
+                if ( ! is_array( $f ) ) {
+                    continue;
+                }
+                $key = sanitize_key( (string) ( $f['key'] ?? '' ) );
+                if ( '' === $key ) {
+                    continue;
+                }
+                $requested[ $key ] = [
+                    'key'         => $key,
+                    'label'       => sanitize_text_field( (string) ( $f['label'] ?? $key ) ),
+                    'type'        => 'text',
+                    'description' => '',
+                ];
+            }
+
+            $existing = \EventKoi\Core\Taxonomies::get( $target );
+            if ( null === $existing ) {
+                $def = [
+                    'slug'         => $target,
+                    'singular'     => sanitize_text_field( (string) ( $input['singular'] ?? $proposed['singular'] ) ),
+                    'plural'       => sanitize_text_field( (string) ( $input['plural'] ?? $proposed['plural'] ) ),
+                    'hierarchical' => false,
+                    'public'       => true,
+                    'show_in_menu' => true,
+                    'fields'       => array_values( $requested ),
+                ];
+                $created = true;
+                $added   = count( $requested );
+            } else {
+                // Extend only: keep every stored field (original_key = key so
+                // EventKoi's rename/alias logic never fires) and append the
+                // requested fields the definition does not have yet.
+                $def           = $existing;
+                $def['fields'] = [];
+                $have          = [];
+                foreach ( (array) ( $existing['fields'] ?? [] ) as $f ) {
+                    $f['original_key'] = $f['key'];
+                    $def['fields'][]   = $f;
+                    $have[ $f['key'] ] = true;
+                }
+                foreach ( $requested as $key => $f ) {
+                    if ( ! isset( $have[ $key ] ) ) {
+                        $def['fields'][] = $f;
+                        ++$added;
+                    }
+                }
+            }
+
+            if ( $created || $added ) {
+                $saved = \EventKoi\Core\Taxonomies::save( $def );
+                if ( is_wp_error( $saved ) ) {
+                    return $saved;
+                }
+            }
+            // Live in this request (register() skips already-registered
+            // taxonomies), rewrites flushed once on the next init.
+            \EventKoi\Core\Taxonomies::register();
+            \EventKoi\Core\Taxonomies::invalidate_rewrites();
+        }
+
+        $designated = false;
+        if ( 'locations' === $type ) {
+            $set = \EventKoi\Core\Location_Taxonomy::set_slug( $target );
+            if ( is_wp_error( $set ) ) {
+                $this->audit_push_provision( $ops, $created, $target );
+                return $set;
+            }
+            // set_slug() never clears a previous taxonomy's map (it compares
+            // after writing), so always write the map explicitly.
+            $map = [];
+            foreach ( (array) ( $input['map'] ?? $this->proposed_slot_map() ) as $slot => $field_key ) {
+                $slot = sanitize_key( (string) $slot );
+                if ( in_array( $slot, $this->location_slots, true ) ) {
+                    $map[ $slot ] = sanitize_key( (string) $field_key );
+                }
+            }
+            \EventKoi\Core\Location_Taxonomy::set_map( $map );
+            $designated = true;
+        }
+
+        $this->audit_push_provision( $ops, $created, $target );
+        $this->log( sprintf(
+            'Taxonomy provisioning (%s): %s "%s"%s%s.',
+            $type,
+            $created ? 'created' : ( 'existing' === $mode ? 'selected' : 'reused' ),
+            $target,
+            $added && ! $created ? ", {$added} field(s) appended" : '',
+            $designated ? ', designated as Saved Locations' : ''
+        ) );
+
+        return [
+            'slug'    => $target,
+            'created' => $created,
+            'added'   => $added,
+            'state'   => $this->get_taxonomy_setup_state( $type ),
+        ];
+    }
+
+    private function audit_push_provision( $ops, $created, $slug ) {
+        $ops[] = [ 'type' => 'provision_taxonomy', 'slug' => $slug, 'created' => (bool) $created ];
+        $audit = get_option( 'ekti_tax_provision_audit', [] );
+        update_option( 'ekti_tax_provision_audit', array_merge( is_array( $audit ) ? $audit : [], $ops ), false );
+    }
+
+    /**
+     * Undo taxonomy provisioning. Refused while a term sync ledger still
+     * holds writes into those taxonomies (undo term matching first).
+     */
+    private function undo_taxonomy_provision() {
+        $audit = get_option( 'ekti_tax_provision_audit', [] );
+        if ( empty( $audit ) ) {
+            return [ 'error' => 'Nothing to undo.' ];
+        }
+        foreach ( [ 'locations', 'instructors' ] as $type ) {
+            if ( ! empty( get_option( "ekti_tax_sync_audit_{$type}", [] ) ) ) {
+                return [ 'error' => 'Undo the ' . $type . ' term matching first — its ledger still holds writes into this taxonomy.' ];
+            }
+        }
+        $counts = $this->replay_audit_ops( $audit );
+        delete_option( 'ekti_tax_provision_audit' );
+        foreach ( [ 'locations', 'instructors' ] as $type ) {
+            delete_option( "ekti_taxonomy_mapping_{$type}" );
+        }
+        $this->log( 'Taxonomy provisioning undo complete. ' . wp_json_encode( $counts ) );
+        return [ 'undone' => $counts ];
+    }
+
+    /**
+     * Assign the mapped Locations / Instructors terms to one freshly
+     * imported event (events stage). Uses the saved source → term mappings
+     * from the wizard's taxonomy step; unresolved "new:" targets are skipped.
+     */
+    private function assign_event_taxonomies( $tec_id, $ek_id, &$ops ) {
+        $assigned = [];
+        foreach ( [ 'locations', 'instructors' ] as $type ) {
+            $taxonomy = $this->get_taxonomy_for_type( $type );
+            $mapping  = $this->get_saved_taxonomy_mapping( $type );
+            if ( ! $taxonomy || empty( $mapping ) ) {
+                continue;
+            }
+            $keys = [];
+            if ( 'locations' === $type ) {
+                $vid   = (int) get_post_meta( $tec_id, '_EventVenueID', true );
+                $venue = $vid ? get_post( $vid ) : null;
+                if ( $venue && '' !== trim( $venue->post_title ) ) {
+                    $keys[] = $this->normalize_location_name( html_entity_decode( $venue->post_title, ENT_QUOTES ) );
+                }
+            } else {
+                $oids = get_post_meta( $tec_id, '_EventOrganizerID', false );
+                foreach ( (array) $oids as $oid ) {
+                    foreach ( (array) $oid as $one ) {
+                        $org = (int) $one ? get_post( (int) $one ) : null;
+                        if ( $org && '' !== trim( $org->post_title ) ) {
+                            $keys[] = $this->normalize_location_name( html_entity_decode( $org->post_title, ENT_QUOTES ) );
+                        }
+                    }
+                }
+            }
+            $term_ids = [];
+            foreach ( array_unique( array_filter( $keys ) ) as $key ) {
+                $target = $mapping[ $key ] ?? null;
+                if ( is_int( $target ) || ( is_numeric( $target ) && (int) $target > 0 ) ) {
+                    $term_ids[] = (int) $target;
+                }
+            }
+            if ( empty( $term_ids ) ) {
+                continue;
+            }
+            $current = wp_get_object_terms( $ek_id, $taxonomy, [ 'fields' => 'ids' ] );
+            $current = is_wp_error( $current ) ? [] : array_map( 'intval', $current );
+            $set     = wp_set_object_terms( $ek_id, $term_ids, $taxonomy, true );
+            if ( is_wp_error( $set ) ) {
+                continue;
+            }
+            $ops[] = [ 'type' => 'set_terms', 'taxonomy' => $taxonomy, 'post' => $ek_id, 'old_term_ids' => $current ];
+            $assigned[ $type ] = count( $term_ids );
+        }
+        return $assigned;
     }
 
     /* ------------------------------------------------------------------
@@ -4664,7 +5169,7 @@ final class EventKoi_Tickets_Importer {
      * @param array $ops           Audit ledger (appended by reference).
      * @return array|WP_Error Result summary, or WP_Error.
      */
-    private function import_one_event( $tec_id, $import_images, &$ops ) {
+    private function import_one_event( $tec_id, $import_images, &$ops, $full = true ) {
         global $wpdb;
         $tec_id = (int) $tec_id;
 
@@ -4774,23 +5279,20 @@ final class EventKoi_Tickets_Importer {
         // stranded a second copy of the event).
         update_post_meta( $new_post_id, '_tec_import_source_id', $tec_id );
 
-        // Ticket types (RSVP / Tickets Commerce / WooCommerce).
-        $et_tickets = $this->import_event_tickets_sync( $tec_id, $new_post_id, $ops, $notes );
-
+        // Step 16: tickets and attendees are separate stages. The event
+        // stage only needs to know whether tickets WILL exist, for the
+        // description's cost tail (native appends it only when the event
+        // has neither Event Tickets types nor a cost-derived ticket).
         $cost_raw        = get_post_meta( $tec_id, '_EventCost', true );
         $currency_symbol = get_post_meta( $tec_id, '_EventCurrencySymbol', true );
         $currency_pos    = get_post_meta( $tec_id, '_EventCurrencyPosition', true );
         $currency_code   = get_post_meta( $tec_id, '_EventCurrencyCode', true );
+        $has_et_tickets  = $this->es_has_et_tickets( $tec_id );
+        $will_cost_ticket = ! $has_et_tickets
+            && null !== $this->cost_ticket_spec( $cost_raw, $currency_symbol, $currency_code );
 
-        $ticket_id = 0;
-        if ( ! $et_tickets['found'] ) {
-            $ticket_id = $this->maybe_create_ticket_from_cost_sync( $new_post_id, $cost_raw, $currency_symbol, $currency_code, $ops );
-        }
-
-        $attendance_mode = ( $ticket_id || $et_tickets['imported'] > 0 ) ? 'tickets' : 'none';
-        if ( 'rsvp' === $et_tickets['attendance_mode'] ) {
-            $attendance_mode = 'rsvp';
-        }
+        // Placeholder attendance until the tickets stage sets the real mode.
+        $attendance_mode = 'none';
 
         // Description: TEC body through wpautop, plus organizer/cost tail.
         $description    = wpautop( (string) $post->post_content );
@@ -4811,7 +5313,7 @@ final class EventKoi_Tickets_Importer {
             $tail[] = '<p>' . implode( '<br>', $lines ) . '</p>';
         }
 
-        if ( ! $ticket_id && ! $et_tickets['found'] && '' !== (string) $cost_raw ) {
+        if ( ! $will_cost_ticket && ! $has_et_tickets && '' !== (string) $cost_raw ) {
             $cost_display = $this->es_format_cost_display( $cost_raw, $currency_symbol, $currency_pos );
             $tail[]       = '<p><strong>Cost:</strong> ' . esc_html( $cost_display ) . '</p>';
         }
@@ -4843,24 +5345,6 @@ final class EventKoi_Tickets_Importer {
         update_post_meta( $new_post_id, 'attendance_mode', $attendance_mode );
         update_post_meta( $new_post_id, 'tickets_enabled', 'tickets' === $attendance_mode );
         update_post_meta( $new_post_id, 'timezone_display', $this->es_tec_shows_timezone() );
-
-        if ( 'rsvp' === $attendance_mode ) {
-            update_post_meta( $new_post_id, 'rsvp_enabled', true );
-            if ( $et_tickets['rsvp_capacity'] > 0 ) {
-                update_post_meta( $new_post_id, 'rsvp_capacity', $et_tickets['rsvp_capacity'] );
-            }
-        }
-
-        // Shared (capped/global) Event Tickets stock maps to the per-event total.
-        if ( $et_tickets['event_capacity'] > 0 ) {
-            update_post_meta( $new_post_id, 'tickets_event_capacity', $et_tickets['event_capacity'] );
-        }
-
-        // Attendee history (native order: after tickets + event capacity):
-        // RSVP rows for RSVP-only events; otherwise Tickets Commerce
-        // attendees as manual orders and WooCommerce attendees as WC-linked
-        // rows, then the native capacity give-back (Step 15).
-        $attendees = $this->import_event_attendees_sync( $tec_id, $new_post_id, $et_tickets, $ops, $notes );
 
         if ( ! empty( $end_iso ) ) {
             update_post_meta( $new_post_id, 'end_date', $end_iso );
@@ -4919,24 +5403,161 @@ final class EventKoi_Tickets_Importer {
             $ops[] = [ 'type' => 'update_option', 'name' => 'ekti_event_mapping', 'old' => $old_mapping ];
         }
 
-        return [
+        // Locations / Instructors terms from the wizard's taxonomy mapping.
+        $taxonomies = $this->assign_event_taxonomies( $tec_id, $new_post_id, $ops );
+
+        // Stage marker (lives on the created post — undo deletes it with it).
+        update_post_meta( $new_post_id, '_ekti_stage_events', time() );
+
+        $result = [
             'tec_id'           => $tec_id,
             'event_id'         => $new_post_id,
             'title'            => $title,
             'status'           => $status,
             'attendance_mode'  => $attendance_mode,
-            'tickets'          => $et_tickets['imported'],
-            'cost_ticket'      => (bool) $ticket_id,
-            'tc_attendees'     => $attendees['tc_attendees'],
-            'rsvp_rows'        => $attendees['rsvp_rows'],
-            'rsvp_merged'      => $attendees['rsvp_merged'],
-            'rsvp_skipped'     => $attendees['rsvp_skipped'],
-            'woo_attendees'    => $attendees['woo_attendees'],
-            'woo_orders'       => $attendees['woo_orders'],
-            'woo_unpaid'       => $attendees['woo_unpaid'],
-            'bindings'         => $et_tickets['bindings'],
+            'tickets'          => 0,
+            'cost_ticket'      => false,
+            'tc_attendees'     => 0,
+            'rsvp_rows'        => 0,
+            'rsvp_merged'      => 0,
+            'rsvp_skipped'     => 0,
+            'woo_attendees'    => 0,
+            'woo_orders'       => 0,
+            'woo_unpaid'       => 0,
+            'bindings'         => 0,
+            'taxonomies'       => $taxonomies,
             'notes'            => $notes,
         ];
+
+        if ( ! $full ) {
+            return $result;
+        }
+
+        // Full (single-pass) import: run the next two stages inline, in the
+        // native order (tickets + event capacity, then attendees + give-back).
+        $tickets = $this->import_event_tickets_stage( $new_post_id, $tec_id, $ops );
+        $orders  = $this->import_event_orders_stage( $new_post_id, $tec_id, $ops );
+        if ( is_wp_error( $orders ) ) {
+            return $orders;
+        }
+        return array_merge( $result, [
+            'attendance_mode' => $tickets['attendance_mode'],
+            'tickets'         => $tickets['tickets'],
+            'cost_ticket'     => $tickets['cost_ticket'],
+            'bindings'        => $tickets['bindings'],
+            'tc_attendees'    => $orders['tc_attendees'],
+            'rsvp_rows'       => $orders['rsvp_rows'],
+            'rsvp_merged'     => $orders['rsvp_merged'],
+            'rsvp_skipped'    => $orders['rsvp_skipped'],
+            'woo_attendees'   => $orders['woo_attendees'],
+            'woo_orders'      => $orders['woo_orders'],
+            'woo_unpaid'      => $orders['woo_unpaid'],
+            'notes'           => array_merge( $notes, $tickets['notes'], $orders['notes'] ),
+        ] );
+    }
+
+    /**
+     * Whether a TEC event has any Event Tickets types EventKoi would import
+     * (mirrors the `found` flag of import_event_tickets_sync()).
+     */
+    private function es_has_et_tickets( $tec_id ) {
+        if ( ! function_exists( 'eventkoi_is_tickets_feature_enabled' ) || ! eventkoi_is_tickets_feature_enabled() ) {
+            return false;
+        }
+        return ! empty( $this->es_get_et_ticket_posts( 'tribe_rsvp_tickets', '_tribe_rsvp_for_event', $tec_id ) )
+            || ! empty( $this->es_get_et_ticket_posts( 'tec_tc_ticket', '_tec_tickets_commerce_event', $tec_id ) )
+            || ! empty( $this->es_get_et_ticket_posts( 'product', '_tribe_wooticket_for_event', $tec_id ) );
+    }
+
+    /**
+     * Write one meta value on an imported event, recording the prior value
+     * so a stage undo can restore it.
+     */
+    private function set_event_meta_audited( $post_id, $key, $value, &$ops ) {
+        $old = get_post_meta( $post_id, $key, true );
+        update_post_meta( $post_id, $key, $value );
+        $ops[] = [ 'type' => 'update_postmeta', 'post' => (int) $post_id, 'key' => $key, 'old' => $old ];
+    }
+
+    /**
+     * Tickets stage (Step 16) for one imported event: Event Tickets types
+     * (or the cost-derived ticket), attendance mode, RSVP / shared capacity,
+     * WooCommerce product bindings. The ticket summary (incl. the seats
+     * deducted per ticket) is persisted on the event for the orders stage's
+     * capacity give-back.
+     */
+    private function import_event_tickets_stage( $ek_id, $tec_id, &$ops ) {
+        $notes      = [];
+        $et_tickets = $this->import_event_tickets_sync( $tec_id, $ek_id, $ops, $notes );
+
+        $ticket_id = 0;
+        if ( ! $et_tickets['found'] ) {
+            $ticket_id = $this->maybe_create_ticket_from_cost_sync(
+                $ek_id,
+                get_post_meta( $tec_id, '_EventCost', true ),
+                get_post_meta( $tec_id, '_EventCurrencySymbol', true ),
+                get_post_meta( $tec_id, '_EventCurrencyCode', true ),
+                $ops
+            );
+        }
+
+        $attendance_mode = ( $ticket_id || $et_tickets['imported'] > 0 ) ? 'tickets' : 'none';
+        if ( 'rsvp' === $et_tickets['attendance_mode'] ) {
+            $attendance_mode = 'rsvp';
+        }
+
+        $this->set_event_meta_audited( $ek_id, 'attendance_mode', $attendance_mode, $ops );
+        $this->set_event_meta_audited( $ek_id, 'tickets_enabled', 'tickets' === $attendance_mode, $ops );
+        if ( 'rsvp' === $attendance_mode ) {
+            $this->set_event_meta_audited( $ek_id, 'rsvp_enabled', true, $ops );
+            if ( $et_tickets['rsvp_capacity'] > 0 ) {
+                $this->set_event_meta_audited( $ek_id, 'rsvp_capacity', $et_tickets['rsvp_capacity'], $ops );
+            }
+        }
+        // Shared (capped/global) Event Tickets stock maps to the per-event total.
+        if ( $et_tickets['event_capacity'] > 0 ) {
+            $this->set_event_meta_audited( $ek_id, 'tickets_event_capacity', $et_tickets['event_capacity'], $ops );
+        }
+
+        foreach ( $et_tickets['skipped'] as $s ) {
+            $notes[] = $s;
+        }
+
+        $summary                = $et_tickets;
+        $summary['cost_ticket'] = (int) $ticket_id;
+        $summary['at']          = time();
+        $this->set_event_meta_audited( $ek_id, '_ekti_stage_tickets', $summary, $ops );
+
+        // Attendance mode changed since the events stage indexed the event.
+        if ( class_exists( '\\EventKoi\\Core\\Upcoming_Index' ) ) {
+            \EventKoi\Core\Upcoming_Index::rebuild_event( $ek_id );
+        }
+
+        return [
+            'attendance_mode' => $attendance_mode,
+            'tickets'         => (int) $et_tickets['imported'],
+            'cost_ticket'     => (bool) $ticket_id,
+            'bindings'        => (int) $et_tickets['bindings'],
+            'notes'           => $notes,
+        ];
+    }
+
+    /**
+     * Orders stage (Step 16) for one imported event: RSVP rows, Tickets
+     * Commerce manual orders, WC-linked WooCommerce attendees, then the
+     * native capacity give-back using the tickets stage's summary.
+     *
+     * @return array|WP_Error
+     */
+    private function import_event_orders_stage( $ek_id, $tec_id, &$ops ) {
+        $et_tickets = get_post_meta( $ek_id, '_ekti_stage_tickets', true );
+        if ( ! is_array( $et_tickets ) ) {
+            return new WP_Error( 'no_ticket_stage', 'The tickets stage has not run for this event.' );
+        }
+        $notes     = [];
+        $attendees = $this->import_event_attendees_sync( $tec_id, $ek_id, $et_tickets, $ops, $notes );
+        $this->set_event_meta_audited( $ek_id, '_ekti_stage_orders', array_merge( $attendees, [ 'at' => time() ] ), $ops );
+        return array_merge( $attendees, [ 'notes' => $notes ] );
     }
 
     /**
@@ -5139,9 +5760,11 @@ final class EventKoi_Tickets_Importer {
      * @param array $et_tickets      import_event_tickets_sync() summary.
      * @param array $paid_by_ticket  eventkoi ticket id => ever-paid rows imported.
      */
-    private function give_back_imported_capacity_sync( $new_post_id, $et_tickets, $paid_by_ticket ) {
+    private function give_back_imported_capacity_sync( $new_post_id, $et_tickets, $paid_by_ticket, &$ops ) {
         global $wpdb;
 
+        // Audited (Step 16) so undoing only the orders stage puts the
+        // deducted seats back while the tickets themselves stay.
         $total = 0;
         foreach ( $paid_by_ticket as $ticket_id => $count ) {
             $total    += (int) $count;
@@ -5154,13 +5777,15 @@ final class EventKoi_Tickets_Importer {
                 $give_back,
                 (int) $ticket_id
             ) );
+            $ops[] = [ 'type' => 'ticket_qty_add', 'id' => (int) $ticket_id, 'delta' => $give_back ];
         }
 
         if ( $total > 0 && (int) get_post_meta( $new_post_id, 'tickets_event_capacity', true ) > 0 ) {
             $give_back = min( (int) $et_tickets['sold_total'], $total );
             if ( $give_back > 0 ) {
-                $current = (int) get_post_meta( $new_post_id, 'tickets_event_capacity', true );
-                update_post_meta( $new_post_id, 'tickets_event_capacity', $current + $give_back );
+                $current = get_post_meta( $new_post_id, 'tickets_event_capacity', true );
+                update_post_meta( $new_post_id, 'tickets_event_capacity', (int) $current + $give_back );
+                $ops[] = [ 'type' => 'update_postmeta', 'post' => (int) $new_post_id, 'key' => 'tickets_event_capacity', 'old' => $current ];
             }
         }
     }
@@ -5171,25 +5796,12 @@ final class EventKoi_Tickets_Importer {
      * TEC_Importer::maybe_create_ticket_from_cost() (audited).
      */
     private function maybe_create_ticket_from_cost_sync( $event_id, $cost_raw, $currency_symbol, $currency_code, &$ops ) {
-        if ( '' === (string) $cost_raw ) {
+        $spec = $this->cost_ticket_spec( $cost_raw, $currency_symbol, $currency_code );
+        if ( null === $spec ) {
             return false;
         }
-        if ( ! function_exists( 'eventkoi_is_tickets_feature_enabled' ) || ! eventkoi_is_tickets_feature_enabled() ) {
-            return false;
-        }
-        if ( ! preg_match( '/\d+(?:\.\d+)?/', (string) $cost_raw, $m ) ) {
-            return false; // Non-numeric: "Free", "Donation", "TBD" — description keeps the text.
-        }
-        $price = (float) $m[0];
-        if ( $price <= 0 ) {
-            return false;
-        }
-
-        $checkout_currency = $this->es_get_checkout_currency();
-        $has_tec_currency  = '' !== (string) $currency_code || '' !== trim( (string) $currency_symbol );
-        if ( $has_tec_currency && $this->es_infer_currency_code( $currency_code, $currency_symbol ) !== $checkout_currency ) {
-            return false;
-        }
+        $price             = $spec['price'];
+        $checkout_currency = $spec['currency'];
 
         global $wpdb;
         $ok = $wpdb->insert( $this->ek_table( 'tickets' ), [
@@ -5207,6 +5819,32 @@ final class EventKoi_Tickets_Importer {
         }
         $ops[] = [ 'type' => 'delete_ticket', 'id' => (int) $wpdb->insert_id ];
         return (int) $wpdb->insert_id;
+    }
+
+    /**
+     * The ticket native would derive from TEC's free-text cost field —
+     * [price, currency] — or null when no ticket would be created.
+     */
+    private function cost_ticket_spec( $cost_raw, $currency_symbol, $currency_code ) {
+        if ( '' === (string) $cost_raw ) {
+            return null;
+        }
+        if ( ! function_exists( 'eventkoi_is_tickets_feature_enabled' ) || ! eventkoi_is_tickets_feature_enabled() ) {
+            return null;
+        }
+        if ( ! preg_match( '/\d+(?:\.\d+)?/', (string) $cost_raw, $m ) ) {
+            return null; // Non-numeric: "Free", "Donation", "TBD" — description keeps the text.
+        }
+        $price = (float) $m[0];
+        if ( $price <= 0 ) {
+            return null;
+        }
+        $checkout_currency = $this->es_get_checkout_currency();
+        $has_tec_currency  = '' !== (string) $currency_code || '' !== trim( (string) $currency_symbol );
+        if ( $has_tec_currency && $this->es_infer_currency_code( $currency_code, $currency_symbol ) !== $checkout_currency ) {
+            return null;
+        }
+        return [ 'price' => $price, 'currency' => $checkout_currency ];
     }
 
     /**
@@ -5310,7 +5948,7 @@ final class EventKoi_Tickets_Importer {
             }
         }
 
-        $this->give_back_imported_capacity_sync( $new_post_id, $et_tickets, $paid_by_ticket );
+        $this->give_back_imported_capacity_sync( $new_post_id, $et_tickets, $paid_by_ticket, $ops );
 
         return $summary;
     }
@@ -6031,7 +6669,7 @@ final class EventKoi_Tickets_Importer {
      *                             targeted/QA runs; bypasses the failed-list
      *                             so a targeted retry always attempts).
      */
-    private function run_event_sync( $chunk = 25, $import_images = true, $ids = [] ) {
+    private function run_event_sync( $chunk = 25, $import_images = true, $ids = [], $stage = 'all' ) {
         $chunk         = max( 1, min( 100, (int) $chunk ) );
         $import_images = (bool) $import_images;
         $targeted      = ! empty( $ids );
@@ -6076,7 +6714,7 @@ final class EventKoi_Tickets_Importer {
 
             $event_ops = [];
             try {
-                $result = $this->import_one_event( $tec_id, $import_images, $event_ops );
+                $result = $this->import_one_event( $tec_id, $import_images, $event_ops, 'events' !== $stage );
             } catch ( Throwable $e ) {
                 $result = new WP_Error( 'exception', $e->getMessage() );
             }
@@ -6097,7 +6735,7 @@ final class EventKoi_Tickets_Importer {
                 $failed[ $tec_id ] = $message;
                 $results[] = [
                     'tec_id' => $tec_id,
-                    'title'  => (string) get_the_title( $tec_id ),
+                    'title'  => $this->plain_title( $tec_id ),
                     'status' => 'error',
                     'error'  => $message,
                 ];
@@ -6105,7 +6743,7 @@ final class EventKoi_Tickets_Importer {
                 continue;
             }
 
-            $this->audit_push_event_sync( $event_ops );
+            $this->audit_push_event_sync( 'events' === $stage ? $this->tag_ops( $event_ops, 'events' ) : $event_ops );
 
             ++$tally['imported'];
             $tally['tickets']      += $result['tickets'];
@@ -6120,7 +6758,7 @@ final class EventKoi_Tickets_Importer {
             $results[] = [
                 'tec_id'          => $result['tec_id'],
                 'event_id'        => $result['event_id'],
-                'title'           => $result['title'],
+                'title'           => html_entity_decode( (string) $result['title'], ENT_QUOTES, 'UTF-8' ),
                 'status'          => $result['status'],
                 'attendance_mode' => $result['attendance_mode'],
                 'tickets'         => $result['tickets'],
@@ -6130,6 +6768,7 @@ final class EventKoi_Tickets_Importer {
                 'woo_attendees'   => $result['woo_attendees'],
                 'woo_orders'      => $result['woo_orders'],
                 'woo_unpaid'      => $result['woo_unpaid'],
+                'taxonomies'      => $result['taxonomies'],
                 'notes'           => $result['notes'],
             ];
         }
@@ -6242,6 +6881,856 @@ final class EventKoi_Tickets_Importer {
             $audit = [];
         }
         update_option( 'ekti_event_sync_audit', array_merge( $audit, $ops ), false );
+    }
+
+    /* ------------------------------------------------------------------
+     * STEP 16 — STAGED IMPORT (events → tickets → orders) + WIZARD
+     *
+     * The wizard runs Event Sync in three resumable stages with a review
+     * stop after each. Stage progress lives on the EventKoi event as
+     * `_ekti_stage_events` / `_ekti_stage_tickets` / `_ekti_stage_orders`
+     * meta; each stage's queue is "previous marker present, own marker
+     * absent", re-derived per chunk. Stage ops go into the shared
+     * ekti_event_sync_audit ledger tagged with `stage`, so a stage can be
+     * undone on its own (latest stage first) while "Undo Last Event Sync"
+     * still replays everything.
+     * ------------------------------------------------------------------ */
+
+    private $stages = [ 'events', 'tickets', 'orders' ];
+
+    /**
+     * Post title as plain text (get_the_title() returns HTML entities such
+     * as &#038;, which the admin JS would escape a second time).
+     */
+    private function plain_title( $post_id ) {
+        return html_entity_decode( (string) get_the_title( $post_id ), ENT_QUOTES, 'UTF-8' );
+    }
+
+    private function tag_ops( $ops, $stage ) {
+        foreach ( $ops as $i => $op ) {
+            $ops[ $i ]['stage'] = $stage;
+        }
+        return $ops;
+    }
+
+    /**
+     * EventKoi event IDs waiting for the tickets or orders stage.
+     */
+    private function get_stage_queue( $stage ) {
+        global $wpdb;
+        $prev = 'tickets' === $stage ? '_ekti_stage_events' : '_ekti_stage_tickets';
+        $own  = '_ekti_stage_' . $stage;
+        return array_map( 'intval', $wpdb->get_col( $wpdb->prepare(
+            "SELECT p.ID FROM {$wpdb->posts} p
+             INNER JOIN {$wpdb->postmeta} a ON a.post_id = p.ID AND a.meta_key = %s
+             LEFT JOIN {$wpdb->postmeta} b ON b.post_id = p.ID AND b.meta_key = %s
+             WHERE p.post_type = 'eventkoi_event'
+               AND p.post_status NOT IN ('trash','auto-draft')
+               AND b.meta_id IS NULL
+             ORDER BY p.ID ASC",
+            $prev,
+            $own
+        ) ) );
+    }
+
+    /**
+     * EventKoi event IDs that completed a stage.
+     */
+    private function get_stage_done( $stage ) {
+        global $wpdb;
+        return array_map( 'intval', $wpdb->get_col( $wpdb->prepare(
+            "SELECT p.ID FROM {$wpdb->posts} p
+             INNER JOIN {$wpdb->postmeta} a ON a.post_id = p.ID AND a.meta_key = %s
+             WHERE p.post_type = 'eventkoi_event'
+               AND p.post_status NOT IN ('trash','auto-draft')
+             ORDER BY p.ID ASC",
+            '_ekti_stage_' . $stage
+        ) ) );
+    }
+
+    private function get_stage_failures( $stage ) {
+        if ( 'events' === $stage ) {
+            $state = get_option( 'ekti_event_sync_state', [] );
+            return is_array( $state['failed'] ?? null ) ? $state['failed'] : [];
+        }
+        $state = get_option( 'ekti_event_stage_state', [] );
+        return is_array( $state[ $stage ]['failed'] ?? null ) ? $state[ $stage ]['failed'] : [];
+    }
+
+    private function reset_stage_failures( $stage ) {
+        if ( 'events' === $stage ) {
+            delete_option( 'ekti_event_sync_state' );
+            return;
+        }
+        $state = get_option( 'ekti_event_stage_state', [] );
+        $state = is_array( $state ) ? $state : [];
+        unset( $state[ $stage ] );
+        update_option( 'ekti_event_stage_state', $state, false );
+    }
+
+    /**
+     * One chunk of the tickets or orders stage. Same contract as
+     * run_event_sync(): per-event try/catch with op-replay rollback,
+     * failure memory, 18 s time budget, queue re-derived after the chunk.
+     */
+    private function run_event_stage( $stage, $chunk = 15 ) {
+        if ( ! in_array( $stage, [ 'tickets', 'orders' ], true ) ) {
+            return [ 'error' => 'Invalid stage.' ];
+        }
+        $chunk  = max( 1, min( 100, (int) $chunk ) );
+        $failed = $this->get_stage_failures( $stage );
+        $queue  = array_values( array_diff( $this->get_stage_queue( $stage ), array_map( 'absint', array_keys( $failed ) ) ) );
+        $batch  = array_slice( $queue, 0, $chunk );
+
+        $tally = [
+            'imported'      => 0,
+            'errors'        => 0,
+            'tickets'       => 0,
+            'cost_tickets'  => 0,
+            'bindings'      => 0,
+            'tc_attendees'  => 0,
+            'rsvp_rows'     => 0,
+            'rsvp_merged'   => 0,
+            'woo_attendees' => 0,
+            'woo_orders'    => 0,
+            'woo_unpaid'    => 0,
+        ];
+        $results    = [];
+        $started_at = microtime( true );
+
+        foreach ( $batch as $ek_id ) {
+            if ( microtime( true ) - $started_at > 18 ) {
+                break;
+            }
+            $tec_id = (int) get_post_meta( $ek_id, '_tec_import_source_id', true );
+            $ops    = [];
+            try {
+                if ( ! $tec_id ) {
+                    $result = new WP_Error( 'no_source', 'Event has no _tec_import_source_id marker.' );
+                } elseif ( 'tickets' === $stage ) {
+                    $result = $this->import_event_tickets_stage( $ek_id, $tec_id, $ops );
+                } else {
+                    $result = $this->import_event_orders_stage( $ek_id, $tec_id, $ops );
+                }
+            } catch ( Throwable $e ) {
+                $result = new WP_Error( 'exception', $e->getMessage() );
+            }
+
+            if ( is_wp_error( $result ) ) {
+                if ( $ops ) {
+                    $this->replay_audit_ops( $ops );
+                }
+                ++$tally['errors'];
+                $failed[ $ek_id ] = $result->get_error_message();
+                $results[]        = [
+                    'event_id' => $ek_id,
+                    'tec_id'   => $tec_id,
+                    'title'    => $this->plain_title( $ek_id ),
+                    'status'   => 'error',
+                    'error'    => $result->get_error_message(),
+                ];
+                $this->log( "Event Sync ({$stage} stage): event {$ek_id} failed and was rolled back: " . $result->get_error_message(), 'ERROR' );
+                continue;
+            }
+
+            $this->audit_push_event_sync( $this->tag_ops( $ops, $stage ) );
+            ++$tally['imported'];
+            foreach ( [ 'tickets', 'bindings', 'tc_attendees', 'rsvp_rows', 'rsvp_merged', 'woo_attendees', 'woo_orders', 'woo_unpaid' ] as $k ) {
+                $tally[ $k ] += (int) ( $result[ $k ] ?? 0 );
+            }
+            $tally['cost_tickets'] += ! empty( $result['cost_ticket'] ) ? 1 : 0;
+            $results[] = array_merge( $result, [
+                'event_id' => $ek_id,
+                'tec_id'   => $tec_id,
+                'title'    => $this->plain_title( $ek_id ),
+                'status'   => 'ok',
+            ] );
+        }
+
+        $state = get_option( 'ekti_event_stage_state', [] );
+        $state = is_array( $state ) ? $state : [];
+        $state[ $stage ] = [ 'failed' => $failed ];
+        update_option( 'ekti_event_stage_state', $state, false );
+
+        $remaining = array_values( array_diff( $this->get_stage_queue( $stage ), array_map( 'absint', array_keys( $failed ) ) ) );
+        $processed = $tally['imported'] + $tally['errors'];
+        $this->log( sprintf(
+            'Event Sync (%s stage): processed %d (ok %d, errors %d) — %d remaining.',
+            $stage, $processed, $tally['imported'], $tally['errors'], count( $remaining )
+        ) );
+
+        return [
+            'processed'    => $processed,
+            'tally'        => $tally,
+            'remaining'    => count( $remaining ),
+            'total'        => count( $queue ),
+            'failed_total' => count( $failed ),
+            'done'         => 0 === count( $remaining ),
+            'results'      => $results,
+        ];
+    }
+
+    /**
+     * Undo one stage's ops (latest stage first), newest op first, within a
+     * time budget. Returns done=false when ops remain — call again.
+     */
+    private function undo_event_stage( $stage, $budget = 20 ) {
+        if ( ! in_array( $stage, $this->stages, true ) ) {
+            return [ 'error' => 'Invalid stage.' ];
+        }
+        $audit = get_option( 'ekti_event_sync_audit', [] );
+        $audit = is_array( $audit ) ? $audit : [];
+        $later = array_slice( $this->stages, array_search( $stage, $this->stages, true ) + 1 );
+        foreach ( $audit as $op ) {
+            if ( in_array( $op['stage'] ?? '', $later, true ) ) {
+                return [ 'error' => 'Undo the ' . $op['stage'] . ' stage first.' ];
+            }
+        }
+
+        $idx = [];
+        foreach ( $audit as $i => $op ) {
+            if ( ( $op['stage'] ?? '' ) === $stage ) {
+                $idx[] = $i;
+            }
+        }
+
+        $counts  = [];
+        $undone  = 0;
+        $started = microtime( true );
+        while ( $idx && microtime( true ) - $started < $budget ) {
+            $i = array_pop( $idx );
+            foreach ( $this->replay_audit_ops( [ $audit[ $i ] ] ) as $type => $n ) {
+                $counts[ $type ] = ( $counts[ $type ] ?? 0 ) + $n;
+            }
+            unset( $audit[ $i ] );
+            ++$undone;
+            // Persist periodically so a PHP death mid-undo never replays an
+            // op twice (keys are kept until the final reindex).
+            if ( 0 === $undone % 250 ) {
+                update_option( 'ekti_event_sync_audit', $audit, false );
+            }
+        }
+        update_option( 'ekti_event_sync_audit', array_values( $audit ), false );
+
+        if ( ! $idx ) {
+            $this->reset_stage_failures( $stage );
+            $this->wizard_unapprove_from( $stage );
+        }
+        $this->log( sprintf( 'Event Sync (%s stage) undo: %d op(s) replayed, %d remaining. %s', $stage, $undone, count( $idx ), wp_json_encode( $counts ) ) );
+
+        return [
+            'undone'    => $counts,
+            'ops'       => $undone,
+            'remaining' => count( $idx ),
+            'done'      => empty( $idx ),
+        ];
+    }
+
+    /**
+     * Read-only plan for the tickets stage: per pending event, the ticket
+     * rows the stage would write (native capacity model) plus flags.
+     */
+    private function preview_ticket_stage() {
+        $queue  = $this->get_stage_queue( 'tickets' );
+        $events = [];
+        $counts = [
+            'events'           => count( $queue ),
+            'ticketed_events'  => 0,
+            'tickets'          => 0,
+            'woo'              => 0,
+            'tc'               => 0,
+            'rsvp_events'      => 0,
+            'cost_tickets'     => 0,
+            'unlimited'        => 0,
+            'multi_product'    => 0,
+            'inverted_windows' => 0,
+            'unpriced'         => 0,
+            'no_tickets'       => 0,
+        ];
+        $feature           = function_exists( 'eventkoi_is_tickets_feature_enabled' ) && eventkoi_is_tickets_feature_enabled();
+        $checkout_currency = $this->es_get_checkout_currency();
+        $woo_currency      = $this->es_woo_currency_code();
+        $woo_ok            = '' !== $woo_currency && $woo_currency === $checkout_currency;
+        $tc_ok             = $this->es_et_currency_code() === $checkout_currency;
+
+        foreach ( $queue as $ek_id ) {
+            $tec_id = (int) get_post_meta( $ek_id, '_tec_import_source_id', true );
+            $row    = [
+                'event_id' => $ek_id,
+                'tec_id'   => $tec_id,
+                'title'    => $this->plain_title( $ek_id ),
+                'mode'     => 'none',
+                'tickets'  => [],
+                'flags'    => [],
+            ];
+            $rsvp = $feature ? $this->es_get_et_ticket_posts( 'tribe_rsvp_tickets', '_tribe_rsvp_for_event', $tec_id ) : [];
+            $tc   = $feature ? $this->es_get_et_ticket_posts( 'tec_tc_ticket', '_tec_tickets_commerce_event', $tec_id ) : [];
+            $woo  = $feature ? $this->es_get_et_ticket_posts( 'product', '_tribe_wooticket_for_event', $tec_id ) : [];
+
+            if ( empty( $rsvp ) && empty( $tc ) && empty( $woo ) ) {
+                $spec = $this->cost_ticket_spec(
+                    get_post_meta( $tec_id, '_EventCost', true ),
+                    get_post_meta( $tec_id, '_EventCurrencySymbol', true ),
+                    get_post_meta( $tec_id, '_EventCurrencyCode', true )
+                );
+                if ( $spec ) {
+                    $row['mode']      = 'tickets';
+                    $row['tickets'][] = [
+                        'name' => 'General admission', 'provider' => 'cost', 'price' => $spec['price'],
+                        'capacity' => null, 'sold' => 0, 'available' => null, 'sale_start' => null, 'sale_end' => null,
+                    ];
+                    ++$counts['cost_tickets'];
+                    ++$counts['tickets'];
+                    ++$counts['ticketed_events'];
+                    ++$counts['unlimited'];
+                    $events[] = $row;
+                } else {
+                    ++$counts['no_tickets'];
+                }
+                continue;
+            }
+
+            if ( empty( $tc ) && empty( $woo ) ) {
+                $row['mode'] = 'rsvp';
+                ++$counts['rsvp_events'];
+                $events[] = $row;
+                continue;
+            }
+
+            $row['mode'] = 'tickets';
+            ++$counts['ticketed_events'];
+            if ( count( $woo ) + count( $tc ) > 1 ) {
+                ++$counts['multi_product'];
+                $row['flags'][] = 'multiple ticket types';
+            }
+            foreach ( array_merge( $tc, $rsvp, $woo ) as $t ) {
+                $is_woo   = 'product' === $t->post_type;
+                $price    = (float) get_post_meta( $t->ID, '_price', true );
+                $unpriced = $price > 0 && ( $is_woo ? ! $woo_ok : ! $tc_ok );
+                $capacity = get_post_meta( $t->ID, '_tribe_ticket_capacity', true );
+                $capacity = ( '' === (string) $capacity || (int) $capacity < 0 ) ? null : (int) $capacity;
+                $sold     = max( 0, (int) get_post_meta( $t->ID, 'total_sales', true ) );
+                $start    = $this->es_et_ticket_datetime( $t->ID, '_ticket_start_date', '_ticket_start_time' );
+                $end      = $this->es_et_ticket_datetime( $t->ID, '_ticket_end_date', '_ticket_end_time' );
+                if ( null === $capacity ) {
+                    ++$counts['unlimited'];
+                }
+                if ( $unpriced ) {
+                    ++$counts['unpriced'];
+                    $row['flags'][] = '"' . $t->post_title . '" imports without a price (currency mismatch)';
+                }
+                if ( $start && $end && strtotime( $end ) <= strtotime( $start ) ) {
+                    ++$counts['inverted_windows'];
+                    $row['flags'][] = '"' . $t->post_title . '" sale window ends before it starts';
+                }
+                ++$counts['tickets'];
+                if ( $is_woo ) {
+                    ++$counts['woo'];
+                } elseif ( 'tec_tc_ticket' === $t->post_type ) {
+                    ++$counts['tc'];
+                }
+                $row['tickets'][] = [
+                    'name'       => $t->post_title,
+                    'provider'   => $is_woo ? 'woo' : ( 'tec_tc_ticket' === $t->post_type ? 'tc' : 'rsvp' ),
+                    'price'      => $unpriced ? 0 : $price,
+                    'capacity'   => $capacity,
+                    'sold'       => $sold,
+                    // Native model: seats sold in TEC are deducted now and
+                    // given back per imported paid attendee in the orders stage.
+                    'available'  => null === $capacity ? null : max( $capacity - $sold, 0 ),
+                    'sale_start' => $start ? $this->utc_to_local( $start ) : null,
+                    'sale_end'   => $end ? $this->utc_to_local( $end ) : null,
+                ];
+            }
+            $events[] = $row;
+        }
+
+        return [ 'counts' => $counts, 'events' => $events ];
+    }
+
+    /**
+     * Read-only dry run of the orders stage over a slice of the pending
+     * events (the JS loops over offsets and aggregates).
+     */
+    private function preview_orders_stage( $offset = 0, $limit = 40 ) {
+        global $wpdb;
+        $queue = $this->get_stage_queue( 'orders' );
+        $slice = array_slice( $queue, (int) $offset, max( 1, (int) $limit ) );
+
+        $agg = [
+            'events'       => 0,
+            'woo_rows'     => 0,
+            'woo_orders'   => 0,
+            'woo_unpaid'   => 0,
+            'by_status'    => [],
+            'tc_attendees' => 0,
+            'rsvp_rows'    => 0,
+            'rsvp_merged'  => 0,
+            'not_linked'   => 0,
+        ];
+        $rows = [];
+        foreach ( $slice as $ek_id ) {
+            $tec_id     = (int) get_post_meta( $ek_id, '_tec_import_source_id', true );
+            $et_tickets = get_post_meta( $ek_id, '_ekti_stage_tickets', true );
+            if ( ! $tec_id || ! is_array( $et_tickets ) ) {
+                continue;
+            }
+            ++$agg['events'];
+            $row = [
+                'event_id'  => $ek_id,
+                'tec_id'    => $tec_id,
+                'title'     => $this->plain_title( $ek_id ),
+                'woo_rows'  => 0,
+                'orders'    => 0,
+                'by_status' => [],
+                'notes'     => [],
+                'other'     => '',
+            ];
+            if ( ! $et_tickets['found'] ) {
+                continue;
+            }
+            if ( 'rsvp' === $et_tickets['attendance_mode'] ) {
+                $emails = [];
+                foreach ( $this->es_get_et_ticket_posts( 'tribe_rsvp_attendees', '_tribe_rsvp_event', $tec_id ) as $a ) {
+                    $e = strtolower( sanitize_email( (string) get_post_meta( $a->ID, '_tribe_rsvp_email', true ) ) );
+                    if ( '' !== $e ) {
+                        $emails[] = $e;
+                    }
+                }
+                $unique              = count( array_unique( $emails ) );
+                $agg['rsvp_rows']   += $unique;
+                $agg['rsvp_merged'] += count( $emails ) - $unique;
+                $row['other']        = $unique . ' RSVP row(s)' . ( count( $emails ) > $unique ? ', ' . ( count( $emails ) - $unique ) . ' duplicate(s) merged' : '' );
+                $rows[]              = $row;
+                continue;
+            }
+            $tc = (int) $wpdb->get_var( $wpdb->prepare(
+                "SELECT COUNT(*) FROM {$wpdb->posts} p
+                 INNER JOIN {$wpdb->postmeta} ev ON ev.post_id = p.ID AND ev.meta_key = '_tec_tickets_commerce_event' AND ev.meta_value = %s
+                 INNER JOIN {$wpdb->postmeta} st ON st.post_id = p.ID AND st.meta_key = '_tec_tickets_commerce_status' AND st.meta_value = 'completed'
+                 WHERE p.post_type = 'tec_tc_attendee'",
+                (string) $tec_id
+            ) );
+            $agg['tc_attendees'] += $tc;
+            if ( $tc ) {
+                $row['other'] = $tc . ' Tickets Commerce attendee(s)';
+            }
+
+            $attendees = $this->get_tec_attendees_for_event( $tec_id );
+            if ( $attendees ) {
+                $map      = $et_tickets['ticket_id_map'];
+                $resolver = function ( $product_id ) use ( $map ) {
+                    return (int) ( $map[ (int) $product_id ] ?? 0 );
+                };
+                $ops = [];
+                $dry = $this->link_woo_attendees( $ek_id, $attendees, $resolver, true, $ops );
+                $row['woo_rows']   = $dry['created'];
+                $row['orders']     = $dry['orders'];
+                $row['by_status']  = $dry['by_status'];
+                $row['notes']      = array_values( array_filter( $dry['notes'], function ( $n ) {
+                    return false === strpos( $n, 'non-sold status' );
+                } ) );
+                $agg['woo_rows']   += $dry['created'];
+                $agg['woo_orders'] += $dry['orders'];
+                $agg['woo_unpaid'] += $dry['unpaid'];
+                $agg['not_linked'] += count( $attendees ) - $dry['created'] - $dry['existing'];
+                foreach ( $dry['by_status'] as $s => $n ) {
+                    $agg['by_status'][ $s ] = ( $agg['by_status'][ $s ] ?? 0 ) + $n;
+                }
+            }
+            if ( $row['woo_rows'] || $row['other'] || $row['notes'] ) {
+                $rows[] = $row;
+            }
+        }
+
+        $out = [
+            'total'  => count( $queue ),
+            'offset' => (int) $offset,
+            'next'   => (int) $offset + count( $slice ),
+            'done'   => (int) $offset + count( $slice ) >= count( $queue ),
+            'agg'    => $agg,
+            'rows'   => $rows,
+        ];
+
+        if ( 0 === (int) $offset ) {
+            // Report-only context for the review: attendees on TEC events
+            // that no longer exist, and WC orders spanning several events.
+            $out['orphan_attendees'] = (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM {$wpdb->posts} a
+                 INNER JOIN {$wpdb->postmeta} ev ON ev.post_id = a.ID AND ev.meta_key = '_tribe_wooticket_event'
+                 LEFT JOIN {$wpdb->posts} e ON e.ID = ev.meta_value AND e.post_type = 'tribe_events'
+                  AND e.post_status NOT IN ('trash','auto-draft')
+                 WHERE a.post_type = 'tribe_wooticket' AND a.post_status = 'publish' AND e.ID IS NULL"
+            );
+            $out['multi_event_orders'] = (int) $wpdb->get_var(
+                "SELECT COUNT(*) FROM (
+                   SELECT o.meta_value FROM {$wpdb->postmeta} o
+                   INNER JOIN {$wpdb->posts} a ON a.ID = o.post_id AND a.post_type = 'tribe_wooticket' AND a.post_status = 'publish'
+                   INNER JOIN {$wpdb->postmeta} ev ON ev.post_id = o.post_id AND ev.meta_key = '_tribe_wooticket_event'
+                   WHERE o.meta_key = '_tribe_wooticket_order'
+                   GROUP BY o.meta_value
+                   HAVING COUNT(DISTINCT ev.meta_value) > 1
+                 ) x"
+            );
+        }
+        return $out;
+    }
+
+    /**
+     * Post-stage verification shown at each review stop.
+     */
+    private function verify_stage( $stage ) {
+        global $wpdb;
+        $done     = $this->get_stage_done( $stage );
+        $failures = $this->get_stage_failures( $stage );
+        $failed   = [];
+        foreach ( $failures as $id => $msg ) {
+            $failed[] = [ 'id' => (int) $id, 'title' => $this->plain_title( (int) $id ), 'error' => $msg ];
+        }
+        $remaining = 'events' === $stage
+            ? count( array_diff( $this->get_tec_event_import_ids(), array_map( 'absint', array_keys( $failures ) ) ) )
+            : count( array_diff( $this->get_stage_queue( $stage ), array_map( 'absint', array_keys( $failures ) ) ) );
+
+        $out = [
+            'stage'     => $stage,
+            'done'      => count( $done ),
+            'remaining' => $remaining,
+            'failed'    => $failed,
+            'checks'    => [],
+            'mismatches' => [],
+            'ok'        => true,
+        ];
+        $in = $done ? implode( ',', $done ) : '0';
+
+        if ( 'events' === $stage ) {
+            $out['by_status'] = [];
+            foreach ( $wpdb->get_results( "SELECT post_status, COUNT(*) AS n FROM {$wpdb->posts} WHERE ID IN ({$in}) GROUP BY post_status", ARRAY_A ) as $r ) {
+                $out['by_status'][ $r['post_status'] ] = (int) $r['n'];
+            }
+            foreach ( [ 'locations', 'instructors' ] as $type ) {
+                $taxonomy = $this->get_taxonomy_for_type( $type );
+                $out['checks'][] = [
+                    'label' => 'Events with ' . ( 'locations' === $type ? 'a location' : 'an instructor' ) . ' term',
+                    'value' => $taxonomy ? (int) $wpdb->get_var( $wpdb->prepare(
+                        "SELECT COUNT(DISTINCT tr.object_id) FROM {$wpdb->term_relationships} tr
+                         INNER JOIN {$wpdb->term_taxonomy} tt ON tt.term_taxonomy_id = tr.term_taxonomy_id
+                         WHERE tt.taxonomy = %s AND tr.object_id IN ({$in})",
+                        $taxonomy
+                    ) ) : 'taxonomy not set up',
+                ];
+            }
+            $out['checks'][] = [
+                'label' => 'Events in EventKoi\'s upcoming index',
+                'value' => (int) $wpdb->get_var( "SELECT COUNT(DISTINCT event_id) FROM {$this->ek_table( 'upcoming_index' )} WHERE event_id IN ({$in})" ),
+            ];
+            $out['samples'] = [];
+            // Spread the spot-check across the run (recurring classes
+            // cluster by ID, so the first five are often one title).
+            $picks = [];
+            $step  = max( 1, (int) floor( count( $done ) / 5 ) );
+            for ( $k = 0; $k < count( $done ) && count( $picks ) < 5; $k += $step ) {
+                $picks[] = $done[ $k ];
+            }
+            foreach ( $picks as $id ) {
+                $out['samples'][] = [ 'id' => $id, 'title' => $this->plain_title( $id ), 'url' => get_permalink( $id ) ];
+            }
+            return $out;
+        }
+
+        if ( 'tickets' === $stage ) {
+            $expected = 0;
+            $actual   = 0;
+            $bindings = 0;
+            foreach ( $done as $ek_id ) {
+                $summary = get_post_meta( $ek_id, '_ekti_stage_tickets', true );
+                $want    = is_array( $summary ) ? (int) $summary['imported'] + ( ! empty( $summary['cost_ticket'] ) ? 1 : 0 ) : 0;
+                $have    = (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$this->ek_table( 'tickets' )} WHERE event_id = %d", $ek_id ) );
+                $expected += $want;
+                $actual   += $have;
+                $bindings += is_array( $summary ) ? (int) $summary['bindings'] : 0;
+                if ( $want !== $have && count( $out['mismatches'] ) < 100 ) {
+                    $out['mismatches'][] = [ 'id' => $ek_id, 'title' => $this->plain_title( $ek_id ), 'detail' => "expected {$want} ticket(s), found {$have}" ];
+                }
+            }
+            $out['checks'][] = [ 'label' => 'Ticket rows (expected / found)', 'value' => "{$expected} / {$actual}" ];
+            $out['checks'][] = [ 'label' => 'WooCommerce product bindings', 'value' => $bindings ];
+            $out['checks'][] = [
+                'label' => 'Unlimited-capacity tickets',
+                'value' => (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$this->ek_table( 'tickets' )} WHERE event_id IN ({$in}) AND quantity_available IS NULL" ),
+            ];
+            $out['ok'] = $expected === $actual;
+            return $out;
+        }
+
+        // Orders: Step 15 acceptance, live.
+        $counted   = "'complete','completed','succeeded','paid','partially_refunded'";
+        $ever_paid = "'complete','partially_refunded','refunded'";
+        $tickets_checked = 0;
+        $sold_total      = 0;
+        $rows_total      = 0;
+        foreach ( $done as $ek_id ) {
+            $summary = get_post_meta( $ek_id, '_ekti_stage_tickets', true );
+            $tec_id  = (int) get_post_meta( $ek_id, '_tec_import_source_id', true );
+            if ( ! is_array( $summary ) || empty( $summary['ticket_id_map'] ) ) {
+                continue;
+            }
+            foreach ( $summary['ticket_id_map'] as $product_id => $ticket_id ) {
+                if ( 'product' !== get_post_type( (int) $product_id ) ) {
+                    continue;
+                }
+                ++$tickets_checked;
+                $t = $wpdb->get_row( $wpdb->prepare( "SELECT quantity_available, quantity_sold FROM {$this->ek_table( 'tickets' )} WHERE id = %d", (int) $ticket_id ), ARRAY_A );
+                $tec_rows = (int) $wpdb->get_var( $wpdb->prepare(
+                    "SELECT COUNT(*) FROM {$wpdb->posts} p
+                     INNER JOIN {$wpdb->postmeta} ev ON ev.post_id = p.ID AND ev.meta_key = '_tribe_wooticket_event' AND ev.meta_value = %s
+                     INNER JOIN {$wpdb->postmeta} pr ON pr.post_id = p.ID AND pr.meta_key = '_tribe_wooticket_product' AND pr.meta_value = %s
+                     WHERE p.post_type = 'tribe_wooticket' AND p.post_status = 'publish'",
+                    (string) $tec_id,
+                    (string) (int) $product_id
+                ) );
+                $ek_rows = $wpdb->get_row( $wpdb->prepare(
+                    "SELECT COUNT(*) AS n,
+                            SUM( payment_status IN ({$counted}) ) AS sold,
+                            SUM( payment_status IN ({$ever_paid}) ) AS ever_paid
+                     FROM {$this->ek_table( 'ticket_orders' )}
+                     WHERE ticket_id = %d AND order_id LIKE 'wc\\_%%'",
+                    (int) $ticket_id
+                ), ARRAY_A );
+                $n         = (int) $ek_rows['n'];
+                $sold_rows = (int) $ek_rows['sold'];
+                $sold_total += (int) ( $t['quantity_sold'] ?? 0 );
+                $rows_total += $n;
+
+                $problems = [];
+                if ( ! $t ) {
+                    $problems[] = 'ticket row missing';
+                } else {
+                    if ( (int) $t['quantity_sold'] !== $sold_rows ) {
+                        $problems[] = "quantity_sold {$t['quantity_sold']} ≠ sold rows {$sold_rows}";
+                    }
+                    $capacity = get_post_meta( (int) $product_id, '_tribe_ticket_capacity', true );
+                    if ( '' !== (string) $capacity && (int) $capacity >= 0 ) {
+                        $total_sales = max( 0, (int) get_post_meta( (int) $product_id, 'total_sales', true ) );
+                        $deducted    = min( (int) $capacity, $total_sales );
+                        $expected    = max( (int) $capacity - $total_sales, 0 ) + min( $deducted, (int) $ek_rows['ever_paid'] );
+                        if ( (int) $t['quantity_available'] !== $expected ) {
+                            $problems[] = "quantity_available {$t['quantity_available']} ≠ expected {$expected}";
+                        }
+                    }
+                }
+                if ( $n !== $tec_rows ) {
+                    $problems[] = "{$n} EventKoi row(s) for {$tec_rows} TEC attendee(s)";
+                }
+                if ( $problems && count( $out['mismatches'] ) < 100 ) {
+                    $out['mismatches'][] = [
+                        'id'     => $ek_id,
+                        'title'  => $this->plain_title( $ek_id ) . ' — ' . $this->plain_title( (int) $product_id ),
+                        'detail' => implode( '; ', $problems ),
+                    ];
+                }
+            }
+        }
+        $dup_orders = (int) $wpdb->get_var( "SELECT COUNT(*) FROM (SELECT order_id FROM {$this->ek_table( 'ticket_orders' )} GROUP BY order_id HAVING COUNT(*) > 1) x" );
+        $dup_tokens = (int) $wpdb->get_var( "SELECT COUNT(*) FROM (SELECT checkin_token FROM {$this->ek_table( 'ticket_orders' )} WHERE checkin_token IS NOT NULL AND checkin_token != '' GROUP BY checkin_token HAVING COUNT(*) > 1) x" );
+        $wc_charges = (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$this->ek_table( 'charges' )} WHERE gateway = 'woocommerce' OR charge_id LIKE 'wc\\_charge\\_%'" );
+        $status_rows = $wpdb->get_results(
+            "SELECT payment_status, COUNT(*) AS n FROM {$this->ek_table( 'ticket_orders' )} WHERE event_id IN ({$in}) GROUP BY payment_status",
+            ARRAY_A
+        );
+        $by_status = [];
+        foreach ( $status_rows as $r ) {
+            $by_status[ $r['payment_status'] ] = (int) $r['n'];
+        }
+        $out['by_status'] = $by_status;
+        $out['checks'][]  = [ 'label' => 'WooCommerce tickets checked', 'value' => $tickets_checked ];
+        $out['checks'][]  = [ 'label' => 'WC-linked attendee rows', 'value' => $rows_total ];
+        $out['checks'][]  = [ 'label' => 'Seats counted as sold', 'value' => $sold_total ];
+        $out['checks'][]  = [ 'label' => 'Linked WooCommerce orders', 'value' => (int) $wpdb->get_var(
+            "SELECT COUNT(DISTINCT SUBSTRING_INDEX(order_id, ':', 1)) FROM {$this->ek_table( 'ticket_orders' )} WHERE order_id LIKE 'wc\\_%' AND event_id IN ({$in})"
+        ) ];
+        $out['checks'][]  = [ 'label' => 'Duplicate order IDs', 'value' => $dup_orders ];
+        $out['checks'][]  = [ 'label' => 'Duplicate check-in tokens', 'value' => $dup_tokens ];
+        $out['checks'][]  = [ 'label' => 'eventkoi_charges rows for WooCommerce', 'value' => $wc_charges ];
+        $out['ok'] = empty( $out['mismatches'] ) && 0 === $dup_orders && 0 === $dup_tokens && 0 === $wc_charges;
+
+        $state                   = $this->get_wizard_state();
+        $state['verified'][ $stage ] = [ 'ok' => $out['ok'], 'at' => time() ];
+        update_option( 'ekti_wizard_state', $state, false );
+        return $out;
+    }
+
+    /**
+     * Environment checks for the wizard's first step.
+     */
+    private function preflight() {
+        $checks = [];
+        $add    = function ( $label, $status, $detail = '' ) use ( &$checks ) {
+            $checks[] = [ 'label' => $label, 'status' => $status, 'detail' => $detail ];
+        };
+        $ver = function ( $file ) {
+            $path = WP_PLUGIN_DIR . '/' . $file;
+            if ( ! file_exists( $path ) || ! function_exists( 'get_plugin_data' ) ) {
+                return '';
+            }
+            $data = get_plugin_data( $path, false, false );
+            return isset( $data['Version'] ) ? 'v' . $data['Version'] : '';
+        };
+        if ( ! function_exists( 'get_plugin_data' ) ) {
+            require_once ABSPATH . 'wp-admin/includes/plugin.php';
+        }
+
+        $ek_active = class_exists( '\\EventKoi\\Core\\Ticket_Order_Sync' );
+        $add( 'EventKoi', $ek_active ? 'ok' : 'fail', $ek_active ? $ver( 'eventkoi/eventkoi.php' ) : 'EventKoi is not active.' );
+        $tickets_on = function_exists( 'eventkoi_is_tickets_feature_enabled' ) && eventkoi_is_tickets_feature_enabled();
+        $add( 'EventKoi tickets feature', $tickets_on ? 'ok' : 'fail', $tickets_on ? 'Enabled' : 'Turn on Tickets in EventKoi settings — no ticket rows can be imported without it.' );
+        $tax_api = $this->ek_taxonomy_api_available();
+        $add( 'EventKoi Taxonomy Builder', $tax_api ? 'ok' : 'warn', $tax_api ? 'Available (Locations / Instructors can be created here)' : 'Not available — the Locations and Instructors step will be skipped.' );
+        $tec = class_exists( 'Tribe__Events__Main' );
+        $add( 'The Events Calendar', $tec ? 'ok' : 'fail', $tec ? $ver( 'the-events-calendar/the-events-calendar.php' ) : 'The Events Calendar is not active.' );
+        $et = class_exists( 'Tribe__Tickets__Main' );
+        $add( 'Event Tickets', $et ? 'ok' : 'warn', $et ? $ver( 'event-tickets/event-tickets.php' ) : 'Event Tickets is not active (ticket data is still read from the database).' );
+        $wc = $this->wc_is_available();
+        $add( 'WooCommerce', $wc ? 'ok' : 'fail', $wc ? $ver( 'woocommerce/woocommerce.php' ) : 'WooCommerce is not active — WooCommerce attendees cannot be linked to their orders.' );
+
+        $opts   = get_option( 'tribe_events_calendar_options', [] );
+        $opts   = is_array( $opts ) ? $opts : [];
+        $trash  = isset( $opts['trash-past-events'] ) ? (int) $opts['trash-past-events'] : 0;
+        $delete = isset( $opts['delete-past-events'] ) ? (int) $opts['delete-past-events'] : 0;
+        if ( $delete > 0 ) {
+            $add( 'TEC event cleaner', 'fail', "\"Permanently delete events older than\" is set to {$delete} month(s). Turn it off before importing — it hard-deletes source events." );
+        } elseif ( $trash > 0 && $trash < 24 ) {
+            $add( 'TEC event cleaner', 'warn', "\"Move to trash events older than\" is {$trash} month(s). Raise it to 24 or turn it off so old events are not lost mid-migration." );
+        } else {
+            $add( 'TEC event cleaner', 'ok', $trash ? "Trash after {$trash} months; permanent delete off" : 'Off' );
+        }
+
+        $adopt = $this->scan_native_adoption();
+        $add(
+            'Native EventKoi imports',
+            $adopt['candidate_events'] ? 'warn' : 'ok',
+            $adopt['candidate_events']
+                ? $adopt['candidate_events'] . ' natively imported event(s) carry attendee history. Run "Adopt Native Imports" under Advanced tools before importing orders.'
+                : $adopt['marked_events'] . ' EventKoi event(s) already linked to TEC'
+        );
+
+        $audit = get_option( 'ekti_event_sync_audit', [] );
+        $untagged = 0;
+        foreach ( (array) $audit as $op ) {
+            if ( empty( $op['stage'] ) ) {
+                ++$untagged;
+            }
+        }
+        $add(
+            'Previous Event Sync runs',
+            $untagged ? 'warn' : 'ok',
+            $untagged ? $untagged . ' ledger op(s) from a single-pass Event Sync exist. Those events are skipped by the wizard; "Undo Last Event Sync" under Advanced tools removes them.' : 'None'
+        );
+
+        $log_dir = dirname( EKTI_LOG_FILE );
+        $add( 'Import log', is_writable( $log_dir ) ? 'ok' : 'warn', is_writable( $log_dir ) ? EKTI_LOG_FILE : 'Upload directory is not writable — the log file will not be written.' );
+
+        $fail = count( array_filter( $checks, function ( $c ) {
+            return 'fail' === $c['status'];
+        } ) );
+        return [ 'checks' => $checks, 'ok' => 0 === $fail ];
+    }
+
+    /* Wizard state ----------------------------------------------------- */
+
+    private $wizard_steps = [ 'preflight', 'taxonomies', 'events', 'tickets', 'orders' ];
+
+    private function get_wizard_state() {
+        $state = get_option( 'ekti_wizard_state', [] );
+        $state = is_array( $state ) ? $state : [];
+        $state['approved'] = is_array( $state['approved'] ?? null ) ? $state['approved'] : [];
+        $state['verified'] = is_array( $state['verified'] ?? null ) ? $state['verified'] : [];
+        return $state;
+    }
+
+    /**
+     * Clear the approval of a step and every step after it.
+     */
+    private function wizard_unapprove_from( $step ) {
+        $state = $this->get_wizard_state();
+        $pos   = array_search( $step, $this->wizard_steps, true );
+        if ( false === $pos ) {
+            return;
+        }
+        foreach ( array_slice( $this->wizard_steps, $pos ) as $s ) {
+            unset( $state['approved'][ $s ], $state['verified'][ $s ] );
+        }
+        update_option( 'ekti_wizard_state', $state, false );
+    }
+
+    /**
+     * Live wizard summary: approvals plus each stage's progress.
+     */
+    private function wizard_summary() {
+        $state  = $this->get_wizard_state();
+        $audit  = get_option( 'ekti_event_sync_audit', [] );
+        $ledger = [ 'events' => 0, 'tickets' => 0, 'orders' => 0, 'untagged' => 0 ];
+        foreach ( (array) $audit as $op ) {
+            $s = $op['stage'] ?? '';
+            if ( isset( $ledger[ $s ] ) ) {
+                ++$ledger[ $s ];
+            } else {
+                ++$ledger['untagged'];
+            }
+        }
+        $stages = [];
+        foreach ( $this->stages as $stage ) {
+            $failures = $this->get_stage_failures( $stage );
+            $queue    = 'events' === $stage ? $this->get_tec_event_import_ids() : $this->get_stage_queue( $stage );
+            $stages[ $stage ] = [
+                'done'      => count( $this->get_stage_done( $stage ) ),
+                'remaining' => count( array_diff( $queue, array_map( 'absint', array_keys( $failures ) ) ) ),
+                'failed'    => count( $failures ),
+                'ledger'    => $ledger[ $stage ],
+            ];
+        }
+        return [
+            'approved'     => $state['approved'],
+            'verified'     => $state['verified'],
+            'stages'       => $stages,
+            'untagged_ops' => $ledger['untagged'],
+            'taxonomies'   => [
+                'locations'   => $this->get_taxonomy_setup_state( 'locations' ),
+                'instructors' => $this->get_taxonomy_setup_state( 'instructors' ),
+                'mapped'      => [
+                    'locations'   => count( $this->get_saved_taxonomy_mapping( 'locations' ) ),
+                    'instructors' => count( $this->get_saved_taxonomy_mapping( 'instructors' ) ),
+                ],
+                'provisioned' => ! empty( get_option( 'ekti_tax_provision_audit', [] ) ),
+            ],
+        ];
+    }
+
+    private function wizard_approve( $step ) {
+        $pos = array_search( $step, $this->wizard_steps, true );
+        if ( false === $pos ) {
+            return [ 'error' => 'Unknown step.' ];
+        }
+        $state = $this->get_wizard_state();
+        foreach ( array_slice( $this->wizard_steps, 0, $pos ) as $prev ) {
+            if ( empty( $state['approved'][ $prev ] ) ) {
+                return [ 'error' => 'Approve the ' . $prev . ' step first.' ];
+            }
+        }
+        if ( in_array( $step, $this->stages, true ) ) {
+            $failures  = $this->get_stage_failures( $step );
+            $queue     = 'events' === $step ? $this->get_tec_event_import_ids() : $this->get_stage_queue( $step );
+            $remaining = count( array_diff( $queue, array_map( 'absint', array_keys( $failures ) ) ) );
+            if ( $remaining > 0 ) {
+                return [ 'error' => $remaining . ' event(s) still pending in this stage — finish the run first.' ];
+            }
+        }
+        if ( 'orders' === $step && empty( $state['verified']['orders']['ok'] ) ) {
+            return [ 'error' => 'Order verification has not passed. Run the check and resolve the mismatches first.' ];
+        }
+        $state['approved'][ $step ] = time();
+        update_option( 'ekti_wizard_state', $state, false );
+        $this->log( "Import wizard: step \"{$step}\" approved." );
+        return [ 'approved' => $state['approved'] ];
     }
 
     /* ------------------------------------------------------------------
@@ -6611,6 +8100,104 @@ final class EventKoi_Tickets_Importer {
         wp_send_json_success( $result );
     }
 
+    /* Step 16 — wizard ---------------------------------------------- */
+
+    public function ajax_wizard_state() {
+        $this->check_ajax();
+        wp_send_json_success( $this->wizard_summary() );
+    }
+
+    public function ajax_wizard_approve() {
+        $this->check_ajax();
+        $step   = isset( $_POST['step'] ) ? sanitize_key( $_POST['step'] ) : '';
+        $result = $this->wizard_approve( $step );
+        if ( isset( $result['error'] ) ) {
+            wp_send_json_error( $result['error'] );
+        }
+        wp_send_json_success( $this->wizard_summary() );
+    }
+
+    public function ajax_preflight() {
+        $this->check_ajax();
+        wp_send_json_success( $this->preflight() );
+    }
+
+    public function ajax_provision_taxonomy() {
+        $this->check_ajax();
+        $type  = isset( $_POST['type'] ) ? sanitize_key( $_POST['type'] ) : '';
+        $input = isset( $_POST['config'] ) ? json_decode( wp_unslash( $_POST['config'] ), true ) : [];
+        $result = $this->provision_taxonomy( $type, is_array( $input ) ? $input : [] );
+        if ( is_wp_error( $result ) ) {
+            wp_send_json_error( $result->get_error_message() );
+        }
+        wp_send_json_success( $result );
+    }
+
+    public function ajax_undo_taxonomy_provision() {
+        $this->check_ajax();
+        $result = $this->undo_taxonomy_provision();
+        if ( isset( $result['error'] ) ) {
+            wp_send_json_error( $result['error'] );
+        }
+        $this->wizard_unapprove_from( 'taxonomies' );
+        wp_send_json_success( $result );
+    }
+
+    public function ajax_run_event_stage() {
+        $this->check_ajax();
+        $stage = isset( $_POST['stage'] ) ? sanitize_key( $_POST['stage'] ) : '';
+        if ( ! in_array( $stage, $this->stages, true ) ) {
+            wp_send_json_error( 'Invalid stage.' );
+        }
+        $state = $this->get_wizard_state();
+        $prev  = $this->wizard_steps[ array_search( $stage, $this->wizard_steps, true ) - 1 ];
+        if ( empty( $state['approved'][ $prev ] ) ) {
+            wp_send_json_error( 'Approve the ' . $prev . ' step first.' );
+        }
+        if ( ! empty( $_POST['reset'] ) && 'true' === $_POST['reset'] ) {
+            $this->reset_stage_failures( $stage );
+        }
+        if ( 'events' === $stage ) {
+            $images = ! isset( $_POST['import_images'] ) || ! in_array( $_POST['import_images'], [ '0', 'false', '' ], true );
+            wp_send_json_success( $this->run_event_sync( 20, $images, [], 'events' ) );
+        }
+        $result = $this->run_event_stage( $stage, 'orders' === $stage ? 10 : 20 );
+        if ( isset( $result['error'] ) ) {
+            wp_send_json_error( $result['error'] );
+        }
+        wp_send_json_success( $result );
+    }
+
+    public function ajax_undo_event_stage() {
+        $this->check_ajax();
+        $stage  = isset( $_POST['stage'] ) ? sanitize_key( $_POST['stage'] ) : '';
+        $result = $this->undo_event_stage( $stage );
+        if ( isset( $result['error'] ) ) {
+            wp_send_json_error( $result['error'] );
+        }
+        wp_send_json_success( $result );
+    }
+
+    public function ajax_preview_tickets() {
+        $this->check_ajax();
+        wp_send_json_success( $this->preview_ticket_stage() );
+    }
+
+    public function ajax_preview_orders() {
+        $this->check_ajax();
+        $offset = isset( $_POST['offset'] ) ? absint( $_POST['offset'] ) : 0;
+        wp_send_json_success( $this->preview_orders_stage( $offset, 40 ) );
+    }
+
+    public function ajax_verify_stage() {
+        $this->check_ajax();
+        $stage = isset( $_POST['stage'] ) ? sanitize_key( $_POST['stage'] ) : '';
+        if ( ! in_array( $stage, $this->stages, true ) ) {
+            wp_send_json_error( 'Invalid stage.' );
+        }
+        wp_send_json_success( $this->verify_stage( $stage ) );
+    }
+
     public function ajax_get_log() {
         $this->check_ajax();
         $lines = 50;
@@ -6645,334 +8232,465 @@ final class EventKoi_Tickets_Importer {
         ?>
         <div class="wrap" id="ekti-app">
             <h1>EventKoi Ticket Importer</h1>
-            <p class="description">Migrate tickets &amp; attendees from The Events Calendar to EventKoi.</p>
+            <p class="description">Migrate events, tickets and attendees from The Events Calendar to EventKoi.</p>
 
-            <!-- Stats Panel -->
-            <div class="ekti-panel" id="ekti-stats-panel">
-                <h2>Overview</h2>
-                <div class="ekti-stats-grid" id="ekti-stats-grid">
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="stat-tec-events">—</span><span class="ekti-stat-label">TEC Events with Attendees</span></div>
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="stat-tec-attendees">—</span><span class="ekti-stat-label">Total Attendees</span></div>
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="stat-ek-events">—</span><span class="ekti-stat-label">EventKoi Events</span></div>
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="stat-mapped">—</span><span class="ekti-stat-label">Mapped Events</span></div>
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="stat-unmapped">—</span><span class="ekti-stat-label">Unmapped Events</span></div>
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="stat-mapped-attendees">—</span><span class="ekti-stat-label">Attendees to Import</span></div>
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="stat-wc-orders">—</span><span class="ekti-stat-label">WC Orders to Link</span></div>
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="stat-already-imported">—</span><span class="ekti-stat-label">Already Imported</span></div>
-                </div>
-                <div id="ekti-wc-warning" style="display:none;" class="notice notice-warning"><p>WooCommerce is not active. Order linking requires WooCommerce to be installed and active.</p></div>
-                <button class="button" id="ekti-refresh-stats">Refresh Stats</button>
-            </div>
+            <!-- Import Wizard -->
+            <div class="ekti-panel ekti-wizard" id="ekti-wizard">
+                <h2>Import Wizard</h2>
+                <p>Runs the whole migration in order and stops for your review after events, tickets and order matching. Every step is audited and can be undone, latest step first.</p>
+                <ol class="ekti-stepper" id="ekti-stepper">
+                    <li data-step="preflight"><span class="ekti-step-num">1</span> Preflight</li>
+                    <li data-step="taxonomies"><span class="ekti-step-num">2</span> Locations &amp; Instructors</li>
+                    <li data-step="events"><span class="ekti-step-num">3</span> Events</li>
+                    <li data-step="tickets"><span class="ekti-step-num">4</span> Tickets</li>
+                    <li data-step="orders"><span class="ekti-step-num">5</span> Order matching</li>
+                    <li data-step="finish"><span class="ekti-step-num">6</span> Finish</li>
+                </ol>
 
-            <!-- Event Sync Panel -->
-            <div class="ekti-panel" id="ekti-event-sync-panel">
-                <h2>Event Sync (TEC &rarr; EventKoi)</h2>
-                <p>Import TEC events into EventKoi &mdash; the native importer's pipeline with the duplicate-RSVP Critical Error fixed, per-event error isolation, and a chunked resumable runner. Tickets Commerce and RSVP attendees import here; WooCommerce attendees stay with Run Migration via product bindings.</p>
-                <div class="ekti-actions">
-                    <button class="button button-primary" id="ekti-event-sync-scan">Scan Events</button>
-                    <button class="button" id="ekti-event-sync-run" disabled>Run Event Sync</button>
-                    <button class="button" id="ekti-event-sync-adopt" disabled>Adopt Native Imports</button>
-                    <button class="button button-secondary" id="ekti-event-sync-undo" style="color:#a00;">Undo Last Event Sync</button>
-                </div>
-                <div class="ekti-migration-options">
-                    <label>
-                        <input type="checkbox" id="ekti-event-sync-images" checked />
-                        <strong>Import images</strong> &mdash; reuse TEC featured images on imported events.
-                    </label>
-                    <label style="margin-left:1.5em;">
-                        TEC IDs (optional)
-                        <input type="text" id="ekti-event-sync-ids" placeholder="e.g. 52802, 52766" size="18" />
-                    </label>
-                </div>
-                <div id="ekti-event-sync-status" class="ekti-status"></div>
-                <div id="ekti-event-sync-progress-wrap" style="display:none;">
-                    <div class="ekti-progress-bar">
-                        <div class="ekti-progress-fill" id="ekti-event-sync-progress-fill" style="width:0%"></div>
-                    </div>
-                    <div class="ekti-progress-text" id="ekti-event-sync-progress-text">0%</div>
-                </div>
-                <div class="ekti-stats-grid" id="ekti-event-sync-stats" style="display:none;">
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-total">&mdash;</span><span class="ekti-stat-label">TEC Events</span></div>
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-imported">&mdash;</span><span class="ekti-stat-label">Already Imported</span></div>
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-unimported">&mdash;</span><span class="ekti-stat-label">To Import</span></div>
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-tickets">&mdash;</span><span class="ekti-stat-label">Ticket Types</span></div>
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-tc">&mdash;</span><span class="ekti-stat-label">TC Attendees</span></div>
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-rsvp">&mdash;</span><span class="ekti-stat-label">RSVP Rows</span></div>
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-woo">&mdash;</span><span class="ekti-stat-label">Woo Attendees (deferred)</span></div>
-                    <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-images">&mdash;</span><span class="ekti-stat-label">With Images</span></div>
-                </div>
-                <div id="ekti-es-review-wrap" style="display:none;">
-                    <h3>Review Items</h3>
-                    <table class="wp-list-table widefat fixed striped">
-                        <thead>
-                            <tr><th>TEC Event ID</th><th>Title</th><th>Reason</th><th>Detail</th></tr>
-                        </thead>
-                        <tbody id="ekti-es-review-tbody"></tbody>
-                    </table>
-                </div>
-                <div id="ekti-es-adoption-wrap" style="display:none;">
-                    <h3>Native Import Adoption</h3>
-                    <p class="description" id="ekti-es-adoption-text"></p>
-                </div>
-            </div>
-
-            <!-- Pre-Import Cleanup Panel -->
-            <div class="ekti-panel" id="ekti-cleanup-panel">
-                <h2>Pre-Import Cleanup</h2>
-                <p>Detect and remove stale duplicate ticket types and duplicate EventKoi events (same TEC source) before running the ticket import. All changes are audited and undoable.</p>
-                <div class="ekti-actions">
-                    <button class="button button-primary" id="ekti-cleanup-scan">Scan for Cleanup</button>
-                    <button class="button" id="ekti-cleanup-dedupe" disabled>Run Ticket Dedupe</button>
-                    <button class="button" id="ekti-cleanup-merge" disabled>Run Event Merge</button>
-                    <button class="button button-secondary" id="ekti-cleanup-undo" style="color:#a00;">Undo Last Cleanup</button>
-                </div>
-                <div id="ekti-cleanup-status" class="ekti-status"></div>
-                <div id="ekti-cleanup-progress-wrap" style="display:none;">
-                    <div class="ekti-progress-bar">
-                        <div class="ekti-progress-fill" id="ekti-cleanup-progress-fill" style="width:0%"></div>
-                    </div>
-                    <div class="ekti-progress-text" id="ekti-cleanup-progress-text">0%</div>
-                </div>
-                <div id="ekti-stale-table-wrap" style="display:none;">
-                    <h3>Stale Duplicate Tickets</h3>
-                    <table class="wp-list-table widefat fixed striped">
-                        <thead>
-                            <tr><th>Event ID</th><th>Title</th><th>Keep</th><th>Delete</th><th>TEC Price</th><th>Reason</th></tr>
-                        </thead>
-                        <tbody id="ekti-stale-tbody"></tbody>
-                    </table>
-                </div>
-                <div id="ekti-review-table-wrap" style="display:none;">
-                    <h3>Manual Review Required</h3>
-                    <table class="wp-list-table widefat fixed striped">
-                        <thead>
-                            <tr><th>Event ID</th><th>Title</th><th>Reason</th></tr>
-                        </thead>
-                        <tbody id="ekti-review-tbody"></tbody>
-                    </table>
-                </div>
-                <div id="ekti-dups-table-wrap" style="display:none;">
-                    <h3>Duplicate Event Groups</h3>
-                    <table class="wp-list-table widefat fixed striped">
-                        <thead>
-                            <tr><th>TEC Source</th><th>Role</th><th>Event ID</th><th>Status</th><th>Tickets</th><th>Attendees</th><th>Calendars</th></tr>
-                        </thead>
-                        <tbody id="ekti-dups-tbody"></tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Ticket Details Sync Panel -->
-            <div class="ekti-panel" id="ekti-sync-panel">
-                <h2>Ticket Details Sync</h2>
-                <p>Backfills ticket sale windows (on sale at event publish time, off sale 6 AM the day before the event) and quantity available (TEC capacity), and reconciles multi-product TEC events into distinct ticket types. All changes are audited and undoable.</p>
-                <div class="ekti-actions">
-                    <button class="button button-primary" id="ekti-sync-scan">Scan Ticket Details</button>
-                    <button class="button" id="ekti-sync-run" disabled>Run Sync</button>
-                    <button class="button button-secondary" id="ekti-sync-undo" style="color:#a00;">Undo Last Sync</button>
-                </div>
-                <div id="ekti-sync-status" class="ekti-status"></div>
-                <div id="ekti-sync-progress-wrap" style="display:none;">
-                    <div class="ekti-progress-bar">
-                        <div class="ekti-progress-fill" id="ekti-sync-progress-fill" style="width:0%"></div>
-                    </div>
-                    <div class="ekti-progress-text" id="ekti-sync-progress-text">0%</div>
-                </div>
-                <div id="ekti-sync-types-wrap" style="display:none;">
-                    <h3>Ticket Types to Create / Convert</h3>
-                    <table class="wp-list-table widefat fixed striped">
-                        <thead>
-                            <tr><th>Event ID</th><th>Title</th><th>Action</th><th>Name</th><th>Price</th><th>Capacity</th><th>Sale Window (site time)</th></tr>
-                        </thead>
-                        <tbody id="ekti-sync-types-tbody"></tbody>
-                    </table>
-                </div>
-                <div id="ekti-sync-updates-wrap" style="display:none;">
-                    <h3>Field Updates</h3>
-                    <table class="wp-list-table widefat fixed striped">
-                        <thead>
-                            <tr><th>Event ID</th><th>Title</th><th>Ticket</th><th>Changes</th></tr>
-                        </thead>
-                        <tbody id="ekti-sync-updates-tbody"></tbody>
-                    </table>
-                </div>
-                <div id="ekti-sync-review-wrap" style="display:none;">
-                    <h3>Manual Review Required</h3>
-                    <table class="wp-list-table widefat fixed striped">
-                        <thead>
-                            <tr><th>Event ID</th><th>Title</th><th>Reason</th></tr>
-                        </thead>
-                        <tbody id="ekti-sync-review-tbody"></tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Calendar Sync Panel -->
-            <div class="ekti-panel" id="ekti-calsync-panel">
-                <h2>Legacy: Calendar Sync (Locations)</h2>
-                <p><strong>Deprecated:</strong> EventKoi now has a dedicated Locations taxonomy. Use the new <strong>Taxonomy Sync</strong> panel below for Locations. This legacy panel remains available only to undo previous calendar assignments.</p>
-                <div class="ekti-actions">
-                    <button class="button button-primary" id="ekti-calsync-scan">Scan Locations</button>
-                    <button class="button" id="ekti-calsync-save" disabled>Save Mapping</button>
-                    <button class="button" id="ekti-calsync-run" disabled>Run Calendar Sync</button>
-                    <button class="button button-secondary" id="ekti-calsync-undo" style="color:#a00;">Undo Last Calendar Sync</button>
-                </div>
-                <div id="ekti-calsync-status" class="ekti-status"></div>
-                <div id="ekti-calsync-progress-wrap" style="display:none;">
-                    <div class="ekti-progress-bar">
-                        <div class="ekti-progress-fill" id="ekti-calsync-progress-fill" style="width:0%"></div>
-                    </div>
-                    <div class="ekti-progress-text" id="ekti-calsync-progress-text">0%</div>
-                </div>
-                <div id="ekti-calsync-table-wrap" style="display:none;">
-                    <h3>Location &rarr; Calendar Mapping</h3>
-                    <table class="wp-list-table widefat fixed striped">
-                        <thead>
-                            <tr><th>TEC Location</th><th>Source</th><th>Mapped Events</th><th>Auto-Match</th><th>EventKoi Calendar</th><th>Pending</th></tr>
-                        </thead>
-                        <tbody id="ekti-calsync-tbody"></tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Taxonomy Sync Panel -->
-            <div class="ekti-panel" id="ekti-taxonomy-panel">
-                <h2>Taxonomy Sync</h2>
-                <p>Map The Events Calendar locations and organizers to EventKoi's new <strong>Locations</strong> and <strong>Instructors</strong> taxonomies. Existing term assignments are never removed. All changes are audited and undoable.</p>
-
-                <!-- Locations -->
-                <div class="ekti-tax-section" id="ekti-tax-locations-section" style="margin-top:1.5em;">
-                    <h3>Locations</h3>
-                    <p class="description">Map TEC venues to EventKoi Locations taxonomy terms. With EventKoi's Saved Locations active, each TEC venue's address is copied onto the mapped term, and events resolve their address from the assigned term.</p>
-                    <div class="ekti-actions">
-                        <button class="button button-primary" id="ekti-tax-locations-scan">Scan Locations</button>
-                        <button class="button" id="ekti-tax-locations-save" disabled>Save Mapping</button>
-                        <button class="button" id="ekti-tax-locations-run" disabled>Run Location Sync</button>
-                        <button class="button button-secondary" id="ekti-tax-locations-undo" style="color:#a00;">Undo Last Location Sync</button>
-                        <label style="margin-left:6px;"><input type="checkbox" id="ekti-tax-locations-overwrite" /> <strong>Overwrite</strong> non-empty address fields with TEC venue data</label>
-                    </div>
-                    <div id="ekti-tax-locations-status" class="ekti-status"></div>
-                    <div id="ekti-tax-locations-designation" style="display:none;"></div>
-                    <div id="ekti-tax-locations-progress-wrap" style="display:none;">
-                        <div class="ekti-progress-bar">
-                            <div class="ekti-progress-fill" id="ekti-tax-locations-progress-fill" style="width:0%"></div>
-                        </div>
-                        <div class="ekti-progress-text" id="ekti-tax-locations-progress-text">0%</div>
-                    </div>
-                    <div id="ekti-tax-locations-table-wrap" style="display:none;">
-                        <h4>TEC Location &rarr; EventKoi Location</h4>
-                        <table class="wp-list-table widefat fixed striped">
-                            <thead>
-                                <tr><th>TEC Source</th><th>Source</th><th>Mapped Events</th><th>Auto-Match</th><th>EventKoi Location</th><th>Address Data</th><th>Pending</th></tr>
-                            </thead>
-                            <tbody id="ekti-tax-locations-tbody"></tbody>
-                        </table>
-                    </div>
-                </div>
-
-                <!-- Instructors -->
-                <div class="ekti-tax-section" id="ekti-tax-instructors-section" style="margin-top:2.5em;">
-                    <h3>Instructors</h3>
-                    <p class="description">Map TEC organizers to EventKoi Instructors taxonomy terms.</p>
-                    <div class="ekti-actions">
-                        <button class="button button-primary" id="ekti-tax-instructors-scan">Scan Instructors</button>
-                        <button class="button" id="ekti-tax-instructors-save" disabled>Save Mapping</button>
-                        <button class="button" id="ekti-tax-instructors-run" disabled>Run Instructor Sync</button>
-                        <button class="button button-secondary" id="ekti-tax-instructors-undo" style="color:#a00;">Undo Last Instructor Sync</button>
-                    </div>
-                    <div id="ekti-tax-instructors-status" class="ekti-status"></div>
-                    <div id="ekti-tax-instructors-progress-wrap" style="display:none;">
-                        <div class="ekti-progress-bar">
-                            <div class="ekti-progress-fill" id="ekti-tax-instructors-progress-fill" style="width:0%"></div>
-                        </div>
-                        <div class="ekti-progress-text" id="ekti-tax-instructors-progress-text">0%</div>
-                    </div>
-                    <div id="ekti-tax-instructors-table-wrap" style="display:none;">
-                        <h4>TEC Organizer &rarr; EventKoi Instructor</h4>
-                        <table class="wp-list-table widefat fixed striped">
-                            <thead>
-                                <tr><th>TEC Source</th><th>Source</th><th>Mapped Events</th><th>Auto-Match</th><th>EventKoi Instructor</th><th>Pending</th></tr>
-                            </thead>
-                            <tbody id="ekti-tax-instructors-tbody"></tbody>
-                        </table>
-                    </div>
-                    <div id="ekti-tax-instructors-cleanup" style="margin-top:1.5em; padding-top:1em; border-top:1px solid #c3c4c7;">
-                        <h4>Custom Field Cleanup</h4>
-                        <p class="description">After instructors are synced, remove the native-import Organizer custom field group.</p>
+                <!-- Step 1: Preflight -->
+                <section class="ekti-step" data-step="preflight">
+                    <h3 class="ekti-step-title">1. Preflight <span class="ekti-step-badge"></span></h3>
+                    <div class="ekti-step-body">
+                        <p class="description">Checks the plugins, TEC's event cleaner and any earlier imports before anything is written.</p>
                         <div class="ekti-actions">
-                            <button class="button" id="ekti-tax-instructors-scan-fields">Scan Organizer Fields</button>
-                            <button class="button button-secondary" id="ekti-tax-instructors-remove-fields" disabled style="color:#a00;">Remove Organizer Custom Fields</button>
+                            <button class="button button-primary" id="ekti-wz-preflight-run">Run Checks</button>
+                            <button class="button" id="ekti-wz-preflight-approve" disabled>Approve &amp; Continue</button>
                         </div>
-                        <div id="ekti-tax-instructors-cleanup-status" class="ekti-status"></div>
+                        <div id="ekti-wz-preflight-status" class="ekti-status"></div>
+                        <table class="wp-list-table widefat fixed striped" id="ekti-wz-preflight-table" style="display:none;">
+                            <thead><tr><th style="width:28%;">Check</th><th style="width:10%;">Result</th><th>Detail</th></tr></thead>
+                            <tbody></tbody>
+                        </table>
                     </div>
-                </div>
+                </section>
+
+                <!-- Step 2: Locations & Instructors -->
+                <section class="ekti-step" data-step="taxonomies">
+                    <h3 class="ekti-step-title">2. Locations &amp; Instructors <span class="ekti-step-badge"></span></h3>
+                    <div class="ekti-step-body">
+                        <p class="description">Set up EventKoi's Locations taxonomy as <strong>Saved Locations</strong> (and an Instructors taxonomy), then match each TEC venue and organizer to a term. Terms are created with the venue's address. The events step assigns them to every imported event. This step can be reopened at any time.</p>
+
+                        <h4>2a. Set up the taxonomies</h4>
+                        <div class="ekti-setup-cards">
+                            <div class="ekti-setup-card" id="ekti-setup-locations" data-type="locations"><p><span class="ekti-spinner"></span> Loading&hellip;</p></div>
+                            <div class="ekti-setup-card" id="ekti-setup-instructors" data-type="instructors"><p><span class="ekti-spinner"></span> Loading&hellip;</p></div>
+                        </div>
+                        <div class="ekti-actions">
+                            <button class="button button-secondary" id="ekti-wz-provision-undo" style="color:#a00;">Undo Taxonomy Setup</button>
+                        </div>
+
+                        <h4 style="margin-top:1.5em;">2b. Match TEC venues and organizers to terms</h4>
+                        <p class="description">Pick an existing term or "Create new term" for each source, then <strong>Create terms &amp; apply</strong>. Leave a source on "None" to skip it.</p>
+                            <!-- Locations -->
+                            <div class="ekti-tax-section" id="ekti-tax-locations-section" style="margin-top:1.5em;">
+                                <h3>Locations</h3>
+                                <p class="description">Map TEC venues to EventKoi Locations taxonomy terms. With EventKoi's Saved Locations active, each TEC venue's address is copied onto the mapped term, and events resolve their address from the assigned term.</p>
+                                <div class="ekti-actions">
+                                    <button class="button button-primary" id="ekti-tax-locations-scan">Scan Locations</button>
+                                    <button class="button" id="ekti-tax-locations-save" disabled>Save Mapping</button>
+                                    <button class="button" id="ekti-tax-locations-run" disabled>Create Terms &amp; Apply</button>
+                                    <button class="button button-secondary" id="ekti-tax-locations-undo" style="color:#a00;">Undo Location Matching</button>
+                                    <label style="margin-left:6px;"><input type="checkbox" id="ekti-tax-locations-overwrite" /> <strong>Overwrite</strong> non-empty address fields with TEC venue data</label>
+                                </div>
+                                <div id="ekti-tax-locations-status" class="ekti-status"></div>
+                                <div id="ekti-tax-locations-designation" style="display:none;"></div>
+                                <div id="ekti-tax-locations-progress-wrap" style="display:none;">
+                                    <div class="ekti-progress-bar">
+                                        <div class="ekti-progress-fill" id="ekti-tax-locations-progress-fill" style="width:0%"></div>
+                                    </div>
+                                    <div class="ekti-progress-text" id="ekti-tax-locations-progress-text">0%</div>
+                                </div>
+                                <div id="ekti-tax-locations-table-wrap" style="display:none;">
+                                    <h4>TEC Location &rarr; EventKoi Location</h4>
+                                    <table class="wp-list-table widefat fixed striped">
+                                        <thead>
+                                            <tr><th>TEC Source</th><th>Source</th><th>Mapped Events</th><th>Auto-Match</th><th>EventKoi Location</th><th>Address Data</th><th>Pending</th></tr>
+                                        </thead>
+                                        <tbody id="ekti-tax-locations-tbody"></tbody>
+                                    </table>
+                                </div>
+                            </div>
+                            <!-- Instructors -->
+                            <div class="ekti-tax-section" id="ekti-tax-instructors-section" style="margin-top:2.5em;">
+                                <h3>Instructors</h3>
+                                <p class="description">Map TEC organizers to EventKoi Instructors taxonomy terms.</p>
+                                <div class="ekti-actions">
+                                    <button class="button button-primary" id="ekti-tax-instructors-scan">Scan Instructors</button>
+                                    <button class="button" id="ekti-tax-instructors-save" disabled>Save Mapping</button>
+                                    <button class="button" id="ekti-tax-instructors-run" disabled>Create Terms &amp; Apply</button>
+                                    <button class="button button-secondary" id="ekti-tax-instructors-undo" style="color:#a00;">Undo Instructor Matching</button>
+                                </div>
+                                <div id="ekti-tax-instructors-status" class="ekti-status"></div>
+                                <div id="ekti-tax-instructors-progress-wrap" style="display:none;">
+                                    <div class="ekti-progress-bar">
+                                        <div class="ekti-progress-fill" id="ekti-tax-instructors-progress-fill" style="width:0%"></div>
+                                    </div>
+                                    <div class="ekti-progress-text" id="ekti-tax-instructors-progress-text">0%</div>
+                                </div>
+                                <div id="ekti-tax-instructors-table-wrap" style="display:none;">
+                                    <h4>TEC Organizer &rarr; EventKoi Instructor</h4>
+                                    <table class="wp-list-table widefat fixed striped">
+                                        <thead>
+                                            <tr><th>TEC Source</th><th>Source</th><th>Mapped Events</th><th>Auto-Match</th><th>EventKoi Instructor</th><th>Pending</th></tr>
+                                        </thead>
+                                        <tbody id="ekti-tax-instructors-tbody"></tbody>
+                                    </table>
+                                </div>
+                                <div id="ekti-tax-instructors-cleanup" style="margin-top:1.5em; padding-top:1em; border-top:1px solid #c3c4c7;">
+                                    <h4>Custom Field Cleanup</h4>
+                                    <p class="description">After instructors are synced, remove the native-import Organizer custom field group.</p>
+                                    <div class="ekti-actions">
+                                        <button class="button" id="ekti-tax-instructors-scan-fields">Scan Organizer Fields</button>
+                                        <button class="button button-secondary" id="ekti-tax-instructors-remove-fields" disabled style="color:#a00;">Remove Organizer Custom Fields</button>
+                                    </div>
+                                    <div id="ekti-tax-instructors-cleanup-status" class="ekti-status"></div>
+                                </div>
+                            </div>
+                        <div class="ekti-actions" style="margin-top:1.5em;">
+                            <button class="button button-primary" id="ekti-wz-taxonomies-approve">Approve &amp; Continue</button>
+                        </div>
+                        <div id="ekti-wz-taxonomies-status" class="ekti-status"></div>
+                    </div>
+                </section>
+
+                <!-- Step 3: Events -->
+                <section class="ekti-step" data-step="events">
+                    <h3 class="ekti-step-title">3. Events <span class="ekti-step-badge"></span></h3>
+                    <div class="ekti-step-body">
+                        <p class="description">Imports TEC events into EventKoi (dates, venues, categories, images, Locations and Instructors terms). Tickets and attendees come in the next two steps.</p>
+                        <div class="ekti-actions">
+                            <button class="button" id="ekti-wz-events-preview">Preview</button>
+                            <button class="button button-primary" id="ekti-wz-events-run" disabled>Import Events</button>
+                            <label style="margin-left:6px;"><input type="checkbox" id="ekti-wz-events-images" checked /> Import images</label>
+                        </div>
+                        <div id="ekti-wz-events-status" class="ekti-status"></div>
+                        <div class="ekti-wz-progress" id="ekti-wz-events-progress" style="display:none;"><div class="ekti-progress-bar"><div class="ekti-progress-fill" style="width:0%"></div></div><div class="ekti-progress-text">0%</div></div>
+                        <div class="ekti-wz-preview" id="ekti-wz-events-preview-out"></div>
+                        <div class="ekti-wz-verify" id="ekti-wz-events-verify"></div>
+                        <div class="ekti-actions ekti-review-actions">
+                            <button class="button" id="ekti-wz-events-check">Check Results</button>
+                            <button class="button button-primary" id="ekti-wz-events-approve" disabled>Approve Events</button>
+                            <button class="button button-secondary" id="ekti-wz-events-undo" style="color:#a00;">Undo Events</button>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Step 4: Tickets -->
+                <section class="ekti-step" data-step="tickets">
+                    <h3 class="ekti-step-title">4. Tickets <span class="ekti-step-badge"></span></h3>
+                    <div class="ekti-step-body">
+                        <p class="description">Creates EventKoi ticket types from TEC tickets (price, capacity, sale window), RSVP and shared capacity, and WooCommerce product links. Seats already sold in TEC are held back until their attendees are imported in the next step.</p>
+                        <div class="ekti-actions">
+                            <button class="button" id="ekti-wz-tickets-preview">Preview</button>
+                            <button class="button button-primary" id="ekti-wz-tickets-run" disabled>Import Tickets</button>
+                        </div>
+                        <div id="ekti-wz-tickets-status" class="ekti-status"></div>
+                        <div class="ekti-wz-progress" id="ekti-wz-tickets-progress" style="display:none;"><div class="ekti-progress-bar"><div class="ekti-progress-fill" style="width:0%"></div></div><div class="ekti-progress-text">0%</div></div>
+                        <div class="ekti-wz-preview" id="ekti-wz-tickets-preview-out"></div>
+                        <div class="ekti-wz-verify" id="ekti-wz-tickets-verify"></div>
+                        <div class="ekti-actions ekti-review-actions">
+                            <button class="button" id="ekti-wz-tickets-check">Check Results</button>
+                            <button class="button button-primary" id="ekti-wz-tickets-approve" disabled>Approve Tickets</button>
+                            <button class="button button-secondary" id="ekti-wz-tickets-undo" style="color:#a00;">Undo Tickets</button>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Step 5: Order matching -->
+                <section class="ekti-step" data-step="orders">
+                    <h3 class="ekti-step-title">5. Order matching <span class="ekti-step-badge"></span></h3>
+                    <div class="ekti-step-body">
+                        <p class="description">Links every TEC attendee to its WooCommerce order with the order's real status (refunded and failed seats are kept but not counted as sold), imports RSVP and Tickets Commerce attendees, then releases the held seats. Customers are not emailed.</p>
+                        <div class="ekti-actions">
+                            <button class="button" id="ekti-wz-orders-preview">Preview</button>
+                            <button class="button button-primary" id="ekti-wz-orders-run" disabled>Link Orders &amp; Attendees</button>
+                        </div>
+                        <div id="ekti-wz-orders-status" class="ekti-status"></div>
+                        <div class="ekti-wz-progress" id="ekti-wz-orders-progress" style="display:none;"><div class="ekti-progress-bar"><div class="ekti-progress-fill" style="width:0%"></div></div><div class="ekti-progress-text">0%</div></div>
+                        <div class="ekti-wz-preview" id="ekti-wz-orders-preview-out"></div>
+                        <div class="ekti-wz-verify" id="ekti-wz-orders-verify"></div>
+                        <div class="ekti-actions ekti-review-actions">
+                            <button class="button" id="ekti-wz-orders-check">Check Results</button>
+                            <button class="button button-primary" id="ekti-wz-orders-approve" disabled>Approve Orders</button>
+                            <button class="button button-secondary" id="ekti-wz-orders-undo" style="color:#a00;">Undo Orders</button>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Step 6: Finish -->
+                <section class="ekti-step" data-step="finish">
+                    <h3 class="ekti-step-title">6. Finish <span class="ekti-step-badge"></span></h3>
+                    <div class="ekti-step-body">
+                        <div id="ekti-wz-finish-summary"></div>
+                        <p class="description">Optional: remove the Organizer custom field left by EventKoi's native importer (Step 2 &rarr; Instructors &rarr; Custom Field Cleanup). The full run is recorded in the import log under Advanced tools.</p>
+                        <div class="ekti-actions">
+                            <button class="button button-secondary" id="ekti-wz-undo-all" style="color:#a00;">Undo Entire Import</button>
+                        </div>
+                        <div id="ekti-wz-finish-status" class="ekti-status"></div>
+                    </div>
+                </section>
             </div>
 
-            <!-- Event Mapping Panel -->
-            <div class="ekti-panel" id="ekti-mapping-panel">
-                <h2>Event Mapping</h2>
-                <p>Match TEC events to EventKoi events. Only mapped events will have their attendees imported.</p>
-                <div class="ekti-actions">
-                    <button class="button button-primary" id="ekti-auto-match">Auto-Match by Title</button>
-                    <button class="button" id="ekti-load-mapping">Load Mapping Table</button>
-                    <button class="button button-secondary" id="ekti-save-mapping">Save Mapping</button>
-                </div>
-                <div id="ekti-mapping-status" class="ekti-status"></div>
-                <div id="ekti-mapping-table-wrap" style="display:none;">
-                    <table class="wp-list-table widefat fixed striped" id="ekti-mapping-table">
-                        <thead>
-                            <tr>
-                                <th>TEC Event ID</th>
-                                <th>TEC Event Title</th>
-                                <th>Attendees</th>
-                                <th>EventKoi Event</th>
-                            </tr>
-                        </thead>
-                        <tbody id="ekti-mapping-tbody"></tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Migration Panel -->
-            <div class="ekti-panel" id="ekti-migration-panel">
-                <h2>Run Migration</h2>
-                <div class="ekti-migration-options">
-                    <label>
-                        <input type="checkbox" id="ekti-dry-run" checked />
-                        <strong>Dry Run Mode</strong> — Preview changes without writing to the database.
-                    </label>
-                </div>
-                <div class="ekti-actions">
-                    <button class="button button-primary" id="ekti-start-migration">Start Import</button>
-                    <button class="button" id="ekti-resume-migration">Resume</button>
-                    <button class="button button-secondary" id="ekti-rollback" style="color:#a00;">Rollback / Cleanup</button>
-                </div>
-                <div id="ekti-migration-status" class="ekti-status"></div>
-
-                <!-- Progress -->
-                <div id="ekti-progress-wrap" style="display:none;">
-                    <div class="ekti-progress-bar">
-                        <div class="ekti-progress-fill" id="ekti-progress-fill" style="width:0%"></div>
-                    </div>
-                    <div class="ekti-progress-text" id="ekti-progress-text">0%</div>
-                </div>
-
-                <!-- Console -->
+            <!-- Activity Panel -->
+            <div class="ekti-panel" id="ekti-activity-panel">
+                <h2>Activity</h2>
                 <div id="ekti-console-wrap">
-                    <h3>Console Log</h3>
                     <div id="ekti-console" class="ekti-console"></div>
                 </div>
             </div>
 
-            <!-- Log File Panel -->
-            <div class="ekti-panel" id="ekti-log-panel">
-                <h2>Import Log File</h2>
-                <div class="ekti-actions">
-                    <button class="button" id="ekti-load-log">Load Log</button>
-                    <button class="button" id="ekti-clear-log">Clear Log</button>
+            <details class="ekti-advanced" id="ekti-advanced">
+                <summary>Advanced tools</summary>
+                <p class="description">Manual and repair tools: single-pass Event Sync, mapping existing EventKoi events, the attendee-only migration for events Event Sync did not create, pre-import cleanup and the import log. The wizard above does not need them.</p>
+
+                <!-- Stats Panel -->
+                <div class="ekti-panel" id="ekti-stats-panel">
+                    <h2>Run Migration Overview</h2>
+                    <div class="ekti-stats-grid" id="ekti-stats-grid">
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="stat-tec-events">—</span><span class="ekti-stat-label">TEC Events with Attendees</span></div>
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="stat-tec-attendees">—</span><span class="ekti-stat-label">Total Attendees</span></div>
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="stat-ek-events">—</span><span class="ekti-stat-label">EventKoi Events</span></div>
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="stat-mapped">—</span><span class="ekti-stat-label">Mapped Events</span></div>
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="stat-unmapped">—</span><span class="ekti-stat-label">Unmapped Events</span></div>
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="stat-mapped-attendees">—</span><span class="ekti-stat-label">Attendees to Import</span></div>
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="stat-wc-orders">—</span><span class="ekti-stat-label">WC Orders to Link</span></div>
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="stat-already-imported">—</span><span class="ekti-stat-label">Already Imported</span></div>
+                    </div>
+                    <div id="ekti-wc-warning" style="display:none;" class="notice notice-warning"><p>WooCommerce is not active. Order linking requires WooCommerce to be installed and active.</p></div>
+                    <button class="button" id="ekti-refresh-stats">Refresh Stats</button>
                 </div>
-                <pre id="ekti-log-content" class="ekti-log-content"></pre>
-            </div>
+
+                <!-- Event Sync Panel -->
+                <div class="ekti-panel" id="ekti-event-sync-panel">
+                    <h2>Event Sync &mdash; single pass (manual)</h2>
+                    <p>Imports TEC events, their tickets and all attendees (RSVP, Tickets Commerce, and WooCommerce attendees linked to their orders) in one pass per event, with no review stops. The Import Wizard runs the same pipeline in stages. Use this for targeted re-imports by TEC ID.</p>
+                    <div class="ekti-actions">
+                        <button class="button button-primary" id="ekti-event-sync-scan">Scan Events</button>
+                        <button class="button" id="ekti-event-sync-run" disabled>Run Event Sync</button>
+                        <button class="button" id="ekti-event-sync-adopt" disabled>Adopt Native Imports</button>
+                        <button class="button button-secondary" id="ekti-event-sync-undo" style="color:#a00;">Undo Last Event Sync</button>
+                    </div>
+                    <div class="ekti-migration-options">
+                        <label>
+                            <input type="checkbox" id="ekti-event-sync-images" checked />
+                            <strong>Import images</strong> &mdash; reuse TEC featured images on imported events.
+                        </label>
+                        <label style="margin-left:1.5em;">
+                            TEC IDs (optional)
+                            <input type="text" id="ekti-event-sync-ids" placeholder="e.g. 52802, 52766" size="18" />
+                        </label>
+                    </div>
+                    <div id="ekti-event-sync-status" class="ekti-status"></div>
+                    <div id="ekti-event-sync-progress-wrap" style="display:none;">
+                        <div class="ekti-progress-bar">
+                            <div class="ekti-progress-fill" id="ekti-event-sync-progress-fill" style="width:0%"></div>
+                        </div>
+                        <div class="ekti-progress-text" id="ekti-event-sync-progress-text">0%</div>
+                    </div>
+                    <div class="ekti-stats-grid" id="ekti-event-sync-stats" style="display:none;">
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-total">&mdash;</span><span class="ekti-stat-label">TEC Events</span></div>
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-imported">&mdash;</span><span class="ekti-stat-label">Already Imported</span></div>
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-unimported">&mdash;</span><span class="ekti-stat-label">To Import</span></div>
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-tickets">&mdash;</span><span class="ekti-stat-label">Ticket Types</span></div>
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-tc">&mdash;</span><span class="ekti-stat-label">TC Attendees</span></div>
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-rsvp">&mdash;</span><span class="ekti-stat-label">RSVP Rows</span></div>
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-woo">&mdash;</span><span class="ekti-stat-label">Woo Attendees</span></div>
+                        <div class="ekti-stat"><span class="ekti-stat-value" id="ekti-es-images">&mdash;</span><span class="ekti-stat-label">With Images</span></div>
+                    </div>
+                    <div id="ekti-es-review-wrap" style="display:none;">
+                        <h3>Review Items</h3>
+                        <table class="wp-list-table widefat fixed striped">
+                            <thead>
+                                <tr><th>TEC Event ID</th><th>Title</th><th>Reason</th><th>Detail</th></tr>
+                            </thead>
+                            <tbody id="ekti-es-review-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div id="ekti-es-adoption-wrap" style="display:none;">
+                        <h3>Native Import Adoption</h3>
+                        <p class="description" id="ekti-es-adoption-text"></p>
+                    </div>
+                </div>
+
+                <!-- Event Mapping Panel -->
+                <div class="ekti-panel" id="ekti-mapping-panel">
+                    <h2>Event Mapping</h2>
+                    <p>Match TEC events to EventKoi events. Only mapped events will have their attendees imported.</p>
+                    <div class="ekti-actions">
+                        <button class="button button-primary" id="ekti-auto-match">Auto-Match by Title</button>
+                        <button class="button" id="ekti-load-mapping">Load Mapping Table</button>
+                        <button class="button button-secondary" id="ekti-save-mapping">Save Mapping</button>
+                    </div>
+                    <div id="ekti-mapping-status" class="ekti-status"></div>
+                    <div id="ekti-mapping-table-wrap" style="display:none;">
+                        <table class="wp-list-table widefat fixed striped" id="ekti-mapping-table">
+                            <thead>
+                                <tr>
+                                    <th>TEC Event ID</th>
+                                    <th>TEC Event Title</th>
+                                    <th>Attendees</th>
+                                    <th>EventKoi Event</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ekti-mapping-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Migration Panel -->
+                <div class="ekti-panel" id="ekti-migration-panel">
+                    <h2>Run Migration</h2>
+                    <div class="ekti-migration-options">
+                        <label>
+                            <input type="checkbox" id="ekti-dry-run" checked />
+                            <strong>Dry Run Mode</strong> — Preview changes without writing to the database.
+                        </label>
+                    </div>
+                    <div class="ekti-actions">
+                        <button class="button button-primary" id="ekti-start-migration">Start Import</button>
+                        <button class="button" id="ekti-resume-migration">Resume</button>
+                        <button class="button button-secondary" id="ekti-rollback" style="color:#a00;">Rollback / Cleanup</button>
+                    </div>
+                    <div id="ekti-migration-status" class="ekti-status"></div>
+
+                    <!-- Progress -->
+                    <div id="ekti-progress-wrap" style="display:none;">
+                        <div class="ekti-progress-bar">
+                            <div class="ekti-progress-fill" id="ekti-progress-fill" style="width:0%"></div>
+                        </div>
+                        <div class="ekti-progress-text" id="ekti-progress-text">0%</div>
+                    </div>
+                </div>
+
+                <!-- Pre-Import Cleanup Panel -->
+                <div class="ekti-panel" id="ekti-cleanup-panel">
+                    <h2>Pre-Import Cleanup</h2>
+                    <p>Detect and remove stale duplicate ticket types and duplicate EventKoi events (same TEC source) before running the ticket import. All changes are audited and undoable.</p>
+                    <div class="ekti-actions">
+                        <button class="button button-primary" id="ekti-cleanup-scan">Scan for Cleanup</button>
+                        <button class="button" id="ekti-cleanup-dedupe" disabled>Run Ticket Dedupe</button>
+                        <button class="button" id="ekti-cleanup-merge" disabled>Run Event Merge</button>
+                        <button class="button button-secondary" id="ekti-cleanup-undo" style="color:#a00;">Undo Last Cleanup</button>
+                    </div>
+                    <div id="ekti-cleanup-status" class="ekti-status"></div>
+                    <div id="ekti-cleanup-progress-wrap" style="display:none;">
+                        <div class="ekti-progress-bar">
+                            <div class="ekti-progress-fill" id="ekti-cleanup-progress-fill" style="width:0%"></div>
+                        </div>
+                        <div class="ekti-progress-text" id="ekti-cleanup-progress-text">0%</div>
+                    </div>
+                    <div id="ekti-stale-table-wrap" style="display:none;">
+                        <h3>Stale Duplicate Tickets</h3>
+                        <table class="wp-list-table widefat fixed striped">
+                            <thead>
+                                <tr><th>Event ID</th><th>Title</th><th>Keep</th><th>Delete</th><th>TEC Price</th><th>Reason</th></tr>
+                            </thead>
+                            <tbody id="ekti-stale-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div id="ekti-review-table-wrap" style="display:none;">
+                        <h3>Manual Review Required</h3>
+                        <table class="wp-list-table widefat fixed striped">
+                            <thead>
+                                <tr><th>Event ID</th><th>Title</th><th>Reason</th></tr>
+                            </thead>
+                            <tbody id="ekti-review-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div id="ekti-dups-table-wrap" style="display:none;">
+                        <h3>Duplicate Event Groups</h3>
+                        <table class="wp-list-table widefat fixed striped">
+                            <thead>
+                                <tr><th>TEC Source</th><th>Role</th><th>Event ID</th><th>Status</th><th>Tickets</th><th>Attendees</th><th>Calendars</th></tr>
+                            </thead>
+                            <tbody id="ekti-dups-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Ticket Details Sync Panel -->
+                <div class="ekti-panel" id="ekti-sync-panel">
+                    <h2>Ticket Details Sync</h2>
+                    <p>Backfills ticket sale windows (on sale at event publish time, off sale 6 AM the day before the event) and quantity available (TEC capacity), and reconciles multi-product TEC events into distinct ticket types. All changes are audited and undoable.</p>
+                    <div class="ekti-actions">
+                        <button class="button button-primary" id="ekti-sync-scan">Scan Ticket Details</button>
+                        <button class="button" id="ekti-sync-run" disabled>Run Sync</button>
+                        <button class="button button-secondary" id="ekti-sync-undo" style="color:#a00;">Undo Last Sync</button>
+                    </div>
+                    <div id="ekti-sync-status" class="ekti-status"></div>
+                    <div id="ekti-sync-progress-wrap" style="display:none;">
+                        <div class="ekti-progress-bar">
+                            <div class="ekti-progress-fill" id="ekti-sync-progress-fill" style="width:0%"></div>
+                        </div>
+                        <div class="ekti-progress-text" id="ekti-sync-progress-text">0%</div>
+                    </div>
+                    <div id="ekti-sync-types-wrap" style="display:none;">
+                        <h3>Ticket Types to Create / Convert</h3>
+                        <table class="wp-list-table widefat fixed striped">
+                            <thead>
+                                <tr><th>Event ID</th><th>Title</th><th>Action</th><th>Name</th><th>Price</th><th>Capacity</th><th>Sale Window (site time)</th></tr>
+                            </thead>
+                            <tbody id="ekti-sync-types-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div id="ekti-sync-updates-wrap" style="display:none;">
+                        <h3>Field Updates</h3>
+                        <table class="wp-list-table widefat fixed striped">
+                            <thead>
+                                <tr><th>Event ID</th><th>Title</th><th>Ticket</th><th>Changes</th></tr>
+                            </thead>
+                            <tbody id="ekti-sync-updates-tbody"></tbody>
+                        </table>
+                    </div>
+                    <div id="ekti-sync-review-wrap" style="display:none;">
+                        <h3>Manual Review Required</h3>
+                        <table class="wp-list-table widefat fixed striped">
+                            <thead>
+                                <tr><th>Event ID</th><th>Title</th><th>Reason</th></tr>
+                            </thead>
+                            <tbody id="ekti-sync-review-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Calendar Sync Panel -->
+                <div class="ekti-panel" id="ekti-calsync-panel">
+                    <h2>Legacy: Calendar Sync (Locations)</h2>
+                    <p><strong>Deprecated:</strong> EventKoi now has a dedicated Locations taxonomy. Use the new <strong>Taxonomy Sync</strong> panel below for Locations. This legacy panel remains available only to undo previous calendar assignments.</p>
+                    <div class="ekti-actions">
+                        <button class="button button-primary" id="ekti-calsync-scan">Scan Locations</button>
+                        <button class="button" id="ekti-calsync-save" disabled>Save Mapping</button>
+                        <button class="button" id="ekti-calsync-run" disabled>Run Calendar Sync</button>
+                        <button class="button button-secondary" id="ekti-calsync-undo" style="color:#a00;">Undo Last Calendar Sync</button>
+                    </div>
+                    <div id="ekti-calsync-status" class="ekti-status"></div>
+                    <div id="ekti-calsync-progress-wrap" style="display:none;">
+                        <div class="ekti-progress-bar">
+                            <div class="ekti-progress-fill" id="ekti-calsync-progress-fill" style="width:0%"></div>
+                        </div>
+                        <div class="ekti-progress-text" id="ekti-calsync-progress-text">0%</div>
+                    </div>
+                    <div id="ekti-calsync-table-wrap" style="display:none;">
+                        <h3>Location &rarr; Calendar Mapping</h3>
+                        <table class="wp-list-table widefat fixed striped">
+                            <thead>
+                                <tr><th>TEC Location</th><th>Source</th><th>Mapped Events</th><th>Auto-Match</th><th>EventKoi Calendar</th><th>Pending</th></tr>
+                            </thead>
+                            <tbody id="ekti-calsync-tbody"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Log File Panel -->
+                <div class="ekti-panel" id="ekti-log-panel">
+                    <h2>Import Log File</h2>
+                    <div class="ekti-actions">
+                        <button class="button" id="ekti-load-log">Load Log</button>
+                        <button class="button" id="ekti-clear-log">Clear Log</button>
+                    </div>
+                    <pre id="ekti-log-content" class="ekti-log-content"></pre>
+                </div>
+            </details>
         </div>
         <?php
     }

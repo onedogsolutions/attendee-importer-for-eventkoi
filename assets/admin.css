@@ -184,3 +184,188 @@
 @keyframes ekti-spin {
     to { transform: rotate(360deg); }
 }
+
+/* ------------------------------------------------------------------ */
+/* Import Wizard (v1.9.0)                                              */
+/* ------------------------------------------------------------------ */
+
+.ekti-stepper {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    list-style: none;
+    margin: 12px 0 18px;
+    padding: 0;
+}
+
+.ekti-stepper li {
+    margin: 0;
+    padding: 6px 12px 6px 6px;
+    border: 1px solid #dcdcde;
+    border-radius: 999px;
+    background: #f6f7f7;
+    color: #646970;
+    font-size: 12px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.ekti-step-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: #dcdcde;
+    color: #1d2327;
+    font-weight: 600;
+    font-size: 11px;
+}
+
+.ekti-stepper li.is-approved { color: #1d2327; border-color: #68de7c; background: #edfaef; }
+.ekti-stepper li.is-approved .ekti-step-num { background: #00a32a; color: #fff; }
+.ekti-stepper li.is-active { color: #1d2327; border-color: #2271b1; background: #f0f6fc; font-weight: 600; }
+.ekti-stepper li.is-active .ekti-step-num { background: #2271b1; color: #fff; }
+.ekti-stepper li.is-locked { opacity: .6; cursor: default; }
+
+.ekti-step {
+    border: 1px solid #e0e0e0;
+    border-radius: 6px;
+    margin: 10px 0;
+    background: #fff;
+}
+
+.ekti-step-title {
+    margin: 0;
+    padding: 12px 16px;
+    font-size: 14px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.ekti-step-body {
+    padding: 0 16px 16px;
+    display: none;
+}
+
+.ekti-step.is-open .ekti-step-body { display: block; }
+.ekti-step.is-open .ekti-step-title { border-bottom: 1px solid #eee; margin-bottom: 8px; }
+.ekti-step.is-locked .ekti-step-title { color: #8c8f94; cursor: default; }
+
+.ekti-step-badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: #f0f0f1;
+    color: #646970;
+}
+
+.ekti-step-badge.is-approved { background: #edfaef; color: #00701f; }
+.ekti-step-badge.is-active { background: #f0f6fc; color: #135e96; }
+.ekti-step-badge.is-warning { background: #fcf9e8; color: #8a6d00; }
+
+.ekti-setup-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
+    gap: 14px;
+    margin: 10px 0;
+}
+
+.ekti-setup-card {
+    border: 1px solid #dcdcde;
+    border-radius: 6px;
+    padding: 12px 14px;
+    background: #fcfcfc;
+}
+
+.ekti-setup-card h5 {
+    margin: 0 0 6px;
+    font-size: 13px;
+}
+
+.ekti-setup-card .ekti-slot-grid {
+    display: grid;
+    grid-template-columns: 110px 1fr;
+    gap: 4px 8px;
+    align-items: center;
+    margin: 8px 0;
+    font-size: 12px;
+}
+
+.ekti-setup-card input[type="text"],
+.ekti-setup-card select {
+    max-width: 100%;
+}
+
+.ekti-wz-progress { margin: 8px 0; }
+
+.ekti-wz-preview,
+.ekti-wz-verify { margin: 10px 0; }
+
+.ekti-wz-preview table,
+.ekti-wz-verify table { margin-top: 6px; }
+
+.ekti-wz-scroll {
+    max-height: 360px;
+    overflow: auto;
+    border: 1px solid #e0e0e0;
+}
+
+.ekti-review-actions {
+    border-top: 1px dashed #dcdcde;
+    padding-top: 12px;
+}
+
+.ekti-pill { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; background: #f0f0f1; margin: 1px 2px; }
+.ekti-pill.ok { background: #edfaef; color: #00701f; }
+.ekti-pill.warn { background: #fcf9e8; color: #8a6d00; }
+.ekti-pill.fail { background: #fcf0f1; color: #b32d2e; }
+
+.ekti-advanced {
+    margin: 20px 0;
+}
+
+.ekti-advanced > summary {
+    cursor: pointer;
+    font-size: 15px;
+    font-weight: 600;
+    padding: 10px 0;
+}
+
+@media (max-width: 600px) {
+    .ekti-panel { padding: 14px 16px; }
+    .ekti-setup-cards { grid-template-columns: 1fr; }
+}
+
+/* Narrow screens: let wizard tables and setup rows reflow. */
+#ekti-wizard .ekti-field-row input { min-width: 0; flex: 1 1 0; }
+#ekti-wizard .ekti-setup-card { min-width: 0; overflow-wrap: anywhere; }
+#ekti-wizard .ekti-setup-card input[type="text"] { max-width: 100%; box-sizing: border-box; }
+@media (max-width: 782px) {
+    #ekti-wz-preflight-table { table-layout: auto; }
+    #ekti-wz-preflight-table th { width: auto !important; }
+    .ekti-setup-card .ekti-slot-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 782px) {
+    #ekti-wizard table { table-layout: auto; }
+    #ekti-wizard th, #ekti-wizard td { width: auto !important; }
+}
+#ekti-wizard .ekti-setup-card select,
+#ekti-wizard .ekti-slot-grid select { max-width: 100%; min-width: 0; }
+#ekti-wizard .ekti-slot-grid { grid-template-columns: minmax(0, 110px) minmax(0, 1fr); }
+#ekti-wizard .ekti-tax-section { min-width: 0; overflow-wrap: anywhere; }
+#ekti-wizard .ekti-tax-section [id$="-table-wrap"] { overflow-x: auto; }
+#ekti-wizard .ekti-mode-create label { display: inline-block; margin: 2px 0; }
+#ekti-wizard .ekti-actions .button { white-space: normal; max-width: 100%; height: auto; }
+#ekti-wizard .ekti-actions label { white-space: normal; }
+#ekti-wizard .ekti-slot-grid select { width: 100%; }
+@media (max-width: 782px) {
+    #ekti-wizard .ekti-setup-card .ekti-slot-grid { grid-template-columns: 1fr; gap: 2px 0; }
+    #ekti-wizard .ekti-slot-grid label { margin-top: 6px; }
+}
