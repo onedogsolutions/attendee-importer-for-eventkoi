@@ -69,20 +69,7 @@
     margin: 6px 0;
 }
 
-/* Migration options */
-.ekti-migration-options {
-    margin: 10px 0 14px;
-    padding: 10px 14px;
-    background: #f0f6fc;
-    border: 1px solid #c3d9ed;
-    border-radius: 4px;
-}
-
 /* Progress bar */
-#ekti-progress-wrap {
-    margin: 16px 0;
-}
-
 .ekti-progress-bar {
     height: 22px;
     background: #e0e0e0;
@@ -146,26 +133,6 @@
     white-space: pre-wrap;
     word-break: break-all;
     border-radius: 4px;
-}
-
-/* Mapping table */
-#ekti-mapping-table-wrap {
-    margin-top: 14px;
-    max-height: 500px;
-    overflow-y: auto;
-}
-
-#ekti-mapping-table {
-    font-size: 13px;
-}
-
-#ekti-mapping-table th {
-    white-space: nowrap;
-}
-
-#ekti-mapping-table select {
-    width: 100%;
-    max-width: 300px;
 }
 
 /* Spinner helper */

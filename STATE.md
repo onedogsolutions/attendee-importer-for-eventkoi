@@ -7,9 +7,13 @@ condensed version of each build step so progress and plan travel together in one
 top-level document.
 
 - **Branch:** `main`
-- **Plugin version:** 1.11.0
+- **Plugin version:** 1.11.1
 - **Last updated:** 2026-10-19
-- **Overall status:** ✅ **v1.11.0 EventKoi setup shipped and QA-passed on
+- **Overall status:** 🟡 **v1.11.1 legacy Advanced tools removed
+  (2026-10-19), not yet deployed or QA'd on ott-dev.** Run Migration,
+  Event Mapping, Pre-Import Cleanup, Ticket Details Sync, legacy Calendar
+  Sync and the single-pass Event Sync runner are gone; the wizard is the
+  only import path. See Step 19. Before that: ✅ **v1.11.0 EventKoi setup shipped and QA-passed on
   ott-dev (2026-10-19).** Preflight now detects TEC's WooCommerce ticket
   sales and sets EventKoi's ticket checkout method to WooCommerce, and it
   saves the calendar defaults from EventKoi's onboarding wizard (without
@@ -42,7 +46,7 @@ top-level document.
   React, no `@wordpress/scripts` — this is a lightweight migration utility,
   not a settings-heavy plugin. Admin page registered under Tools.
 - **Persistence:** `ekti_event_mapping` (option, TEC event ID → EventKoi event
-  ID), `ekti_migration_state` (option, batch progress), per-attendee
+  ID), `ekti_event_sync_audit` (undo ledger, wizard ops tagged by stage), per-attendee
   `_eventkoi_imported_from_tec` post meta, per-ticket-type
   `_ekti_tec_product_{tec_event_id}_{product_id}` options.
 - **Logging:** File-based at `wp-content/uploads/eventkoi-import.log`,
@@ -75,10 +79,15 @@ top-level document.
 | 16 | One-shot Import Wizard (staged events → tickets → orders with 3 review stops) + taxonomy provisioning from the UI | ✅ Done | — |
 | 17 | Attendee fidelity: instance-tagged rows (storefront inventory), per-seat attendee identity, TEC registration fields | ✅ Done | — |
 | 18 | EventKoi setup in Preflight: WooCommerce checkout method from TEC sales, onboarding calendar defaults (no demo data), stage guard, events-list count check | ✅ Done | — |
+| 19 | Remove pre-wizard import paths from Advanced tools (v1.11.1) | 🟡 Code done, ott-dev QA pending | — |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
+
+**Step 19 code done (2026-10-19, v1.11.1), not deployed.** Next: with
+the user's OK, deploy to ott-dev and QA (see Step 19 "QA to run"). Do
+not click "Undo Last Event Sync" on ott-dev without approval.
 
 **Step 18 done (2026-10-19, v1.11.0):** ott-dev's EventKoi checkout
 method is now WooCommerce and the events list shows imported sales
@@ -1645,7 +1654,66 @@ event "Classical Concert in the Park" + plugin tour. Completion sets
 
 ---
 
+### Step 19 — Remove pre-wizard import paths (v1.11.1) 🟡
+
+The wizard is the supported import path, so the Advanced tools panels
+that predate it were removed (user-approved audit, 2026-10-19).
+
+**Removed** (PHP methods, AJAX hooks, markup, JS, unused CSS):
+- Run Migration Overview stats (`ekti_get_stats`), Event Mapping
+  (`ekti_get_event_mapping`, `ekti_save_mapping`, `ekti_auto_match`) and
+  Run Migration (`ekti_run_batch`, `ekti_rollback`; `process_batch`,
+  `get_or_create_ticket`, migration state).
+- Pre-Import Cleanup (`ekti_scan_cleanup`, `ekti_run_ticket_dedupe`,
+  `ekti_run_event_merge`, `ekti_undo_cleanup`).
+- Ticket Details Sync (`ekti_scan_ticket_details`,
+  `ekti_run_ticket_details_sync`, `ekti_undo_sync`).
+- Legacy Calendar Sync (`ekti_scan_calendar_sync`,
+  `ekti_save_location_mapping`, `ekti_run_calendar_sync`,
+  `ekti_undo_calendar_sync`).
+- Single-pass Event Sync runner (`ekti_run_event_sync`, TEC-ID targeting,
+  scan tiles and review table). `run_event_sync()` now only runs the
+  wizard's events stage (always tags ops `events`), and
+  `import_one_event()` lost its inline tickets + orders branch.
+- Four methods nothing called (`get_eventkoi_events_with_tickets`,
+  `get_eventkoi_tickets_for_event`, `get_product_name_for_tec_event`,
+  `get_wc_order_date`). 63 methods, ~2,400 PHP lines.
+
+**Kept:** `link_woo_attendees` (orders stage + attendee repair),
+`replay_audit_ops` (every undo; handlers for the old op types stay),
+`get_saved_mapping`/`save_mapping`, `scan_event_sync` (events Preview),
+`scan_native_adoption` (Preflight), taxonomy sync and organizer field
+cleanup (wizard step 2), the import log.
+
+**Advanced tools** now holds "Native Imports & Event Sync Ledger" (Adopt
+Native Imports, Undo Last Event Sync) and the import log. Preflight and
+the events Preview still point users to Adopt.
+
+**Behaviour change:** "Undo Last Event Sync" now replays only the
+untagged ledger ops (adoption and pre-wizard single-pass runs), which is
+what Preflight already described. Before, it replayed the whole ledger,
+including wizard stages, in one request without un-approving the wizard.
+It no longer clears `ekti_event_sync_state` (the events stage's failure
+memory).
+
+**Checks:** `php -l` and `node --check` pass. Every AJAX hook has a JS
+caller and every JS action has a hook. No method is left without a
+caller.
+
+**QA to run on ott-dev (needs the user's OK):** the page loads with no
+JS errors; wizard state is unchanged (all 5 steps approved, 658 events,
+2,306 WC-linked rows); events/tickets/orders Preview and Check Results
+still work; Adopt reports nothing to adopt; check whether any of the
+orphaned legacy ledgers are non-empty (see Open questions).
+
+---
+
 ## Admin UI ✅
+
+**v1.11.1 layout:** Advanced tools holds only "Native Imports & Event
+Sync Ledger" (Adopt Native Imports, Undo Last Event Sync) and the Import
+Log. The panels described below were removed in Step 19 and are kept
+here as history.
 
 **v1.9.0 layout:** Import Wizard (6 steps, review stops after events,
 tickets and orders; taxonomy setup and term matching in step 2) →
@@ -2005,9 +2073,24 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
   the dev QA tools (note: `ott-dev.py`'s stored app password returned 401
   on 2026-10-19; QA used the Novamira MCP connection instead).
 
+- 2026-10-19: **v1.11.1 removed the pre-wizard Advanced tools** (Step
+  19). "Undo Last Event Sync" was narrowed to untagged ledger ops rather
+  than removed, because adoption ops are untagged and no wizard undo
+  covers them; replaying the whole ledger also undid wizard stages
+  without updating wizard state.
+
 ---
 
 ## Open questions / blockers
+
+- **Orphaned legacy ledgers (v1.11.1):** `ekti_migration_audit`,
+  `ekti_cleanup_audit`, `ekti_sync_audit` and `ekti_cal_sync_audit` can
+  no longer be undone from the UI. Check ott-dev before deploying (the
+  Novamira MCP connection failed with DEPTH_ZERO_SELF_SIGNED_CERT on
+  2026-10-19). If any are non-empty, either undo them with v1.11.0 first
+  or accept them as permanent. `ekti_event_mapping` is still written by
+  the events stage; `ekti_migration_state` and `ekti_location_mapping`
+  are now inert.
 
 - **Elementor template choice** (Step 18): EventKoi's onboarding writes
   it through `api/class-elementor-templates.php`; the importer only links
