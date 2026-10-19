@@ -224,9 +224,9 @@
             for (var i = 0; i < results.length; i++) {
                 var r = results[i];
                 if (r.action === 'created') {
-                    appendConsole('✓ Created attendee #' + r.attendee_id + ': ' + (r.name || '') + ' [' + (r.composite_key || '') + ']');
+                    appendConsole('✓ Created attendee #' + r.attendee_id + ': ' + (r.name || '') + ' [' + (r.composite_key || '') + ']' + (r.status && r.status !== 'complete' ? ' — ' + r.status + ' (not counted as sold)' : ''));
                 } else if (r.action === 'dry_run_create') {
-                    appendConsole('[DRY] Would create: ' + (r.name || '') + ' <' + (r.email || '') + '> → EventKoi #' + r.ek_event_id + ' @ $' + (r.price || '0') + ' | key: ' + (r.composite_key || '') + ' | WC#' + (r.wc_order_id || 'none'));
+                    appendConsole('[DRY] Would create: ' + (r.name || '') + ' <' + (r.email || '') + '> → EventKoi #' + r.ek_event_id + ' @ $' + (r.price || '0') + ' | key: ' + (r.composite_key || '') + ' | WC#' + (r.wc_order_id || 'none') + ' | ' + (r.status || ''));
                 } else if (r.action === 'skipped') {
                     appendConsole('⊘ Skipped #' + r.attendee_id + ': ' + r.reason, 'warn');
                 } else if (r.action === 'error') {
@@ -249,7 +249,7 @@
             if (d.done || state.completed) {
                 appendConsole('=== Migration ' + (dryRun ? 'Dry Run ' : '') + 'Complete ===', 'info');
                 appendConsole('Total processed: ' + state.processed, 'info');
-                appendConsole('Attendees: ' + state.attendees_created + ' | Orders: ' + (state.orders_created || 0) + ' | Charges: ' + (state.charges_created || 0) + ' | Skipped: ' + state.skipped + ' | Errors: ' + state.errors, 'info');
+                appendConsole('Attendees: ' + state.attendees_created + ' | WC orders linked: ' + (state.orders_created || 0) + ' | Ticket types created: ' + (state.tickets_created || 0) + ' | Skipped: ' + state.skipped + ' | Errors: ' + state.errors, 'info');
                 updateProgress(100);
                 isRunning = false;
                 $('#ekti-start-migration, #ekti-resume-migration').prop('disabled', false);
@@ -269,7 +269,7 @@
     }
 
     function rollback() {
-        if (!confirm('This will DELETE all imported ticket orders, parent orders, charges, notes, and WC order meta created by this importer. Continue?')) {
+        if (!confirm('This will revert everything Run Migration wrote (ticket orders, ticket types it created, attendee flags and WC order meta). Event Sync data is not touched. Continue?')) {
             return;
         }
         appendConsole('=== Running Rollback ===', 'warn');
@@ -281,9 +281,6 @@
             var d = resp.data;
             appendConsole('Rollback complete:', 'warn');
             appendConsole('  Ticket orders: ' + d.deleted_orders, 'warn');
-            appendConsole('  Parent orders: ' + d.deleted_parent_orders, 'warn');
-            appendConsole('  Charges: ' + d.deleted_charges, 'warn');
-            appendConsole('  Notes: ' + d.deleted_notes, 'warn');
             appendConsole('  Ticket types: ' + d.deleted_tickets, 'warn');
             setStatus('#ekti-migration-status', 'Rollback complete.', 'warning');
             updateProgress(0);
@@ -1305,7 +1302,7 @@
     }
 
     function loopEventSync(ids) {
-        var grand = { imported: 0, tickets: 0, cost_tickets: 0, tc_attendees: 0, rsvp_rows: 0, rsvp_merged: 0, errors: 0, skipped: 0 };
+        var grand = { imported: 0, tickets: 0, cost_tickets: 0, tc_attendees: 0, rsvp_rows: 0, rsvp_merged: 0, woo_attendees: 0, woo_orders: 0, woo_unpaid: 0, errors: 0, skipped: 0 };
         var total = ids ? ids.split(',').filter(function (v) { return $.trim(v) !== ''; }).length : esTotals.unimported;
         var noProgress = 0;
         var firstChunk = true;
@@ -1340,6 +1337,7 @@
                     } else {
                         var bits = ['\u2713 ' + escapeHtml(r.title) + ' (TEC ' + r.tec_id + ' \u2192 EK #' + r.event_id + ')'];
                         if (r.tickets) bits.push(r.tickets + ' ticket type(s)');
+                        if (r.woo_attendees) bits.push(r.woo_attendees + ' Woo attendee(s) / ' + r.woo_orders + ' order(s)' + (r.woo_unpaid ? ' (' + r.woo_unpaid + ' refunded/unpaid, not counted as sold)' : ''));
                         if (r.tc_attendees) bits.push(r.tc_attendees + ' TC attendee(s)');
                         if (r.rsvp_rows) bits.push(r.rsvp_rows + ' RSVP row(s)');
                         if (r.rsvp_merged) bits.push(r.rsvp_merged + ' duplicate(s) merged');
@@ -1365,6 +1363,7 @@
                 if (d.done) {
                     appendConsole('=== Event Sync complete: ' + grand.imported + ' event(s) imported, ' +
                         (grand.tickets + grand.cost_tickets) + ' ticket type(s), ' +
+                        grand.woo_attendees + ' Woo attendee(s) in ' + grand.woo_orders + ' order(s) (' + grand.woo_unpaid + ' refunded/unpaid), ' +
                         grand.tc_attendees + ' TC attendee(s), ' +
                         grand.rsvp_rows + ' RSVP row(s), ' +
                         grand.rsvp_merged + ' duplicate(s) merged, ' +

@@ -7,19 +7,16 @@ condensed version of each build step so progress and plan travel together in one
 top-level document.
 
 - **Branch:** `main`
-- **Plugin version:** 1.7.0
+- **Plugin version:** 1.8.0
 - **Last updated:** 2026-10-18
-- **Overall status:** ✅ **v1.7.0 Event Sync shipped and QA-passed on
-  ott-dev (2026-10-18).** New "Event Sync (TEC → EventKoi)" panel imports
-  TEC events through a hardened port of EventKoi's native importer
-  (v1.4.7.0): duplicate-RSVP-email dedupe (the Critical-Error fix), early
-  dedup marker, per-event try/catch with op-replay rollback, chunked
-  resumable runner (25/chunk, 18s budget), audited undo with hard-delete
-  + residual table sweep, native-import adoption, and Run Migration
-  interop via `_ekti_tec_product_*` bindings. QA: full run (626 events
-  incl. the native-fatal one), undo to exact baseline, idempotent
-  re-run, migration interop, adoption, and a rollback-scoping fix found
-  and re-verified during QA. See Step 14 below.
+- **Overall status:** ✅ **v1.8.0 ticket data parity rewrite shipped and
+  QA-passed on ott-dev (2026-10-18).** Event Sync now follows EventKoi's
+  native importer ticket model (capacity − sold, then give-back) and
+  imports WooCommerce attendees inline as WC-linked, status-aware
+  `ticket_orders` rows through one shared writer that Run Migration also
+  uses. Full run: 688/688 tickets have `quantity_sold` == TEC paid
+  attendees and 682/682 capacity-limited tickets have the expected
+  remaining. See Step 15.
 
 ## Shared project facts (true for every step)
 
@@ -65,32 +62,37 @@ top-level document.
 | 12 | Organizer custom field cleanup (backup + remove native-import Organizer field group) | ✅ Done | — |
 | 13 | Saved Locations term field sync (TEC venue addresses → builder term fields, overwrite + undo) | ✅ Done | — |
 | 14 | Event Sync (TEC events → EventKoi events — native-importer port, Critical-Error fix, chunked runner, adoption + undo) | ✅ Done | — |
+| 15 | Ticket data parity rewrite (native ticket/capacity model, inline WC-linked attendee import, status-aware rows, shared writer for Run Migration) | ✅ Done | — |
 
 Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 ## Next action
 
-**Step 14 QA complete (2026-10-18) — results under Step 14 below.**
-`eventkoi-tickets-importer.zip` has been rebuilt from the 1.7.0 tree and
-is per-file identical to the QA-passed build deployed on ott-dev.
+**Step 15 QA complete (2026-10-18) — results under Step 15 below.** Dev is
+left in the fully synced v1.8.0 state.
 
-1. **Send the upstream bug report to EventKoi** — draft in the Step 14
-   section (uncaught DatabaseQueryException on duplicate RSVP emails;
-   recommend marker-before-attendees, per-event isolation, chunking).
-2. **Production cutover prep** — update readme/changelog, add the
-   uninstall cleanup routine, then run the prod cutover checklist. On
-   prod, BEFORE any import verify TEC cleaner settings
-   (`trash-past-events` ≥ 24 or off; `delete-past-events` absent) and
-   run the panels in pipeline order: Event Sync → Adopt Native Imports
-   (if native imports exist) → Auto-Match → Taxonomy Syncs (Locations,
-   Instructors, Saved Locations fields) → Run Migration. On dev the
-   v1.5.0 location/instructor term assignments went with the earlier
-   event population (0 assignments after the Step 14 re-run) — a
-   Taxonomy Sync re-run repopulates them.
-3. **Prod-watch items from dev QA** — events without `_EventStartDate`
-   are reported as errors and skipped (35 on dev; data issue, not an
-   importer bug); recurrence-rule conversion is ported but untested
-   (0 recurring events on dev); custom fields are report-only.
+1. **Status-sync QA (not run):** change a WC order to refunded/cancelled on
+   a test order and confirm EventKoi's `on_order_status_changed` /
+   `on_order_refunded` update the imported rows and recount. Not run on dev
+   because a status change on a real customer order can send WC emails —
+   use a throwaway test order.
+2. **Admin UI pass:** run Event Sync / Run Migration / Rollback from the
+   Tools page once (QA drove the private methods via reflection; the JS
+   output lines for Woo attendees are new).
+3. **Re-run Taxonomy Sync** (Locations, Instructors, Saved Locations
+   fields) — the reset dev EventKoi has no builder taxonomies configured
+   yet, so 0 events carry location/instructor terms.
+4. **Send the upstream bug report to EventKoi** (Step 14 draft), plus
+   Step 15 note: native `import_event_attendees()` imports refunded /
+   failed WooCommerce attendees as `complete` manual orders.
+5. **Production cutover prep** — readme/changelog, uninstall cleanup
+   (new options: `ekti_migration_audit`; WC meta `_ekti_wc_linked`), then
+   the prod checklist. Pipeline order on prod: Event Sync (now brings
+   attendees) → Adopt Native Imports (if native imports exist) →
+   Auto-Match → Taxonomy Syncs → Run Migration (only needed for mapped
+   events Event Sync did not create).
+6. `ott-dev.py`'s stored application password is stale (HTTP 401) — use
+   the Novamira MCP connection, or refresh the credential.
 
 - **Verification results:** all 2421 order_ids distinct, 0 rows outside
   the mapping, 0 null ticket_ids, 0 orphan tickets, all `quantity_sold`
@@ -781,6 +783,143 @@ EventKoi v1.4.7.0, `includes/importers/class-tec-importer.php`:
 
 ---
 
+### Step 15 — Ticket data parity rewrite (v1.8.0) ✅
+
+**Problem:** after Step 14 (our Event Sync replacing EventKoi's native TEC
+importer) EventKoi ticket data no longer matches TEC. Under the old
+pipeline (native importer → Run Migration) it did. Investigated on
+ott-dev 2026-10-18. The dev EventKoi side had been reset to empty
+(EventKoi 1.4.7.0 tables at AUTO_INCREMENT 1, no builder taxonomies), and
+TEC/Woo was intact: 693 live events, 697 live Woo ticket products,
+2,306 live attendees (2,088 completed / 215 refunded / 3 failed orders),
+692 events on shared (global) stock.
+
+**Root causes (measured on live events):**
+
+1. **Refunded / failed seats imported as sold.** `process_batch()` writes
+   every `tribe_wooticket` as `payment_status='complete'` regardless of
+   the WC order status → 218 non-paid seats counted in `quantity_sold`
+   (122 tickets affected). It also writes a `succeeded` `eventkoi_charges`
+   row for refunded orders, inflating EventKoi's Stats (which read the
+   charges table).
+2. **`quantity_sold` preset from WC `total_sales` cannot hold.** Event
+   Sync presets it; EventKoi (and our own batch recount) recounts from
+   `ticket_orders` rows on every write, so the value flips. `total_sales`
+   ≠ paid-attendee count for 139/697 products (247 sold seats with no
+   attendee post; WC also never decrements `total_sales` on refund).
+3. **Capacity model diverged from native.** Step 14 stores full capacity
+   and no event-capacity deduction. Native stores
+   `capacity − total_sales`, then gives back one seat per imported
+   attendee. Seats sold in TEC that have no attendee row (the 247) stay
+   deducted, so EventKoi's remaining matches TEC's. Same for the per-event
+   shared cap (`_tribe_ticket_global_stock_level`).
+4. **Attendees imported outside the event import, in a non-native
+   shape.** Native imports attendees inside `import_single_event()`
+   (tickets → attendees → give-back). We defer to Run Migration, which
+   hardcodes USD, generates random tokens (the v1.4.1 doubling root
+   cause), omits `'paid'` from the recount IN-list, names fallback tickets
+   from `_tribe_deleted_product_name` only, and writes parent
+   `eventkoi_orders` + `eventkoi_charges` rows. EventKoi's own WC checkout
+   never writes those: it lists WC orders by grouping `ticket_orders` on
+   the `wc_{id}` base, and its charges table is documented as Stripe-only.
+
+**Plan (single-file plugin + admin.js, version 1.8.0):**
+
+- **A. Native ticket model in Event Sync.** `insert_imported_ticket_sync()`
+  goes back to native exactly (`quantity_available = max(cap − total_sales, 0)`,
+  `quantity_sold` left to the recount), records `deducted`. New
+  `give_back_imported_capacity_sync()` is a port of native
+  `give_back_imported_attendee_capacity()`. Seats given back = rows
+  imported for orders that were ever paid (complete /
+  partially_refunded / refunded), capped by `deducted` (native counts every
+  imported attendee; pending/failed seats never entered `total_sales`).
+  Event cap = native `global_level − sold_total` + the same give-back.
+- **B. One shared WC attendee writer** `link_woo_attendees()` used by both
+  Event Sync (inline, native order) and Run Migration:
+  - one `ticket_orders` row per attendee in the exact column set of
+    `Ticket_Order_Sync::sync_order_to_local()`'s codes path:
+    `order_id = wc_{order}:{ticket}:{token}`, quantity 1, unit/total =
+    `_paid_price`, currency = WC order currency, created_at = order date
+    (GMT), `charge_id`/`payment_intent_id` empty (non-Stripe parity);
+  - `payment_status` from WC order status via EventKoi's own
+    `on_order_status_changed()` map (completed/processing → complete,
+    refunded → refunded, cancelled, failed, on-hold/pending → pending);
+    completed orders with a partial refund → `partially_refunded`;
+  - deterministic check-in token per attendee (EventKoi base32 alphabet,
+    hash of attendee ID) → re-runs hit the same key (DB-level
+    idempotency in addition to the attendee flag);
+  - per-attendee name/email (TEC attendee meta, WC billing fallback, as
+    native does);
+  - checked-in carried over only for check-in-eligible (complete) rows;
+  - recount via EventKoi's public `Ticket_Order_Sync::sync_quantity_sold()`;
+  - WC order meta (`_eventkoi_event_id`, `_eventkoi_ticket_items` with
+    real ticket IDs + per-seat codes, `_eventkoi_master_checkin_code`,
+    `_eventkoi_synced = yes`) so EventKoi's status/refund hooks keep the
+    rows in sync and never re-run `on_payment_complete()` (which would
+    email customers); multi-event orders append ticket_items;
+  - **no** parent `eventkoi_orders` / `eventkoi_charges` / notes rows for
+    WC orders (native parity, fixes Stats inflation);
+  - attendee flag `_eventkoi_imported_from_tec`; every write audited
+    (`insert_ticket_order`, new `wc_order_meta` op, `update_postmeta`).
+- **C. Event Sync imports Woo attendees inline** (native order), so one
+  run produces the finished event. Product bindings still written for
+  Ticket Details Sync / Run Migration.
+- **D. Run Migration rewired onto the shared writer** (same AJAX/JS
+  contract): ticket resolution = binding → native ticket name match →
+  create (named from the order line item / deleted-product name). Its
+  rollback replays a new `ekti_migration_audit` ledger instead of
+  pattern-deletes.
+- **E. Undo hardening:** the `insert_post` sweep deletes a WC base's
+  parent rows only when no `ticket_orders` rows remain for it (multi-event
+  orders); `wc_order_meta` restores prior values.
+
+**Acceptance (ott-dev):** for every live Woo ticket, EventKoi
+`quantity_sold` == paid attendees and remaining (`quantity_available −
+sold`) == `capacity − paid − unrepresented` clamped at 0, where
+unrepresented = `max(total_sales − ever-paid imported rows, 0)` (native
+semantics; a refunded seat is released, matching WC's restock); refunded
+/ failed rows present with their status and not counted; 0
+`eventkoi_charges` rows for WC orders; idempotent re-run (0 new rows);
+EventKoi REST orders list shows the imported WC orders; undo restores the
+empty baseline.
+
+**Dev QA results (2026-10-18, importer v1.8.0 / EventKoi v1.4.7.0):**
+
+- **Deploy:** zip uploaded via `novamira/create-upload-link`,
+  `wp plugin install --force --activate`, opcache invalidated, server md5
+  == local build; upload removed afterwards.
+- **Targeted run** (44193, 44318, 44515, 43119, 43257, 52802 — refunds,
+  multi-event WC order 44624, two-product event, unrepresented seats,
+  duplicate-email RSVP): 6 imported / 0 errors, 66 Woo attendees in 41
+  orders, 3 refunded kept as `refunded`; every ticket sold == TEC paid,
+  remaining == expected (43257: cap 18, ts 7, 4 rows → avail 15 / sold 4);
+  0 charges, 0 parent orders, 0 status mismatches vs WC; order 44624's
+  `_eventkoi_ticket_items` carries both events' items.
+- **Run Migration interop + determinism:** deleted 43257's rows/flags,
+  re-linked via `process_batch()` → the 4 recreated `order_id`s are
+  byte-identical to Event Sync's (deterministic tokens). Rollback replayed
+  `ekti_migration_audit` → removed exactly those 4 rows + flags, restored
+  the WC meta to its pre-migration values, 0 tickets touched.
+- **Undo (targeted set):** 180 ops replayed → exact empty baseline (0
+  posts / rows / flags / WC meta / bindings, default calendar only).
+- **Full run:** 11 calls of ≤15-event chunks; 658 imported + 35
+  no-start-date errors (= all 693 live events), 688 tickets, 2,306 Woo
+  rows (== live attendee count) in 1,594 linked orders, 9 RSVP rows (2
+  merged), 8,329 ledger ops. Rows: 2,049 complete / 39
+  partially_refunded / 215 refunded / 3 failed.
+- **Acceptance:** 688/688 sold == TEC paid attendees (2,088 == 2,088);
+  682/682 capacity-limited remaining == expected (6 unlimited); 0 dup
+  order_ids, 0 dup tokens, 0 null tickets; 0 eventkoi_orders / charges.
+  Re-run: 0 imported, 0 new rows. The single TEC checked-in attendee is on
+  a permanently deleted event (orphan, correctly skipped).
+- **EventKoi API:** `Tickets::get_all_orders` returns 1,594 orders;
+  per-event `get_ticket_orders` (TEC 44515) returns 19 orders (18 complete
+  / 1 refunded) with amounts, per-seat codes, master code, and refunded
+  orders at 0 check-in eligibility. `/eventkoi/v1/orders` is the Stripe
+  `eventkoi_orders` view → empty by design.
+
+---
+
 ## Admin UI ✅
 
 Server-rendered PHP page (`render_admin_page()`) with eight panels:
@@ -1068,6 +1207,21 @@ with syntax coloring, mapping table overflow scroll, CSS spinner.
   35 unusable events). Location/instructor term assignments from
   v1.5.0 went with the pre-cleanup event population (0 assignments
   today) — re-run Taxonomy Sync after Event Sync to repopulate.
+
+- 2026-10-18: **Step 15 — native ticket model + WC-linked attendees.**
+  WC attendees stay WC-linked (real price, real WC status, WC meta) rather
+  than native's zero-value manual orders: the importer exists to connect
+  tickets to WooCommerce orders, and native's manual orders mark refunded
+  and failed seats `complete`. Parent `eventkoi_orders` /
+  `eventkoi_charges` rows for WC orders were dropped — EventKoi 1.4.7's
+  own WC checkout writes none (it groups `ticket_orders` by the `wc_{id}`
+  base), and synthetic `succeeded` charges inflated EventKoi Stats. This
+  supersedes the Step 5 parent-order/charge design. Capacity give-back
+  counts only ever-paid rows (complete / partially_refunded / refunded):
+  WC `total_sales` includes refunded sales but never pending/failed ones.
+  Run Migration's rollback is now a ledger replay (`ekti_migration_audit`);
+  the v1.7.0 tracking options (`ekti_migration_created_tickets`,
+  `ekti_migration_flagged_posts`) are no longer written.
 
 - **No REST API:** the plugin uses `admin-ajax.php` rather than WP REST. This
   is deliberate for a migration tool — all operations are admin-initiated,

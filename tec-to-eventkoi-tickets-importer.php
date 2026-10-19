@@ -3,7 +3,7 @@
  * Plugin Name: EventKoi Tickets Importer
  * Plugin URI:  https://onedog.solutions
  * Description: Migrates tickets and attendees from The Events Calendar (Event Tickets / Event Tickets Plus) to EventKoi.
- * Version:     1.7.0
+ * Version:     1.8.0
  * Author:      One Dog Solutions
  * Author URI:  https://onedog.solutions
  * License:     GPL-2.0-or-later
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit;
 }
 
-define( 'EKTI_VERSION', '1.7.0' );
+define( 'EKTI_VERSION', '1.8.0' );
 define( 'EKTI_LOG_DIR', WP_CONTENT_DIR . '/uploads' );
 define( 'EKTI_LOG_FILE', EKTI_LOG_DIR . '/eventkoi-import.log' );
 define( 'EKTI_BATCH_SIZE', 30 );
@@ -488,16 +488,15 @@ final class EventKoi_Tickets_Importer {
     }
 
     /**
-     * Process a batch of attendees.
+     * Process a batch of attendees (Run Migration).
      *
-     * Groups attendees by WC order so we can create a single parent
-     * wp_eventkoi_orders row per order, plus one wp_eventkoi_charges row,
-     * then one wp_eventkoi_ticket_orders row per attendee with the
-     * EventKoi-native composite key format.
+     * Step 15: the batch is grouped by TEC event and handed to the shared
+     * link_woo_attendees() writer — the same code Event Sync runs inline —
+     * so both paths produce identical, EventKoi-native WC-linked rows with
+     * the real order status. Writes are recorded in ekti_migration_audit,
+     * which rollback_import() replays.
      */
     private function process_batch( $dry_run = false ) {
-        global $wpdb;
-
         $state     = $this->get_migration_state();
         $mapping   = $this->get_saved_mapping();
         $attendees = $this->get_tec_attendees( $state['offset'], EKTI_BATCH_SIZE );
@@ -513,21 +512,12 @@ final class EventKoi_Tickets_Importer {
             ];
         }
 
-        $results          = [];
-        $ticket_cache     = []; // tec_event_id_product_id => eventkoi_ticket_id
-        $parent_order_ids = []; // wc_order_id => eventkoi_orders.id
-        $wc_order_totals  = []; // wc_order_id => { total, qty, event_id, title, attendees, ticket_id }
-        $flagged_ids      = []; // Attendee posts this batch flagged as imported.
-
-        // --- Phase 1: resolve tickets and group by WC order ----------------
-        $resolved = []; // attendees that passed mapping + ticket resolution
+        $results  = [];
+        $by_event = []; // tec_event_id => attendee rows to link.
 
         foreach ( $attendees as $att ) {
             $tec_event_id = $att['tec_event_id'];
-            $product_id   = $att['product_id'];
-            $wc_order_id  = $att['wc_order_id'];
 
-            // Check mapping.
             if ( ! isset( $mapping[ $tec_event_id ] ) ) {
                 $state['skipped']++;
                 $results[] = [
@@ -538,289 +528,56 @@ final class EventKoi_Tickets_Importer {
                 continue;
             }
 
-            // Idempotency: skip attendees already imported from a previous run.
+            // Idempotency: attendees imported by Event Sync, a previous run,
+            // or Adopt Native Imports carry the attendee-level flag.
             if ( get_post_meta( $att['ID'], '_eventkoi_imported_from_tec', true ) ) {
                 $state['skipped']++;
+                $state['processed']++;
                 $results[] = [
                     'attendee_id' => $att['ID'],
                     'action'      => 'skipped',
                     'reason'      => 'Already imported (attendee-level flag)',
                 ];
-                $state['processed']++;
                 continue;
             }
 
+            $by_event[ $tec_event_id ][] = $att;
+        }
+
+        $ops = [];
+        foreach ( $by_event as $tec_event_id => $rows ) {
             $ek_event_id = (int) $mapping[ $tec_event_id ];
+            $resolver    = function ( $product_id, $att ) use ( $tec_event_id, $ek_event_id, $dry_run, &$ops, &$state ) {
+                return (int) $this->get_or_create_ticket( $tec_event_id, $ek_event_id, $product_id, $att, $dry_run, $ops, $state );
+            };
 
-            // Get or create EventKoi ticket type for this product.
-            $cache_key = $tec_event_id . '_' . $product_id;
-            if ( isset( $ticket_cache[ $cache_key ] ) ) {
-                $ek_ticket_id = $ticket_cache[ $cache_key ];
-            } else {
-                $ek_ticket_id = $this->get_or_create_ticket( $tec_event_id, $ek_event_id, $product_id, $att, $dry_run );
-                if ( $ek_ticket_id ) {
-                    $ticket_cache[ $cache_key ] = $ek_ticket_id;
-                }
-            }
+            $linked = $this->link_woo_attendees( $ek_event_id, $rows, $resolver, $dry_run, $ops );
 
-            if ( ! $ek_ticket_id && ! $dry_run ) {
-                $state['errors']++;
-                $results[] = [
-                    'attendee_id' => $att['ID'],
-                    'action'      => 'error',
-                    'reason'      => "Failed to get/create ticket for TEC event {$tec_event_id}",
-                ];
-                continue;
-            }
-
-            // Attach resolved EventKoi IDs before grouping so the WC order
-            // meta ticket_items carry real ticket IDs.
-            $att['_ek_event_id']  = $ek_event_id;
-            $att['_ek_ticket_id'] = $ek_ticket_id;
-
-            // Track per-WC-order totals for parent order creation.
-            if ( $wc_order_id ) {
-                if ( ! isset( $wc_order_totals[ $wc_order_id ] ) ) {
-                    $ek_event_title = get_the_title( $ek_event_id );
-                    $wc_order_totals[ $wc_order_id ] = [
-                        'total'     => 0,
-                        'qty'       => 0,
-                        'ek_event_id'    => $ek_event_id,
-                        'ek_event_title' => $ek_event_title,
-                        'ek_ticket_id'   => $ek_ticket_id,
-                        'attendees'      => [],
-                        'ticket_items'   => [],
-                    ];
-                }
-                $wc_order_totals[ $wc_order_id ]['total'] += floatval( $att['paid_price'] );
-                $wc_order_totals[ $wc_order_id ]['qty']++;
-                $wc_order_totals[ $wc_order_id ]['attendees'][] = $att;
-            }
-
-            $resolved[] = $att;
-        }
-
-        // --- Phase 2: create parent orders and charges per WC order --------
-        foreach ( $wc_order_totals as $wc_order_id => $group ) {
-            if ( ! $wc_order_id ) {
-                continue;
-            }
-
-            $parent_id = $this->create_parent_order(
-                $wc_order_id,
-                $group['ek_event_id'],
-                $group['attendees'],
-                $group['ek_ticket_id'],
-                $dry_run
-            );
-
-            if ( $parent_id ) {
-                $parent_order_ids[ $wc_order_id ] = $parent_id;
-                $state['orders_created']++;
-
-                if ( ! $dry_run ) {
-                    $this->create_charge_row(
-                        $wc_order_id,
-                        $parent_id,
-                        $group['total'],
-                        $group['qty'],
-                        $dry_run
-                    );
-                    $state['charges_created']++;
-                }
-
-                // Build ticket_items array for WC order meta.
-                $ticket_items_for_meta = [];
-                foreach ( $group['attendees'] as $a ) {
-                    $ticket_items_for_meta[] = [
-                        'ticket_id'   => $a['_ek_ticket_id'],
-                        'name'        => $a['product_name'] ?: 'General Admission',
-                        'description' => '',
-                        'quantity'    => 1,
-                        'unit_amount' => (int) round( floatval( $a['paid_price'] ) * 100 ),
-                        'codes'       => [], // codes set below per attendee
-                    ];
-                }
-                $group['ticket_items'] = $ticket_items_for_meta;
-
-                // Generate master check-in code and set WC order meta.
-                $master_code = $this->generate_checkin_code();
-                $this->set_wc_order_meta(
-                    $wc_order_id,
-                    $group['ek_event_id'],
-                    $group['ek_event_title'],
-                    $ticket_items_for_meta,
-                    $master_code,
-                    $dry_run
-                );
-            }
-        }
-
-        // --- Phase 3: insert ticket_orders rows per attendee ---------------
-        $ticket_orders_table = $this->ek_table( 'ticket_orders' );
-
-        foreach ( $resolved as $att ) {
-            $ek_event_id  = $att['_ek_event_id'];
-            $ek_ticket_id = $att['_ek_ticket_id'];
-            $wc_order_id  = $att['wc_order_id'];
-
-            // Generate check-in code.
-            $checkin_code = $this->generate_checkin_code();
-
-            // Build composite order_id matching EventKoi's format.
-            if ( $wc_order_id && $ek_ticket_id ) {
-                $composite_order_id = 'wc_' . $wc_order_id . ':' . $ek_ticket_id . ':' . $checkin_code;
-            } elseif ( $wc_order_id ) {
-                $composite_order_id = 'wc_' . $wc_order_id . ':0:' . $checkin_code;
-            } else {
-                $composite_order_id = 'tec_import_' . $att['ID'];
-            }
-
-            // Determine charge_id.
-            $charge_id = $wc_order_id ? 'wc_charge_' . $wc_order_id : null;
-
-            // Determine check-in status.
-            $checked_in = ! empty( $att['checked_in'] ) && $att['checked_in'] === '1' ? 1 : 0;
-
-            // Get WooCommerce order date for created_at.
-            $order_date = $this->get_wc_order_date( $wc_order_id );
-
-            // Check if already imported (by composite key or legacy key).
-            if ( ! $dry_run ) {
-                $existing = $wpdb->get_var( $wpdb->prepare(
-                    "SELECT id FROM {$ticket_orders_table} WHERE order_id = %s LIMIT 1",
-                    $composite_order_id
-                ) );
-                if ( $existing ) {
-                    $state['skipped']++;
-                    $results[] = [
-                        'attendee_id' => $att['ID'],
-                        'action'      => 'skipped',
-                        'reason'      => 'Already imported',
-                    ];
-                    $state['processed']++;
-                    continue;
-                }
-                // Also check legacy key for backward compat with v1.0.0 imports.
-                $legacy_key = 'tec_import_' . $att['ID'];
-                $existing_legacy = $wpdb->get_var( $wpdb->prepare(
-                    "SELECT id FROM {$ticket_orders_table} WHERE order_id = %s LIMIT 1",
-                    $legacy_key
-                ) );
-                if ( $existing_legacy ) {
-                    $state['skipped']++;
-                    $results[] = [
-                        'attendee_id' => $att['ID'],
-                        'action'      => 'skipped',
-                        'reason'      => 'Already imported (v1.0)',
-                    ];
-                    $state['processed']++;
-                    continue;
-                }
-            }
-
-            if ( $dry_run ) {
-                $state['attendees_created']++;
-                $results[] = [
-                    'attendee_id'      => $att['ID'],
-                    'action'           => 'dry_run_create',
-                    'name'             => $att['full_name'],
-                    'email'            => $att['email'],
-                    'ek_event_id'      => $ek_event_id,
-                    'ek_ticket_id'     => $ek_ticket_id ?: 'would_create',
-                    'wc_order_id'      => $wc_order_id,
-                    'composite_key'    => $composite_order_id,
-                    'checkin_code'     => $checkin_code,
-                    'price'            => $att['paid_price'],
-                    'checked_in'       => $checked_in,
-                ];
-            } else {
-                $unit_price = floatval( $att['paid_price'] );
-                $inserted = $wpdb->insert( $ticket_orders_table, [
-                    'event_id'         => $ek_event_id,
-                    'ticket_id'        => $ek_ticket_id ?: 0,
-                    'order_id'         => $composite_order_id,
-                    'customer_name'    => sanitize_text_field( $att['full_name'] ),
-                    'customer_email'   => sanitize_email( $att['email'] ),
-                    'quantity'         => 1,
-                    'unit_price'       => $unit_price,
-                    'total_amount'     => $unit_price,
-                    'currency'         => 'USD',
-                    'payment_status'   => 'complete',
-                    'payment_intent_id'=> null,
-                    'charge_id'        => $charge_id,
-                    'refund_amount'    => 0,
-                    'checked_in'       => $checked_in,
-                    'checked_in_at'    => $checked_in ? current_time( 'mysql' ) : null,
-                    'checkin_token'    => $checkin_code,
-                    'status'           => 'active',
-                    'created_at'       => $order_date ?: current_time( 'mysql' ),
-                    'updated_at'       => current_time( 'mysql' ),
-                    'instance_ts'      => 0,
-                ], [
-                    '%d', '%d', '%s', '%s', '%s', '%d', '%f', '%f', '%s', '%s',
-                    '%s', '%s', '%f', '%d', '%s', '%s', '%s', '%s', '%s', '%d',
-                ] );
-
-                if ( $inserted ) {
-                    $ticket_order_id  = (int) $wpdb->insert_id;
-                    $state['attendees_created']++;
-
-                    // Update ticket quantity_sold via recount (accurate).
-                    if ( $ek_ticket_id ) {
-                        $sold = (int) $wpdb->get_var( $wpdb->prepare(
-                            "SELECT COALESCE(SUM(quantity), 0) FROM {$ticket_orders_table}
-                             WHERE ticket_id = %d AND event_id = %d
-                               AND payment_status IN ('complete', 'completed', 'succeeded', 'partially_refunded')",
-                            $ek_ticket_id, $ek_event_id
-                        ) );
-                        $wpdb->update(
-                            $this->ek_table( 'tickets' ),
-                            [ 'quantity_sold' => $sold ],
-                            [ 'id' => $ek_ticket_id, 'event_id' => $ek_event_id ],
-                            [ '%d' ],
-                            [ '%d', '%d' ]
-                        );
-                    }
-
-                    // Mark source attendee as imported, remembering it so the
-                    // migration rollback clears only flags the migration set —
-                    // Adopt Native Imports (Step 14) writes the same flag for
-                    // attendees that must keep it.
-                    update_post_meta( $att['ID'], '_eventkoi_imported_from_tec', true );
-                    $flagged_ids[] = (int) $att['ID'];
-
-                    $results[] = [
-                        'attendee_id'        => $att['ID'],
-                        'action'             => 'created',
-                        'name'               => $att['full_name'],
-                        'composite_key'      => $composite_order_id,
-                        'ek_ticket_order_id' => $ticket_order_id,
-                    ];
-                } else {
+            $state['attendees_created'] += $linked['created'];
+            $state['orders_created']    += $linked['orders'];
+            foreach ( $linked['results'] as $r ) {
+                if ( 'error' === $r['action'] ) {
                     $state['errors']++;
-                    $this->log( "DB Error inserting attendee {$att['ID']}: " . $wpdb->last_error, 'ERROR' );
-                    $results[] = [
-                        'attendee_id' => $att['ID'],
-                        'action'      => 'error',
-                        'reason'      => $wpdb->last_error,
-                    ];
+                    continue; // Not processed — retried on the next run.
                 }
+                if ( 'skipped' === $r['action'] ) {
+                    $state['skipped']++;
+                }
+                $state['processed']++;
             }
+            $results = array_merge( $results, $linked['results'] );
+            foreach ( $linked['notes'] as $note ) {
+                $this->log( "Run Migration (TEC {$tec_event_id}): {$note}" );
+            }
+        }
 
-            $state['processed']++;
+        if ( ! $dry_run && $ops ) {
+            $audit = get_option( 'ekti_migration_audit', [] );
+            update_option( 'ekti_migration_audit', array_merge( is_array( $audit ) ? $audit : [], $ops ), false );
         }
 
         $state['offset'] += count( $attendees );
         $this->update_migration_state( $state );
-
-        if ( $flagged_ids && ! $dry_run ) {
-            $flagged = get_option( 'ekti_migration_flagged_posts', [] );
-            if ( ! is_array( $flagged ) ) {
-                $flagged = [];
-            }
-            update_option( 'ekti_migration_flagged_posts', array_values( array_unique( array_merge( $flagged, $flagged_ids ) ) ), false );
-        }
 
         return [
             'done'    => count( $attendees ) < EKTI_BATCH_SIZE,
@@ -830,70 +587,72 @@ final class EventKoi_Tickets_Importer {
     }
 
     /**
-     * Get or create an EventKoi ticket type for a TEC event/product combo.
+     * Resolve (or create) the EventKoi ticket type for a TEC event/product.
+     *
+     * Order: _ekti_tec_product_* binding (Event Sync / Ticket Details Sync)
+     * → an existing ticket on the event named like the product (native
+     * imports name tickets after the product post_title) → create. Created
+     * tickets follow the Step 7 field rules; quantity_sold is left to
+     * EventKoi's recount after the rows are written.
      */
-    private function get_or_create_ticket( $tec_event_id, $ek_event_id, $product_id, $att, $dry_run = false ) {
+    private function get_or_create_ticket( $tec_event_id, $ek_event_id, $product_id, $att, $dry_run, &$ops, &$state ) {
         global $wpdb;
         $tickets_table = $this->ek_table( 'tickets' );
 
-        // Check if a ticket already created for this TEC event + product combo.
-        $meta_key = '_ekti_tec_product_' . $tec_event_id . '_' . $product_id;
-        $existing_id = get_option( $meta_key );
-
-        if ( $existing_id ) {
-            $exists = $wpdb->get_var( $wpdb->prepare(
-                "SELECT id FROM {$tickets_table} WHERE id = %d",
-                $existing_id
-            ) );
-            if ( $exists ) {
-                return (int) $exists;
-            }
+        $meta_key    = '_ekti_tec_product_' . $tec_event_id . '_' . $product_id;
+        $existing_id = (int) get_option( $meta_key );
+        if ( $existing_id && $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$tickets_table} WHERE id = %d AND event_id = %d", $existing_id, $ek_event_id ) ) ) {
+            return $existing_id;
         }
 
-        // Check if an existing ticket matches by event_id and price.
-        $price = floatval( $att['paid_price'] );
-        $ticket_name = $att['product_name'] ?: 'General Admission';
+        // Ticket name as native would have created it: the product title.
+        $product     = get_post( (int) $product_id );
+        $ticket_name = $product && 'product' === $product->post_type ? $product->post_title : '';
+        if ( '' === trim( $ticket_name ) ) {
+            $ticket_name = (string) $att['product_name'];
+        }
+        if ( '' === trim( $ticket_name ) && ! empty( $att['order_item_id'] ) && function_exists( 'wc_get_order_item_meta' ) ) {
+            $item        = class_exists( 'WC_Order_Item_Product' ) ? new WC_Order_Item_Product( (int) $att['order_item_id'] ) : null;
+            $ticket_name = $item ? (string) $item->get_name() : '';
+        }
+        if ( '' === trim( $ticket_name ) ) {
+            $ticket_name = 'General admission';
+        }
+        $ticket_name = sanitize_text_field( $ticket_name );
 
-        $existing = $wpdb->get_row( $wpdb->prepare(
-            "SELECT id FROM {$tickets_table} WHERE event_id = %d AND name = %s LIMIT 1",
+        $match = (int) $wpdb->get_var( $wpdb->prepare(
+            "SELECT id FROM {$tickets_table} WHERE event_id = %d AND name = %s ORDER BY id ASC LIMIT 1",
             $ek_event_id,
             $ticket_name
-        ), ARRAY_A );
-
-        if ( $existing ) {
-            update_option( $meta_key, $existing['id'] );
-            return (int) $existing['id'];
+        ) );
+        if ( $match ) {
+            if ( ! $dry_run && $match !== $existing_id ) {
+                $old = get_option( $meta_key );
+                update_option( $meta_key, $match );
+                $ops[] = false === $old
+                    ? [ 'type' => 'add_option', 'name' => $meta_key ]
+                    : [ 'type' => 'update_option', 'name' => $meta_key, 'old' => $old ];
+            }
+            return $match;
         }
 
         if ( $dry_run ) {
-            return null;
+            return -1; // "Would create" — keeps the dry-run row resolvable.
         }
 
-        // Count existing attendees for this TEC event/product to set quantity_sold.
-        $attendee_count = (int) $wpdb->get_var( $wpdb->prepare(
-            "SELECT COUNT(*)
-             FROM {$wpdb->posts} p
-             JOIN {$wpdb->postmeta} pm1 ON (p.ID = pm1.post_id AND pm1.meta_key = '_tribe_wooticket_event')
-             JOIN {$wpdb->postmeta} pm2 ON (p.ID = pm2.post_id AND pm2.meta_key = '_tribe_wooticket_product')
-             WHERE p.post_type = 'tribe_wooticket' AND p.post_status = 'publish'
-               AND pm1.meta_value = %s AND pm2.meta_value = %s",
-            $tec_event_id,
-            $product_id
-        ) );
-
-        // Sale window + capacity from TEC source data (Step 7 rules).
-        $defaults      = $this->ticket_defaults( $tec_event_id, $ek_event_id, $product_id );
-        $qty_available = $defaults['quantity_available'];
+        $price    = $product ? (float) get_post_meta( $product->ID, '_price', true ) : (float) $att['paid_price'];
+        $currency = function_exists( 'get_woocommerce_currency' ) ? strtoupper( (string) get_woocommerce_currency() ) : 'USD';
+        $defaults = $this->ticket_defaults( $tec_event_id, $ek_event_id, $product_id );
 
         $inserted = $wpdb->insert( $tickets_table, [
             'event_id'           => $ek_event_id,
-            'name'               => sanitize_text_field( $ticket_name ),
+            'name'               => $ticket_name,
             'description'        => '',
             'price'              => $price,
-            'currency'           => 'USD',
-            'quantity_available' => $qty_available,
+            'currency'           => $currency,
+            'quantity_available' => $defaults['quantity_available'],
             'max_per_order'      => null,
-            'quantity_sold'      => $attendee_count,
+            'quantity_sold'      => 0,
             'sale_start'         => $defaults['sale_start'],
             'sale_end'           => $defaults['sale_end'],
             'terms_conditions'   => null,
@@ -903,24 +662,21 @@ final class EventKoi_Tickets_Importer {
             'updated_at'         => current_time( 'mysql' ),
         ], [ '%d', '%s', '%s', '%f', '%s', '%d', '%d', '%d', '%s', '%s', '%s', '%s', '%d', '%s', '%s' ] );
 
-        if ( $inserted ) {
-            $ticket_id = $wpdb->insert_id;
-            update_option( $meta_key, $ticket_id );
-            // Remember tickets the migration created so its rollback deletes
-            // only those — Event Sync (Step 14) writes the same binding
-            // options for tickets that must survive a migration rollback.
-            $created = get_option( 'ekti_migration_created_tickets', [] );
-            if ( ! is_array( $created ) ) {
-                $created = [];
-            }
-            $created[] = (int) $ticket_id;
-            update_option( 'ekti_migration_created_tickets', array_values( array_unique( $created ) ), false );
-            $this->log( "Created ticket type: {$ticket_name} (ID: {$ticket_id}) for EventKoi event {$ek_event_id}" );
-            return $ticket_id;
+        if ( ! $inserted ) {
+            $this->log( 'Failed to create ticket: ' . $wpdb->last_error, 'ERROR' );
+            return 0;
         }
 
-        $this->log( "Failed to create ticket: " . $wpdb->last_error, 'ERROR' );
-        return null;
+        $ticket_id = (int) $wpdb->insert_id;
+        $old       = get_option( $meta_key );
+        update_option( $meta_key, $ticket_id );
+        $ops[] = [ 'type' => 'delete_ticket', 'id' => $ticket_id ];
+        $ops[] = false === $old
+            ? [ 'type' => 'add_option', 'name' => $meta_key ]
+            : [ 'type' => 'update_option', 'name' => $meta_key, 'old' => $old ];
+        $state['tickets_created']++;
+        $this->log( "Created ticket type: {$ticket_name} (ID: {$ticket_id}) for EventKoi event {$ek_event_id}" );
+        return $ticket_id;
     }
 
     /**
@@ -951,334 +707,40 @@ final class EventKoi_Tickets_Importer {
         return null;
     }
 
-    /**
-     * Generate a 12-character check-in code using EventKoi's human-friendly
-     * alphabet (no ambiguous characters: 0, O, 1, I).
-     */
-    private function generate_checkin_code() {
-        $alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-        $length   = 12;
-        $code     = '';
-        $bytes    = random_bytes( $length );
-        for ( $i = 0; $i < $length; $i++ ) {
-            $code .= $alphabet[ ord( $bytes[ $i ] ) % strlen( $alphabet ) ];
-        }
-        return $code;
-    }
-
-    /**
-     * Create (or skip if exists) a parent row in wp_eventkoi_orders.
-     *
-     * Returns the row ID of the parent order, or null on failure.
-     */
-    private function create_parent_order( $wc_order_id, $ek_event_id, $attendees_group, $ek_ticket_id, $dry_run = false ) {
-        global $wpdb;
-
-        $checkout_id = 'wc_' . $wc_order_id;
-        $orders_table = $this->ek_table( 'orders' );
-
-        // Check if already exists.
-        $existing = $wpdb->get_var( $wpdb->prepare(
-            "SELECT id FROM {$orders_table} WHERE checkout_id = %s LIMIT 1",
-            $checkout_id
-        ) );
-        if ( $existing ) {
-            return (int) $existing;
-        }
-
-        if ( $dry_run ) {
-            return null;
-        }
-
-        // Calculate totals from the attendees group.
-        $total_amount = 0;
-        $total_qty    = 0;
-        foreach ( $attendees_group as $att ) {
-            $total_amount += floatval( $att['paid_price'] );
-            $total_qty++;
-        }
-
-        // Get billing info from WC order.
-        $billing_name  = '';
-        $billing_email = '';
-        $wc_order      = $this->get_wc_order( $wc_order_id );
-        if ( $wc_order ) {
-            $billing_name  = trim( $wc_order->get_billing_first_name() . ' ' . $wc_order->get_billing_last_name() );
-            $billing_email = $wc_order->get_billing_email();
-        }
-
-        // Fallback to first attendee's info.
-        if ( empty( $billing_name ) && ! empty( $attendees_group ) ) {
-            $billing_name = $attendees_group[0]['full_name'];
-        }
-        if ( empty( $billing_email ) && ! empty( $attendees_group ) ) {
-            $billing_email = $attendees_group[0]['email'];
-        }
-
-        $now = time();
-        $inserted = $wpdb->insert( $orders_table, [
-            'checkout_id'    => $checkout_id,
-            'payment_id'     => null,
-            'charge_id'      => 'wc_charge_' . $wc_order_id,
-            'customer_id'    => null,
-            'ticket_id'      => $ek_ticket_id ?: 0,
-            'quantity'       => $total_qty,
-            'subtotal'       => $total_amount,
-            'total'          => $total_amount,
-            'item_price'     => ! empty( $attendees_group ) ? floatval( $attendees_group[0]['paid_price'] ) : 0,
-            'currency'       => 'usd',
-            'payment_status' => 'complete',
-            'status'         => 'complete',
-            'created'        => $now,
-            'expires'        => $now,
-            'last_updated'   => $now,
-            'live'           => 1,
-            'billing_type'   => null,
-            'billing_name'   => sanitize_text_field( $billing_name ),
-            'billing_email'  => sanitize_email( $billing_email ),
-            'billing_phone'  => null,
-            'billing_address'=> null,
-            'billing_data'   => null,
-            'ip_address'     => null,
-            'gateway'        => 'woocommerce',
-            'is_archived'    => 0,
-        ], [
-            '%s', '%s', '%s', '%s', '%d', '%d', '%f', '%f', '%f', '%s', '%s',
-            '%s', '%d', '%d', '%d', '%d', '%s', '%s', '%s', '%s', '%s', '%s',
-            '%s', '%s', '%d',
-        ] );
-
-        if ( ! $inserted ) {
-            $this->log( "DB Error creating parent order for WC #{$wc_order_id}: " . $wpdb->last_error, 'ERROR' );
-            return null;
-        }
-
-        $order_row_id = $wpdb->insert_id;
-
-        // Add order note.
-        $notes_table = $this->ek_table( 'order_notes' );
-        $wpdb->insert( $notes_table, [
-            'order_id'   => $order_row_id,
-            'note_key'   => 'order_completed',
-            'note_value' => null,
-            'type'       => 'system',
-            'created'    => $now,
-        ] );
-
-        $this->log( "Created parent order: {$checkout_id} (row #{$order_row_id}) for event {$ek_event_id}" );
-        return $order_row_id;
-    }
-
-    /**
-     * Create (or skip if exists) a charge row in wp_eventkoi_charges.
-     */
-    private function create_charge_row( $wc_order_id, $ek_parent_order_id, $total_amount, $total_qty, $dry_run = false ) {
-        global $wpdb;
-
-        $charge_id     = 'wc_charge_' . $wc_order_id;
-        $charges_table = $this->ek_table( 'charges' );
-
-        // Check if already exists.
-        $existing = $wpdb->get_var( $wpdb->prepare(
-            "SELECT id FROM {$charges_table} WHERE charge_id = %s LIMIT 1",
-            $charge_id
-        ) );
-        if ( $existing ) {
-            return (int) $existing;
-        }
-
-        if ( $dry_run ) {
-            return null;
-        }
-
-        $now = time();
-        $inserted = $wpdb->insert( $charges_table, [
-            'order_id'        => $ek_parent_order_id ?: 0,
-            'checkout_id'     => 'wc_' . $wc_order_id,
-            'payment_id'      => 'wc_order_' . $wc_order_id,
-            'charge_id'       => $charge_id,
-            'amount'          => $total_amount,
-            'amount_captured' => $total_amount,
-            'amount_refunded' => 0,
-            'fees'            => 0,
-            'net'             => $total_amount,
-            'currency'        => 'USD',
-            'quantity'        => $total_qty,
-            'status'          => 'succeeded',
-            'created'         => $now,
-            'live'            => 1,
-            'gateway'         => 'woocommerce',
-        ], [
-            '%d', '%s', '%s', '%s', '%f', '%f', '%f', '%f', '%f', '%s',
-            '%d', '%s', '%d', '%d', '%s',
-        ] );
-
-        if ( ! $inserted ) {
-            $this->log( "DB Error creating charge for WC #{$wc_order_id}: " . $wpdb->last_error, 'ERROR' );
-            return null;
-        }
-
-        $this->log( "Created charge: {$charge_id} (amount: {$total_amount}) for WC order #{$wc_order_id}" );
-        return $wpdb->insert_id;
-    }
-
-    /**
-     * Set EventKoi meta on the WooCommerce order so EventKoi's admin can
-     * link back to it, handle status changes, and process refunds.
-     */
-    private function set_wc_order_meta( $wc_order_id, $ek_event_id, $ek_event_title, $ticket_items, $master_checkin_code, $dry_run = false ) {
-        if ( $dry_run || ! $this->wc_is_available() ) {
-            return;
-        }
-
-        $wc_order = wc_get_order( $wc_order_id );
-        if ( ! $wc_order ) {
-            return;
-        }
-
-        // Idempotent: skip if already synced.
-        if ( 'yes' === $wc_order->get_meta( '_eventkoi_synced' ) ) {
-            return;
-        }
-
-        $wc_order->update_meta_data( '_eventkoi_event_id', $ek_event_id );
-        $wc_order->update_meta_data( '_eventkoi_instance_ts', 0 );
-        $wc_order->update_meta_data( '_eventkoi_event_title', $ek_event_title );
-        $wc_order->update_meta_data( '_eventkoi_ticket_items', $ticket_items );
-        $wc_order->update_meta_data( '_eventkoi_master_checkin_code', $master_checkin_code );
-        $wc_order->update_meta_data( '_eventkoi_synced', 'yes' );
-        $wc_order->save();
-    }
-
     /* ------------------------------------------------------------------
      * ROLLBACK
      * ------------------------------------------------------------------ */
 
+    /**
+     * Roll back Run Migration by replaying its ekti_migration_audit ledger
+     * in reverse (Step 15): only rows, tickets, bindings, flags and WC order
+     * meta this migration wrote are reverted — Event Sync's own artifacts
+     * (which share the same row format) are untouched.
+     */
     private function rollback_import() {
         global $wpdb;
-        $ticket_orders_table = $this->ek_table( 'ticket_orders' );
-        $tickets_table       = $this->ek_table( 'tickets' );
-        $orders_table        = $this->ek_table( 'orders' );
-        $charges_table       = $this->ek_table( 'charges' );
-        $notes_table         = $this->ek_table( 'order_notes' );
 
-        // Collect parent order IDs before deleting (for notes cleanup).
-        $parent_order_ids = $wpdb->get_col(
-            "SELECT id FROM {$orders_table} WHERE gateway = 'woocommerce' AND checkout_id LIKE 'wc_%'"
-        );
+        $audit = get_option( 'ekti_migration_audit', [] );
+        $count = function ( $table ) use ( $wpdb ) {
+            return (int) $wpdb->get_var( "SELECT COUNT(*) FROM {$this->ek_table( $table )}" );
+        };
+        $before = [ 'ticket_orders' => $count( 'ticket_orders' ), 'tickets' => $count( 'tickets' ) ];
 
-        // Delete order notes for importer-created parent orders.
-        $deleted_notes = 0;
-        if ( ! empty( $parent_order_ids ) ) {
-            $ids_in = implode( ',', array_map( 'intval', $parent_order_ids ) );
-            $deleted_notes = $wpdb->query(
-                "DELETE FROM {$notes_table} WHERE order_id IN ({$ids_in})"
-            );
-        }
+        $undone = is_array( $audit ) && $audit ? $this->replay_audit_ops( $audit ) : [];
 
-        // Delete charges created by the importer.
-        $deleted_charges = $wpdb->query(
-            "DELETE FROM {$charges_table} WHERE gateway = 'woocommerce' AND charge_id LIKE 'wc_charge_%'"
-        );
-
-        // Delete parent orders created by the importer.
-        $deleted_parent_orders = $wpdb->query(
-            "DELETE FROM {$orders_table} WHERE gateway = 'woocommerce' AND checkout_id LIKE 'wc_%'"
-        );
-
-        // Delete imported ticket orders (new composite keys + legacy keys).
-        $deleted_orders = $wpdb->query(
-            "DELETE FROM {$ticket_orders_table} WHERE order_id LIKE 'wc_%' OR order_id LIKE 'tec_import_%'"
-        );
-
-        // Delete tickets created by THIS importer only. The _ekti_tec_product_*
-        // bindings are also written by Event Sync (Step 14) for tickets Event
-        // Sync itself created; those tickets and bindings survive a migration
-        // rollback. A binding is removed when its ticket was migration-created
-        // or no longer exists (stale).
-        $migration_tickets = get_option( 'ekti_migration_created_tickets', [] );
-        if ( ! is_array( $migration_tickets ) ) {
-            $migration_tickets = [];
-        }
-        $migration_tickets = array_map( 'intval', $migration_tickets );
-        $all_options = $wpdb->get_results(
-            "SELECT option_name, option_value FROM {$wpdb->options} WHERE option_name LIKE '_ekti_tec_product_%'"
-        );
-        $deleted_tickets = 0;
-        foreach ( $all_options as $opt ) {
-            $ticket_id           = intval( $opt->option_value );
-            $is_migration_ticket = in_array( $ticket_id, $migration_tickets, true );
-            if ( $is_migration_ticket ) {
-                $wpdb->delete( $tickets_table, [ 'id' => $ticket_id ], [ '%d' ] );
-                $deleted_tickets++;
-            }
-            $ticket_exists = (bool) $wpdb->get_var( $wpdb->prepare(
-                "SELECT id FROM {$tickets_table} WHERE id = %d",
-                $ticket_id
-            ) );
-            if ( $is_migration_ticket || ! $ticket_exists ) {
-                delete_option( $opt->option_name );
-            }
-        }
-        delete_option( 'ekti_migration_created_tickets' );
-
-        // Clear only the import flags the migration itself set — Adopt Native
-        // Imports (Step 14) writes the same flag on other attendee posts and
-        // those must not be reset by a migration rollback.
-        $flagged_posts = get_option( 'ekti_migration_flagged_posts', [] );
-        if ( ! is_array( $flagged_posts ) ) {
-            $flagged_posts = [];
-        }
-        if ( $flagged_posts ) {
-            $flagged_in = implode( ',', array_map( 'intval', $flagged_posts ) );
-            $wpdb->query(
-                "DELETE FROM {$wpdb->postmeta} WHERE meta_key = '_eventkoi_imported_from_tec' AND post_id IN ({$flagged_in})"
-            );
-        }
-        delete_option( 'ekti_migration_flagged_posts' );
-
-        // Clean EventKoi meta from WooCommerce orders the migration stamped
-        // (_eventkoi_synced). Event Dedupe repoints _eventkoi_event_id on
-        // other orders; those writes must survive a migration rollback.
-        if ( $this->wc_is_available() ) {
-            $ek_meta_keys = [
-                '_eventkoi_event_id',
-                '_eventkoi_instance_ts',
-                '_eventkoi_event_title',
-                '_eventkoi_ticket_items',
-                '_eventkoi_master_checkin_code',
-                '_eventkoi_synced',
-            ];
-            $synced_posts = $wpdb->get_col(
-                "SELECT DISTINCT pm.post_id FROM {$wpdb->postmeta} pm
-                 INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
-                 WHERE pm.meta_key = '_eventkoi_synced' AND p.post_type = 'shop_order'"
-            );
-            if ( $synced_posts ) {
-                $synced_in = implode( ',', array_map( 'intval', $synced_posts ) );
-                foreach ( $ek_meta_keys as $meta_key ) {
-                    $wpdb->query(
-                        "DELETE FROM {$wpdb->postmeta} WHERE meta_key = '{$meta_key}' AND post_id IN ({$synced_in})"
-                    );
-                }
-            }
-        }
-
-        // Reset state.
+        delete_option( 'ekti_migration_audit' );
         delete_option( 'ekti_migration_state' );
 
-        $this->log( sprintf(
-            'Rollback complete. Deleted: %d ticket orders, %d parent orders, %d charges, %d notes, %d ticket types.',
-            $deleted_orders, $deleted_parent_orders, $deleted_charges, $deleted_notes, $deleted_tickets
-        ) );
-
-        return [
-            'deleted_orders'        => $deleted_orders,
-            'deleted_parent_orders' => $deleted_parent_orders,
-            'deleted_charges'       => $deleted_charges,
-            'deleted_notes'         => $deleted_notes,
-            'deleted_tickets'       => $deleted_tickets,
+        $result = [
+            'deleted_orders'        => $before['ticket_orders'] - $count( 'ticket_orders' ),
+            'deleted_parent_orders' => 0,
+            'deleted_charges'       => 0,
+            'deleted_notes'         => 0,
+            'deleted_tickets'       => $before['tickets'] - $count( 'tickets' ),
+            'undone'                => $undone,
         ];
+        $this->log( 'Rollback complete. ' . wp_json_encode( $result ) );
+        return $result;
     }
 
     /* ------------------------------------------------------------------
@@ -1917,7 +1379,13 @@ final class EventKoi_Tickets_Importer {
                     delete_option( $op['name'] );
                     break;
                 case 'update_postmeta':
-                    update_post_meta( $op['post'], $op['key'], $op['old'] );
+                    // get_post_meta() returns '' for a missing key — restore
+                    // "missing" rather than leaving an empty value behind.
+                    if ( '' === $op['old'] ) {
+                        delete_post_meta( $op['post'], $op['key'] );
+                    } else {
+                        update_post_meta( $op['post'], $op['key'], $op['old'] );
+                    }
                     break;
                 case 'set_terms':
                     $term_taxonomy = ! empty( $op['taxonomy'] ) ? $op['taxonomy'] : 'event_cal';
@@ -1952,9 +1420,23 @@ final class EventKoi_Tickets_Importer {
                         "SELECT DISTINCT order_id FROM {$this->ek_table( 'ticket_orders' )} WHERE event_id = %d",
                         $post_id
                     ) );
+                    $wpdb->delete( $this->ek_table( 'ticket_orders' ), [ 'event_id' => $post_id ] );
+                    $bases = [];
                     foreach ( (array) $order_ids as $order_id ) {
-                        $base = strstr( (string) $order_id, ':', true );
-                        $base = false === $base ? (string) $order_id : $base;
+                        $base           = strstr( (string) $order_id, ':', true );
+                        $bases[ false === $base ? (string) $order_id : $base ] = true;
+                    }
+                    foreach ( array_keys( $bases ) as $base ) {
+                        // A WC order can span several events — keep its
+                        // parent rows while another event still has seats.
+                        $still_used = (int) $wpdb->get_var( $wpdb->prepare(
+                            "SELECT COUNT(*) FROM {$this->ek_table( 'ticket_orders' )} WHERE order_id = %s OR order_id LIKE %s",
+                            $base,
+                            $wpdb->esc_like( $base ) . ':%'
+                        ) );
+                        if ( $still_used ) {
+                            continue;
+                        }
                         $order_row_id = (int) $wpdb->get_var( $wpdb->prepare(
                             "SELECT id FROM {$this->ek_table( 'orders' )} WHERE checkout_id = %s",
                             $base
@@ -1964,7 +1446,6 @@ final class EventKoi_Tickets_Importer {
                             $wpdb->delete( $this->ek_table( 'orders' ), [ 'id' => $order_row_id ] );
                         }
                     }
-                    $wpdb->delete( $this->ek_table( 'ticket_orders' ), [ 'event_id' => $post_id ] );
                     $wpdb->delete( $this->ek_table( 'rsvps' ), [ 'event_id' => $post_id ] );
                     $wpdb->delete( $this->ek_table( 'tickets' ), [ 'event_id' => $post_id ] );
                     $wpdb->delete( $this->ek_table( 'upcoming_index' ), [ 'event_id' => $post_id ] );
@@ -1998,6 +1479,20 @@ final class EventKoi_Tickets_Importer {
                          WHERE t.id = %d",
                         (int) $op['ticket_id']
                     ) );
+                    break;
+                case 'wc_order_meta':
+                    // Restore the WC order's EventKoi meta to its pre-link values.
+                    $wc_order = $this->get_wc_order( (int) $op['order'] );
+                    if ( $wc_order ) {
+                        foreach ( (array) $op['old'] as $meta_key => $old_value ) {
+                            if ( null === $old_value ) {
+                                $wc_order->delete_meta_data( $meta_key );
+                            } else {
+                                $wc_order->update_meta_data( $meta_key, $old_value );
+                            }
+                        }
+                        $wc_order->save();
+                    }
                     break;
                 case 'insert_field':
                     $wpdb->delete( $this->ek_table( 'fields' ), [ 'id' => (int) $op['id'] ] );
@@ -5361,9 +4856,10 @@ final class EventKoi_Tickets_Importer {
             update_post_meta( $new_post_id, 'tickets_event_capacity', $et_tickets['event_capacity'] );
         }
 
-        // Attendee history: RSVP rows for RSVP-only events, Tickets Commerce
-        // attendees as manual orders otherwise. WooCommerce attendees are
-        // deliberately left for Run Migration (see Step 14 header).
+        // Attendee history (native order: after tickets + event capacity):
+        // RSVP rows for RSVP-only events; otherwise Tickets Commerce
+        // attendees as manual orders and WooCommerce attendees as WC-linked
+        // rows, then the native capacity give-back (Step 15).
         $attendees = $this->import_event_attendees_sync( $tec_id, $new_post_id, $et_tickets, $ops, $notes );
 
         if ( ! empty( $end_iso ) ) {
@@ -5435,7 +4931,9 @@ final class EventKoi_Tickets_Importer {
             'rsvp_rows'        => $attendees['rsvp_rows'],
             'rsvp_merged'      => $attendees['rsvp_merged'],
             'rsvp_skipped'     => $attendees['rsvp_skipped'],
-            'woo_attendees_skipped' => $attendees['woo_attendees_skipped'],
+            'woo_attendees'    => $attendees['woo_attendees'],
+            'woo_orders'       => $attendees['woo_orders'],
+            'woo_unpaid'       => $attendees['woo_unpaid'],
             'bindings'         => $et_tickets['bindings'],
             'notes'            => $notes,
         ];
@@ -5528,6 +5026,9 @@ final class EventKoi_Tickets_Importer {
                 $sold_total += $sold;
 
                 $summary['ticket_id_map'][ (int) $et_ticket->ID ] = $inserted['id'];
+                if ( $inserted['deducted'] > 0 ) {
+                    $summary['sold_by_ticket'][ $inserted['id'] ] = $inserted['deducted'];
+                }
 
                 // WooCommerce binding so Run Migration attaches to this ticket.
                 if ( $is_woo ) {
@@ -5551,14 +5052,16 @@ final class EventKoi_Tickets_Importer {
             $summary['skipped'][] = $unpriced_woo . ' WooCommerce ticket(s) imported without pricing: WooCommerce charges ' . $woo_currency . ' while checkout is ' . $checkout_currency . '.';
         }
         if ( $sold_total > 0 ) {
-            $notes[] = 'quantity_sold pre-set to TEC total_sales for ' . $sold_total . ' previously sold seat(s) (Step 7 capacity model).';
+            $notes[] = $sold_total . ' previously sold seat(s) deducted from the imported capacity (given back per imported attendee).';
         }
 
-        // Shared (capped/global) stock maps to the per-event total capacity.
-        // Unlike native, no sold deduction: quantity_sold already covers it.
+        // Shared (capped/global) stock maps to the per-event total capacity,
+        // minus the seats already sold (native parity; given back after the
+        // attendee import).
         $use_global = (string) get_post_meta( $tec_id, '_tribe_ticket_use_global_stock', true );
         if ( in_array( $use_global, [ '1', 'yes', 'true' ], true ) ) {
-            $summary['event_capacity'] = max( 0, (int) get_post_meta( $tec_id, '_tribe_ticket_global_stock_level', true ) );
+            $stock_level               = max( 0, (int) get_post_meta( $tec_id, '_tribe_ticket_global_stock_level', true ) );
+            $summary['event_capacity'] = max( $stock_level - $sold_total, 0 );
         }
 
         return $summary;
@@ -5566,9 +5069,14 @@ final class EventKoi_Tickets_Importer {
 
     /**
      * Insert one imported Event Tickets type as an eventkoi_tickets row.
-     * Mirrors native TEC_Importer::insert_imported_ticket() with the Step 14
-     * divergence: full capacity + pre-set quantity_sold (native stores
-     * capacity-minus-sold and leaves quantity_sold at 0 for the give-back).
+     * Mirrors native TEC_Importer::insert_imported_ticket() exactly:
+     * previously sold seats are deducted from the capacity up front and
+     * quantity_sold is left to EventKoi's recount. After attendee import,
+     * give_back_imported_capacity_sync() returns the seats that are now
+     * represented by real ticket_orders rows (Step 15 — the Step 14
+     * full-capacity + total_sales preset could not survive a recount).
+     *
+     * @return array{id:int, deducted:int}
      */
     private function insert_imported_ticket_sync( $event_id, $et_ticket, $price, $currency, $sold, $sort_order, &$ops ) {
         global $wpdb;
@@ -5587,14 +5095,13 @@ final class EventKoi_Tickets_Importer {
         ];
         $formats = [ '%d', '%s', '%s', '%f', '%s', '%s', '%d' ];
 
+        // Seats actually removed from capacity (0 for unlimited tickets).
+        $deducted = 0;
         if ( null !== $capacity ) {
-            $data['quantity_available'] = $capacity; // Full capacity (divergence).
-            $formats[]                   = '%d';
+            $deducted                   = min( $capacity, max( 0, (int) $sold ) );
+            $data['quantity_available'] = max( $capacity - (int) $sold, 0 );
+            $formats[]                  = '%d';
         }
-
-        // Pre-set sold count so availability math is correct immediately.
-        $data['quantity_sold'] = max( 0, (int) $sold );
-        $formats[]             = '%d';
 
         $sale_start = $this->es_et_ticket_datetime( $et_ticket->ID, '_ticket_start_date', '_ticket_start_time' );
         if ( null !== $sale_start ) {
@@ -5610,12 +5117,52 @@ final class EventKoi_Tickets_Importer {
 
         $inserted = $wpdb->insert( $this->ek_table( 'tickets' ), $data, $formats );
         if ( ! $inserted ) {
-            return [ 'id' => 0 ];
+            return [ 'id' => 0, 'deducted' => 0 ];
         }
 
         $id     = (int) $wpdb->insert_id;
         $ops[]  = [ 'type' => 'delete_ticket', 'id' => $id ];
-        return [ 'id' => $id ];
+        return [ 'id' => $id, 'deducted' => $deducted ];
+    }
+
+    /**
+     * Give back capacity for seats now represented by imported attendee
+     * rows. Port of native give_back_imported_attendee_capacity(): native
+     * counts every imported attendee; here only rows whose WC order was
+     * ever paid count (complete / partially_refunded / refunded) because
+     * pending or failed seats never entered total_sales, so they were
+     * never deducted. Both the per-ticket and the shared per-event
+     * capacity are adjusted. The ticket rows were created in this same
+     * event import, so undo deletes them outright (no extra op needed);
+     * the event meta lives on the created post.
+     *
+     * @param array $et_tickets      import_event_tickets_sync() summary.
+     * @param array $paid_by_ticket  eventkoi ticket id => ever-paid rows imported.
+     */
+    private function give_back_imported_capacity_sync( $new_post_id, $et_tickets, $paid_by_ticket ) {
+        global $wpdb;
+
+        $total = 0;
+        foreach ( $paid_by_ticket as $ticket_id => $count ) {
+            $total    += (int) $count;
+            $give_back = min( (int) ( $et_tickets['sold_by_ticket'][ $ticket_id ] ?? 0 ), (int) $count );
+            if ( $give_back <= 0 ) {
+                continue;
+            }
+            $wpdb->query( $wpdb->prepare(
+                "UPDATE {$this->ek_table( 'tickets' )} SET quantity_available = quantity_available + %d WHERE id = %d",
+                $give_back,
+                (int) $ticket_id
+            ) );
+        }
+
+        if ( $total > 0 && (int) get_post_meta( $new_post_id, 'tickets_event_capacity', true ) > 0 ) {
+            $give_back = min( (int) $et_tickets['sold_total'], $total );
+            if ( $give_back > 0 ) {
+                $current = (int) get_post_meta( $new_post_id, 'tickets_event_capacity', true );
+                update_post_meta( $new_post_id, 'tickets_event_capacity', $current + $give_back );
+            }
+        }
     }
 
     /**
@@ -5675,7 +5222,9 @@ final class EventKoi_Tickets_Importer {
             'rsvp_rows'             => 0,
             'rsvp_merged'           => 0,
             'rsvp_skipped'          => 0,
-            'woo_attendees_skipped' => 0,
+            'woo_attendees'         => 0,
+            'woo_orders'            => 0,
+            'woo_unpaid'            => 0,
         ];
 
         if ( ! $et_tickets['found'] ) {
@@ -5693,8 +5242,9 @@ final class EventKoi_Tickets_Importer {
             return $summary;
         }
 
-        $currency      = '' !== $et_tickets['currency'] ? $et_tickets['currency'] : $this->es_get_checkout_currency();
-        $ticket_id_map = $et_tickets['ticket_id_map'];
+        $currency       = '' !== $et_tickets['currency'] ? $et_tickets['currency'] : $this->es_get_checkout_currency();
+        $ticket_id_map  = $et_tickets['ticket_id_map'];
+        $paid_by_ticket = []; // eventkoi ticket id => ever-paid rows (capacity give-back).
 
         // Tickets Commerce attendees → zero-value manual orders.
         $unmatched = 0;
@@ -5728,6 +5278,7 @@ final class EventKoi_Tickets_Importer {
 
             if ( $this->create_manual_attendee_sync( $new_post_id, $ticket_id, $name, $email, $currency, $ops ) ) {
                 ++$summary['tc_attendees'];
+                $paid_by_ticket[ $ticket_id ] = ( $paid_by_ticket[ $ticket_id ] ?? 0 ) + 1;
             }
         }
 
@@ -5738,14 +5289,432 @@ final class EventKoi_Tickets_Importer {
             $notes[] = $unusable . ' Tickets Commerce attendee(s) not imported: no recorded name or email.';
         }
 
-        // WooCommerce attendees are deliberately left for Run Migration.
-        $woo_attendees = $this->es_get_et_ticket_posts( 'tribe_wooticket', '_tribe_wooticket_event', $tec_id );
+        // WooCommerce attendees → WC-linked ticket_orders rows (Step 15).
+        // Native imports them here too (as zero-value manual orders); we
+        // keep the WooCommerce link and the real order status instead.
+        $woo_attendees = $this->get_tec_attendees_for_event( $tec_id );
         if ( ! empty( $woo_attendees ) ) {
-            $summary['woo_attendees_skipped'] = count( $woo_attendees );
-            $notes[] = count( $woo_attendees ) . ' WooCommerce attendee(s) left for Run Migration (product bindings written).';
+            $resolver = function ( $product_id ) use ( $ticket_id_map ) {
+                return (int) ( $ticket_id_map[ (int) $product_id ] ?? 0 );
+            };
+            $woo = $this->link_woo_attendees( $new_post_id, $woo_attendees, $resolver, false, $ops );
+
+            $summary['woo_attendees'] = $woo['created'];
+            $summary['woo_orders']    = $woo['orders'];
+            $summary['woo_unpaid']    = $woo['unpaid'];
+            foreach ( $woo['ever_paid_by_ticket'] as $tid => $n ) {
+                $paid_by_ticket[ $tid ] = ( $paid_by_ticket[ $tid ] ?? 0 ) + $n;
+            }
+            foreach ( $woo['notes'] as $n ) {
+                $notes[] = $n;
+            }
+        }
+
+        $this->give_back_imported_capacity_sync( $new_post_id, $et_tickets, $paid_by_ticket );
+
+        return $summary;
+    }
+
+    /* ------------------------------------------------------------------
+     * WOOCOMMERCE ATTENDEE WRITER (Step 15)
+     *
+     * Shared by Event Sync (inline, native order) and Run Migration. Writes
+     * one wp_eventkoi_ticket_orders row per TEC attendee in the exact shape
+     * EventKoi's own WooCommerce checkout produces via
+     * Ticket_Order_Sync::sync_order_to_local() (codes path), with the WC
+     * order's real status. No eventkoi_orders / eventkoi_charges rows: the
+     * native WC flow writes none (EventKoi lists WC orders by grouping
+     * ticket_orders on the wc_{id} base; its charges table is Stripe-only).
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Pivoted TEC WooCommerce attendee rows for one TEC event (published
+     * attendee posts only), same columns as get_tec_attendees().
+     */
+    private function get_tec_attendees_for_event( $tec_id ) {
+        global $wpdb;
+        return $wpdb->get_results( $wpdb->prepare(
+            "SELECT p.ID, p.post_title,
+                    MAX(CASE WHEN pm.meta_key='_tribe_tickets_full_name' THEN pm.meta_value END) AS full_name,
+                    MAX(CASE WHEN pm.meta_key='_tribe_tickets_email' THEN pm.meta_value END) AS email,
+                    MAX(CASE WHEN pm.meta_key='_tribe_wooticket_event' THEN pm.meta_value END) AS tec_event_id,
+                    MAX(CASE WHEN pm.meta_key='_tribe_wooticket_product' THEN pm.meta_value END) AS product_id,
+                    MAX(CASE WHEN pm.meta_key='_tribe_wooticket_order' THEN pm.meta_value END) AS wc_order_id,
+                    MAX(CASE WHEN pm.meta_key='_paid_price' THEN pm.meta_value END) AS paid_price,
+                    MAX(CASE WHEN pm.meta_key='_tribe_wooticket_checkedin' THEN pm.meta_value END) AS checked_in,
+                    MAX(CASE WHEN pm.meta_key='_tribe_deleted_product_name' THEN pm.meta_value END) AS product_name,
+                    MAX(CASE WHEN pm.meta_key='_tribe_wooticket_security_code' THEN pm.meta_value END) AS security_code,
+                    MAX(CASE WHEN pm.meta_key='_tribe_tickets_meta' THEN pm.meta_value END) AS ticket_meta,
+                    MAX(CASE WHEN pm.meta_key='order_item_id' THEN pm.meta_value END) AS order_item_id
+             FROM {$wpdb->posts} p
+             INNER JOIN {$wpdb->postmeta} ev ON ev.post_id = p.ID
+               AND ev.meta_key = '_tribe_wooticket_event' AND ev.meta_value = %s
+             LEFT JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
+             WHERE p.post_type = 'tribe_wooticket' AND p.post_status = 'publish'
+             GROUP BY p.ID
+             ORDER BY p.ID ASC",
+            (string) (int) $tec_id
+        ), ARRAY_A );
+    }
+
+    /**
+     * EventKoi payment_status for a WC order — the map EventKoi itself uses
+     * in WooCommerce_Checkout::on_order_status_changed(). A completed order
+     * carrying a partial refund maps to partially_refunded (EventKoi's
+     * sync_refund_to_local() status; still counted as sold). Returns null
+     * for statuses EventKoi ignores (checkout-draft, trash, custom).
+     */
+    private function wc_order_ek_status( $wc_order ) {
+        $map = [
+            'completed'  => 'complete',
+            'processing' => 'complete',
+            'refunded'   => 'refunded',
+            'cancelled'  => 'cancelled',
+            'failed'     => 'failed',
+            'on-hold'    => 'pending',
+            'pending'    => 'pending',
+        ];
+        $status = $map[ (string) $wc_order->get_status() ] ?? null;
+        if ( 'complete' === $status && (float) $wc_order->get_total_refunded() > 0 ) {
+            $status = 'partially_refunded';
+        }
+        return $status;
+    }
+
+    /**
+     * Deterministic 12-char check-in token for a TEC attendee (EventKoi's
+     * human-friendly base32 alphabet). Determinism makes the composite
+     * order_id stable across runs, so a re-run hits the same key instead of
+     * inserting a second row (the v1.4.1 doubling root cause).
+     */
+    private function attendee_checkin_token( $attendee_id, $salt = 0 ) {
+        $alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+        $hash     = hash( 'sha256', 'ekti-tec-attendee:' . (int) $attendee_id . ( $salt ? ':' . (int) $salt : '' ), true );
+        $code     = '';
+        for ( $i = 0; $i < 12; $i++ ) {
+            $code .= $alphabet[ ord( $hash[ $i ] ) % 32 ];
+        }
+        return $code;
+    }
+
+    /**
+     * Link TEC WooCommerce attendees for ONE EventKoi event.
+     *
+     * @param int      $ek_event_id EventKoi event post ID.
+     * @param array    $attendees   Rows from get_tec_attendees*() — all for one TEC event.
+     * @param callable $resolve     fn( $product_id, $attendee_row ) => eventkoi ticket id (0 = none).
+     * @param bool     $dry_run     Compute only, no writes.
+     * @param array    $ops         Audit ops (by reference).
+     * @return array {created, existing, orders, unpaid, ever_paid_by_ticket, by_status, notes, results}
+     */
+    private function link_woo_attendees( $ek_event_id, $attendees, $resolve, $dry_run, &$ops ) {
+        global $wpdb;
+
+        $table   = $this->ek_table( 'ticket_orders' );
+        $summary = [
+            'created'             => 0,
+            'existing'            => 0,
+            'orders'              => 0,
+            'unpaid'              => 0,
+            'ever_paid_by_ticket' => [],
+            'by_status'           => [],
+            'notes'               => [],
+            'results'             => [],
+        ];
+        $ever_paid  = [ 'complete', 'partially_refunded', 'refunded' ];
+        $counted    = [ 'complete', 'completed', 'succeeded', 'paid', 'partially_refunded' ];
+        $no_ticket  = 0;
+        $no_order   = 0;
+        $odd_status = 0;
+
+        // Group by WC order so each order is resolved (and its meta written) once.
+        $by_order = [];
+        foreach ( $attendees as $att ) {
+            $by_order[ (int) $att['wc_order_id'] ][] = $att;
+        }
+
+        $touched_tickets = [];
+        foreach ( $by_order as $wc_order_id => $group ) {
+            $wc_order = $wc_order_id ? $this->get_wc_order( $wc_order_id ) : null;
+            if ( ! $wc_order ) {
+                $no_order += count( $group );
+                foreach ( $group as $att ) {
+                    $summary['results'][] = [ 'attendee_id' => $att['ID'], 'action' => 'skipped', 'reason' => 'No WooCommerce order #' . $wc_order_id ];
+                }
+                continue;
+            }
+
+            $status = $this->wc_order_ek_status( $wc_order );
+            if ( null === $status ) {
+                $odd_status += count( $group );
+                foreach ( $group as $att ) {
+                    $summary['results'][] = [ 'attendee_id' => $att['ID'], 'action' => 'skipped', 'reason' => 'WC order #' . $wc_order_id . ' status "' . $wc_order->get_status() . '" is not mapped by EventKoi' ];
+                }
+                continue;
+            }
+
+            $currency   = strtoupper( (string) $wc_order->get_currency() );
+            $currency   = preg_match( '/^[A-Z]{3}$/', $currency ) ? $currency : 'USD';
+            $date       = $wc_order->get_date_created();
+            $created_at = $date ? gmdate( 'Y-m-d H:i:s', $date->getTimestamp() ) : gmdate( 'Y-m-d H:i:s' );
+            $bill_name  = trim( $wc_order->get_billing_first_name() . ' ' . $wc_order->get_billing_last_name() );
+            $bill_email = (string) $wc_order->get_billing_email();
+
+            $items     = []; // ticket_id|unit_amount => meta ticket item (with codes).
+            $new_rows  = []; // ticket_id => row ids inserted for this order.
+            $order_new = 0;
+
+            foreach ( $group as $att ) {
+                $ticket_id = (int) call_user_func( $resolve, (int) $att['product_id'], $att );
+                if ( ! $ticket_id ) {
+                    ++$no_ticket;
+                    $summary['results'][] = [ 'attendee_id' => $att['ID'], 'action' => 'error', 'reason' => 'No EventKoi ticket for product #' . $att['product_id'] ];
+                    continue;
+                }
+
+                $token = $this->attendee_checkin_token( $att['ID'] );
+                $key   = 'wc_' . $wc_order_id . ':' . $ticket_id . ':' . $token;
+                $cents = (int) round( (float) $att['paid_price'] * 100 );
+
+                $ikey = $ticket_id . '|' . $cents;
+                if ( ! isset( $items[ $ikey ] ) ) {
+                    $items[ $ikey ] = [
+                        'ticket_id'   => $ticket_id,
+                        'name'        => (string) $wpdb->get_var( $wpdb->prepare( "SELECT name FROM {$this->ek_table( 'tickets' )} WHERE id = %d", $ticket_id ) ),
+                        'description' => '',
+                        'quantity'    => 0,
+                        'unit_amount' => $cents,
+                        'codes'       => [],
+                    ];
+                }
+                ++$items[ $ikey ]['quantity'];
+                $items[ $ikey ]['codes'][] = $token;
+
+                $summary['by_status'][ $status ] = ( $summary['by_status'][ $status ] ?? 0 ) + 1;
+                if ( in_array( $status, $ever_paid, true ) ) {
+                    $summary['ever_paid_by_ticket'][ $ticket_id ] = ( $summary['ever_paid_by_ticket'][ $ticket_id ] ?? 0 ) + 1;
+                }
+                if ( ! in_array( $status, $counted, true ) ) {
+                    ++$summary['unpaid'];
+                }
+
+                $exists = $dry_run ? null : $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE order_id = %s LIMIT 1", $key ) );
+                if ( $exists ) {
+                    ++$summary['existing'];
+                    $summary['results'][] = [ 'attendee_id' => $att['ID'], 'action' => 'skipped', 'reason' => 'Already imported', 'composite_key' => $key ];
+                    $this->flag_attendee_imported( (int) $att['ID'], $ops );
+                    continue;
+                }
+
+                $name  = trim( (string) $att['full_name'] ) !== '' ? (string) $att['full_name'] : $bill_name;
+                $email = trim( (string) $att['email'] ) !== '' ? (string) $att['email'] : $bill_email;
+                $name  = '' !== trim( $name ) ? $name : 'Imported attendee';
+
+                if ( $dry_run ) {
+                    ++$summary['created'];
+                    ++$order_new;
+                    $summary['results'][] = [
+                        'attendee_id'   => $att['ID'],
+                        'action'        => 'dry_run_create',
+                        'name'          => $name,
+                        'email'         => $email,
+                        'ek_event_id'   => $ek_event_id,
+                        'ek_ticket_id'  => $ticket_id,
+                        'wc_order_id'   => $wc_order_id,
+                        'composite_key' => $key,
+                        'price'         => $att['paid_price'],
+                        'status'        => $status,
+                    ];
+                    continue;
+                }
+
+                // A token clash with another order's row (astronomically
+                // unlikely) gets a salted variant rather than a dup key.
+                for ( $salt = 1; $salt < 5 && $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$table} WHERE checkin_token = %s LIMIT 1", $token ) ); $salt++ ) {
+                    $token = $this->attendee_checkin_token( $att['ID'], $salt );
+                    $key   = 'wc_' . $wc_order_id . ':' . $ticket_id . ':' . $token;
+                    $items[ $ikey ]['codes'][ count( $items[ $ikey ]['codes'] ) - 1 ] = $token;
+                }
+
+                $checked_in = in_array( $status, [ 'complete', 'partially_refunded' ], true ) && '1' === (string) $att['checked_in'];
+                $unit_price = (float) $att['paid_price'];
+
+                // Column set of Ticket_Order_Sync::sync_order_to_local() (codes path).
+                $inserted = $wpdb->insert( $table, [
+                    'event_id'          => (int) $ek_event_id,
+                    'instance_ts'       => 0,
+                    'ticket_id'         => $ticket_id,
+                    'order_id'          => $key,
+                    'customer_name'     => sanitize_text_field( $name ),
+                    'customer_email'    => sanitize_email( $email ),
+                    'quantity'          => 1,
+                    'unit_price'        => $unit_price,
+                    'total_amount'      => $unit_price,
+                    'currency'          => $currency,
+                    'payment_status'    => $status,
+                    'payment_intent_id' => '',
+                    'charge_id'         => '',
+                    'checkin_token'     => $token,
+                    'checked_in'        => $checked_in ? 1 : 0,
+                    'checked_in_at'     => $checked_in ? $created_at : null,
+                    'created_at'        => $created_at,
+                    'updated_at'        => gmdate( 'Y-m-d H:i:s' ),
+                ] );
+
+                if ( ! $inserted ) {
+                    $summary['results'][] = [ 'attendee_id' => $att['ID'], 'action' => 'error', 'reason' => $wpdb->last_error ];
+                    $this->log( "DB Error inserting attendee {$att['ID']}: " . $wpdb->last_error, 'ERROR' );
+                    continue;
+                }
+
+                $row_id                       = (int) $wpdb->insert_id;
+                $new_rows[ $ticket_id ][]     = $row_id;
+                $touched_tickets[ $ticket_id ] = true;
+                ++$summary['created'];
+                ++$order_new;
+                $this->flag_attendee_imported( (int) $att['ID'], $ops );
+
+                $summary['results'][] = [
+                    'attendee_id'        => $att['ID'],
+                    'action'             => 'created',
+                    'name'               => $name,
+                    'composite_key'      => $key,
+                    'status'             => $status,
+                    'ek_ticket_order_id' => $row_id,
+                ];
+            }
+
+            foreach ( $new_rows as $ticket_id => $row_ids ) {
+                $ops[] = [
+                    'type'             => 'insert_ticket_order',
+                    'ticket_order_ids' => $row_ids,
+                    'order_id'         => 'wc_' . $wc_order_id,
+                    'order_row_id'     => 0,
+                    'note_ids'         => [],
+                    'ticket_id'        => (int) $ticket_id,
+                ];
+            }
+
+            if ( $order_new > 0 ) {
+                ++$summary['orders'];
+                if ( ! $dry_run ) {
+                    $this->link_wc_order_meta( $wc_order, $ek_event_id, array_values( $items ), $ops );
+                }
+            }
+        }
+
+        // EventKoi's own recount (complete/completed/succeeded/paid/partially_refunded).
+        if ( ! $dry_run && $touched_tickets ) {
+            $recount_items = array_map( function ( $id ) {
+                return [ 'ticket_id' => $id ];
+            }, array_keys( $touched_tickets ) );
+            if ( class_exists( '\\EventKoi\\Core\\Ticket_Order_Sync' ) ) {
+                \EventKoi\Core\Ticket_Order_Sync::sync_quantity_sold( (int) $ek_event_id, $recount_items );
+            }
+        }
+
+        if ( $no_ticket ) {
+            $summary['notes'][] = $no_ticket . ' WooCommerce attendee(s) not imported: no EventKoi ticket for their product.';
+        }
+        if ( $no_order ) {
+            $summary['notes'][] = $no_order . ' WooCommerce attendee(s) not imported: WooCommerce order not found.';
+        }
+        if ( $odd_status ) {
+            $summary['notes'][] = $odd_status . ' WooCommerce attendee(s) not imported: order status not mapped by EventKoi.';
+        }
+        if ( $summary['unpaid'] ) {
+            $summary['notes'][] = $summary['unpaid'] . ' WooCommerce attendee(s) imported with a non-sold status (refunded/failed/pending/cancelled) — not counted as sold.';
         }
 
         return $summary;
+    }
+
+    /**
+     * Stamp EventKoi's order meta on a WC order (what attach_order_meta() +
+     * on_payment_complete() leave behind) so EventKoi's status/refund hooks
+     * keep the imported rows in sync. _eventkoi_synced = 'yes' is mandatory:
+     * without it a later status change to completed re-enters
+     * on_payment_complete() and emails the customer. Orders spanning several
+     * events (one row group per event) append their ticket items; orders
+     * EventKoi itself synced (no _ekti_wc_linked marker) are left alone.
+     */
+    private function link_wc_order_meta( $wc_order, $ek_event_id, $items, &$ops ) {
+        $keys = [
+            '_eventkoi_event_id',
+            '_eventkoi_instance_ts',
+            '_eventkoi_event_title',
+            '_eventkoi_ticket_items',
+            '_eventkoi_master_checkin_code',
+            '_eventkoi_synced',
+            '_ekti_wc_linked',
+        ];
+
+        $ours = '1' === (string) $wc_order->get_meta( '_ekti_wc_linked' );
+        if ( 'yes' === $wc_order->get_meta( '_eventkoi_synced' ) && ! $ours ) {
+            return; // A genuine EventKoi checkout order — never rewrite it.
+        }
+
+        $old = [];
+        foreach ( $keys as $k ) {
+            $old[ $k ] = $wc_order->meta_exists( $k ) ? $wc_order->get_meta( $k ) : null;
+        }
+
+        $merged = [];
+        if ( $ours ) {
+            foreach ( (array) $wc_order->get_meta( '_eventkoi_ticket_items' ) as $it ) {
+                if ( is_array( $it ) && ! empty( $it['ticket_id'] ) ) {
+                    $merged[ (int) $it['ticket_id'] . '|' . (int) ( $it['unit_amount'] ?? 0 ) ] = $it;
+                }
+            }
+        }
+        foreach ( $items as $it ) {
+            $k = (int) $it['ticket_id'] . '|' . (int) $it['unit_amount'];
+            if ( isset( $merged[ $k ] ) ) {
+                $codes                   = array_values( array_unique( array_merge( (array) ( $merged[ $k ]['codes'] ?? [] ), $it['codes'] ) ) );
+                $merged[ $k ]['codes']    = $codes;
+                $merged[ $k ]['quantity'] = count( $codes );
+            } else {
+                $merged[ $k ] = $it;
+            }
+        }
+        $merged = array_values( $merged );
+
+        $all_codes = [];
+        foreach ( $merged as $it ) {
+            foreach ( (array) $it['codes'] as $c ) {
+                $all_codes[] = $c;
+            }
+        }
+        // One seat reuses its own token (EventKoi's rule); otherwise a
+        // deterministic group code derived from the order ID.
+        $master = 1 === count( $all_codes ) ? $all_codes[0] : $this->attendee_checkin_token( 0, (int) $wc_order->get_id() );
+
+        // First event wins the order-level pointer (EventKoi's model is one
+        // event per order); every row keeps its own event_id.
+        if ( ! $ours ) {
+            $wc_order->update_meta_data( '_eventkoi_event_id', (int) $ek_event_id );
+            $wc_order->update_meta_data( '_eventkoi_instance_ts', 0 );
+            $wc_order->update_meta_data( '_eventkoi_event_title', get_the_title( $ek_event_id ) );
+        }
+        $wc_order->update_meta_data( '_eventkoi_ticket_items', $merged );
+        $wc_order->update_meta_data( '_eventkoi_master_checkin_code', $master );
+        $wc_order->update_meta_data( '_eventkoi_synced', 'yes' );
+        $wc_order->update_meta_data( '_ekti_wc_linked', '1' );
+        $wc_order->save();
+
+        $ops[] = [ 'type' => 'wc_order_meta', 'order' => (int) $wc_order->get_id(), 'old' => $old ];
+    }
+
+    /**
+     * Flag a TEC attendee as imported (audited, no-op when already set).
+     */
+    private function flag_attendee_imported( $attendee_id, &$ops ) {
+        $old = get_post_meta( $attendee_id, '_eventkoi_imported_from_tec', true );
+        if ( '' !== (string) $old && '0' !== (string) $old ) {
+            return;
+        }
+        update_post_meta( $attendee_id, '_eventkoi_imported_from_tec', '1' );
+        $ops[] = [ 'type' => 'update_postmeta', 'post' => $attendee_id, 'key' => '_eventkoi_imported_from_tec', 'old' => $old ];
     }
 
     /**
@@ -6093,6 +6062,9 @@ final class EventKoi_Tickets_Importer {
             'tc_attendees' => 0,
             'rsvp_rows'    => 0,
             'rsvp_merged'  => 0,
+            'woo_attendees' => 0,
+            'woo_orders'   => 0,
+            'woo_unpaid'   => 0,
         ];
 
         $started_at = microtime( true );
@@ -6141,6 +6113,9 @@ final class EventKoi_Tickets_Importer {
             $tally['tc_attendees'] += $result['tc_attendees'];
             $tally['rsvp_rows']    += $result['rsvp_rows'];
             $tally['rsvp_merged']  += $result['rsvp_merged'];
+            $tally['woo_attendees'] += $result['woo_attendees'];
+            $tally['woo_orders']   += $result['woo_orders'];
+            $tally['woo_unpaid']   += $result['woo_unpaid'];
 
             $results[] = [
                 'tec_id'          => $result['tec_id'],
@@ -6152,6 +6127,10 @@ final class EventKoi_Tickets_Importer {
                 'tc_attendees'    => $result['tc_attendees'],
                 'rsvp_rows'       => $result['rsvp_rows'],
                 'rsvp_merged'     => $result['rsvp_merged'],
+                'woo_attendees'   => $result['woo_attendees'],
+                'woo_orders'      => $result['woo_orders'],
+                'woo_unpaid'      => $result['woo_unpaid'],
+                'notes'           => $result['notes'],
             ];
         }
 
