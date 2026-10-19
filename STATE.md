@@ -106,7 +106,9 @@ higher.)
 3. The v1.7.0 plugin folder is backed up at
    `wp-content/ekti-backup-1.7.0` on ott-dev; delete it once 1.11.1 is
    accepted.
-4. Branch `claude/intelligent-hertz-8fb9b8` is not merged to `main` yet.
+4. **Merged to `main`** (fast-forward, 2026-10-19). The installer zip
+   `eventkoi-tickets-importer.zip` (repo root, gitignored) is rebuilt from
+   `main` for testing in WordPress.
 
 **Step 18 done (2026-10-19, v1.11.0):** ott-dev's EventKoi checkout
 method is now WooCommerce and the events list shows imported sales
