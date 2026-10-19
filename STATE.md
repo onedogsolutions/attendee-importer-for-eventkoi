@@ -82,12 +82,9 @@ Status legend: ⬜ Not started · 🟡 In progress · ✅ Done · ⚠️ Blocked
 
 **Step 18 done (2026-10-19, v1.11.0):** ott-dev's EventKoi checkout
 method is now WooCommerce and the events list shows imported sales
-(event 54644: 1 sold; 328/328 events match). Open items:
+(event 54644: 1 sold; 328/328 events match). UI click-through passed.
 
-1. **UI click-through of step 1 not done.** The built-in browser needed a
-   WordPress sign-in. Run Checks, review the EventKoi setup form, click
-   Save Setup and Undo EventKoi Setup once from the Tools page.
-2. **Production:** run Preflight first; approving step 1 saves the setup
+1. **Production:** run Preflight first; approving step 1 saves the setup
    before any tickets or orders are imported.
 
 **Step 17 done (2026-10-19, v1.10.0, option B2):** dev is fully
@@ -1638,7 +1635,13 @@ event "Classical Concert in the Park" + plugin tour. Completion sets
   "paypal" are refused with no writes.
 - **Order matching:** passes — 328 / 328 events match, plus the Step 17
   checks (0 off-instance, 41 storefront events correct, 0 missing).
-- **UI:** not clicked through (browser sign-in needed).
+- **UI (built-in browser):** Run Checks → form pre-filled (WooCommerce,
+  Monday, Mon–Fri, 12-hour); Save Setup → "no changes"; Undo EventKoi
+  Setup → method back to "not set", Preflight warns, Tickets run
+  disabled; Save Setup → WooCommerce. EventKoi Events page 8 (start date
+  desc) now shows "1 ticket" for Vintage Halloween Cookies and 2 / 0 / 1 /
+  3 / 0 / 1 / 4 / 4 / 2 for the rest. No JS errors (only unrelated font
+  CORS errors).
 
 ---
 
